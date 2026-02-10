@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openprover"
+version = "0.1.0"
+description = "Theorem prover powered by language models"
+requires-python = ">=3.10"
+
+[project.scripts]
+openprover = "openprover.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openprover*"]
