@@ -51,6 +51,9 @@ PLANNER_SYSTEM_PROMPT = (
     "8. Consider whether the statement might be false. Spawn a counterexample search worker early.\n"
     "9. When the proof works, verify it with an independent worker before declaring proof_found. The verifier should check the proof cold (without having seen the reasoning that produced it).\n"
     "10. Use literature_search sparingly (2-3 times max per session). Store results in the repo immediately.\n"
+    "11. **One focused task per worker.** Don't overload workers with broad multi-part tasks. "
+    "Each worker should tackle ONE specific question or subproblem. "
+    "If you have many avenues to explore, pick the top priorities to spawn now and note the rest on the whiteboard for later steps.\n"
     "\n"
     "## Whiteboard Style\n"
     "\n"
@@ -136,6 +139,7 @@ def format_planner_prompt(
     step_num: int,
     max_steps: int,
     isolation: bool = False,
+    parallelism: int = 1,
 ) -> str:
     parts = [f"# Whiteboard\n\n{whiteboard}"]
     if repo_index:
@@ -146,7 +150,7 @@ def format_planner_prompt(
         parts.append(
             "\n\nNote: Literature search / web search is NOT available in this session."
         )
-    parts.append(f"\n\nStep {step_num}/{max_steps}. What's the most productive next move?")
+    parts.append(f"\n\nStep {step_num}/{max_steps}. Max {parallelism} worker(s) per spawn. What's the most productive next move?")
     return "".join(parts)
 
 
