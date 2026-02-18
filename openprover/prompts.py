@@ -1,258 +1,187 @@
-"""Prompt templates for OpenProver."""
+"""Prompt templates for OpenProver — planner/worker architecture."""
+
+import re
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
+
+
+# ── Action types ────────────────────────────────────────────
 
 ACTIONS = [
-    "continue", "explore_avenue", "prove_lemma", "verify",
-    "check_counterexample", "literature_search", "replan",
-    "declare_proof", "declare_stuck",
+    "proof_found", "give_up", "read_items", "write_item",
+    "spawn", "literature_search",
 ]
-
-SYSTEM_PROMPT = r"""
-You are a senior research mathematician. You prove theorems.
-
-Your workspace is a WHITEBOARD — terse, dense, like a real whiteboard. Update it when you have meaningful changes.
-
-## Principles
-
-1. KEEP IT SIMPLE. If a step is trivial, just do it inline. Don't create lemmas for trivial facts.
-2. Only extract a lemma when it's genuinely reusable or the proof is non-trivial.
-3. Before diving into a proof attempt, think about whether the approach can actually work. Catch doomed avenues early.
-4. Try small cases and examples first. Build intuition before formalism.
-5. When stuck, consider: can you reduce to a simpler subproblem, or generalize to a setting where the result becomes natural? Changing perspective beats pushing harder on a stuck approach. **Prove special cases, weaker versions, or variations of the theorem** — these build insight and often reveal the path to the full proof.
-6. Understand *why* things work, not just *that* they work. If you can't explain the proof idea in one sentence, you don't understand it yet.
-7. Be honest about gaps. A proof sketch with a clearly marked gap is worth more than a hand-wavy "proof." Mark confidence: [high], [med], [low].
-8. Consider whether the statement might be false. A quick counterexample search can save hours.
-9. When the proof works, write it up cleanly and declare it. Don't keep going.
-10. After a literature search, store truly relevant known results as lemmas using the LEMMA section. Cite the source. These become available tools for your proof.
-
-## CRITICAL: literature_search rules
-
-Literature search is a SUPPORT tool, not a crutch. You are a mathematician, not a librarian. Rules:
-- Use literature_search AT MOST 2-3 times per session. Every search costs a step.
-- NEVER search for the same topic twice. Store results as lemmas on first search.
-- NEVER search when you haven't tried to prove things yourself first. Do real math before searching.
-- Prefer DOING MATH over searching: try simplifications, special cases, different proof techniques.
-- If you find yourself wanting to search again, STOP — instead, try to prove a simpler version of the theorem or explore a different angle.
-
-## CRITICAL: declare_proof rules
-
-NEVER use declare_proof unless you have a COMPLETE, RIGOROUS proof with NO gaps. A proof means: every logical step follows from the previous one, all the way from hypotheses to conclusion. The following are NOT proofs:
-- Summarizing what is known about a problem
-- Citing existing results without connecting them into a complete argument
-- A proof sketch with gaps marked "this can be shown" or "it is known that"
-- Describing an approach without carrying it out
-
-If the theorem is hard or open, THAT IS YOUR JOB. You are here to ATTEMPT PROOFS, not to report on the state of human knowledge. The fact that a problem is famous or open is IRRELEVANT — you must try anyway. Try novel approaches, combine known techniques in new ways, explore unconventional angles. Investigate special cases, find partial results, build toward a proof.
-
-## CRITICAL: declare_stuck rules
-
-NEVER use declare_stuck early. You must use nearly all your allotted steps before even considering it. "This problem is open" or "this is a famous unsolved problem" is NEVER a valid reason to declare_stuck. Instead:
-- **Prove a simpler version**: weaken hypotheses, strengthen conclusions, try small cases ($n=2,3$), restrict to special cases
-- **Prove a variation**: change the problem slightly — if you can prove the variation, the difference reveals what makes the original hard
-- Try a completely different proof technique (algebraic vs combinatorial vs probabilistic vs topological)
-- Build partial results that constrain the solution
-- Replan from scratch with a completely different strategy
-
-## Whiteboard Style
-
-Write like shorthand on a real whiteboard — abbreviated, dense, no fluff:
-- "WLOG assume $p,q$ coprime" not "Without loss of generality, we may assume that p and q are coprime integers"
-- "$p^2=2q^2 \Rightarrow p$ even $\Rightarrow p=2k \Rightarrow 4k^2=2q^2 \Rightarrow q$ even. Contradiction." not paragraphs explaining each step
-- Use LaTeX for all math: $inline$ and $$display$$
-- Use arrows, abbreviations freely
-- Sections: Goal, Plan, Work, Observations, Tried (keep failed approaches as one-liners)
-
-You respond in JSON as specified.
-"""
-
-# Used when literature_search is unavailable (--isolation mode)
 ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
-PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": ACTIONS,
-        },
-        "summary": {
-            "type": "string",
-            "description": "One-line summary of what you plan to do.",
-        },
-        "reasoning": {
-            "type": "string",
-            "description": "Brief: why this is the most productive next step.",
-        },
-        "target": {
-            "type": "string",
-            "description": "For prove_lemma: lemma name. For verify: what to verify. For literature_search: search query. Otherwise empty.",
-        },
-    },
-    "required": ["action", "summary", "reasoning"],
-    "additionalProperties": False,
-}
 
-# Step output uses text sections instead of JSON schema (more reliable for long math)
-_STEP_OUTPUT_BASE = """\
-At the END of your response, output the following sections (these are REQUIRED):
+# ── System prompts ──────────────────────────────────────────
 
-ACTION: <one of: {actions}>
-SUMMARY: <one-line summary of what you did>
+_TQ = '"""'  # triple-quote for embedding in prompts
 
-Optional sections (include only when applicable):
-WHITEBOARD:
-<COMPLETE updated whiteboard — replaces previous. Keep terse and dense. Only include if you have meaningful changes to the whiteboard.>
-END_WHITEBOARD
-PROOF:
-<If action=declare_proof: the COMPLETE, RIGOROUS proof. Not a sketch. A real proof.>
-END_PROOF
-VERIFY_TARGET: <what to verify>
-VERIFY_CONTENT:
-<self-contained statement+proof to check>
-END_VERIFY_CONTENT
-"""
+PLANNER_SYSTEM_PROMPT = (
+    "You are a senior research mathematician coordinating a proof effort. "
+    "You manage a whiteboard and a repository of items, and you delegate mathematical work to workers.\n"
+    "\n"
+    "## Your Role\n"
+    "\n"
+    "You are the PLANNER. You do NOT do math directly -- you delegate to workers. Each step you choose one action:\n"
+    "\n"
+    "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning -- no web access.\n"
+    "- **literature_search**: Search the web for relevant mathematical literature. Spawns one web-enabled worker.\n"
+    "- **read_items**: Request full content of repo items (you only see one-line summaries by default).\n"
+    "- **write_item**: Create, update, or delete a repo item.\n"
+    "- **proof_found**: Declare success. **This terminates the session.** You must be confident the proof is correct -- it must have been independently verified by a worker.\n"
+    "- **give_up**: Declare failure. Only after using nearly all allotted steps.\n"
+    "\n"
+    "## Principles\n"
+    "\n"
+    "1. KEEP IT SIMPLE. Don't spawn workers for trivial bookkeeping -- use write_item for that.\n"
+    "2. Give workers COMPLETE context in their task descriptions. They see ONLY the task description plus any [[wikilink]]-referenced repo items. Include the theorem statement, relevant definitions, and specific instructions.\n"
+    "3. Before diving into a proof attempt, think about whether the approach can actually work. Catch doomed avenues early.\n"
+    "4. Try small cases and examples first. Delegate exploration workers before committing to a full proof attempt.\n"
+    "5. When stuck: reduce to a simpler subproblem, or generalize to a setting where the result becomes natural.\n"
+    "6. **Prove special cases, weaker versions, or variations** -- these build insight and often reveal the path to the full proof.\n"
+    "7. Be honest about gaps. Store failed attempts in the repo -- they prevent repeating mistakes.\n"
+    "8. Consider whether the statement might be false. Spawn a counterexample search worker early.\n"
+    "9. When the proof works, verify it with an independent worker before declaring proof_found. The verifier should check the proof cold (without having seen the reasoning that produced it).\n"
+    "10. Use literature_search sparingly (2-3 times max per session). Store results in the repo immediately.\n"
+    "\n"
+    "## Whiteboard Style\n"
+    "\n"
+    "Terse, dense, like shorthand on a real whiteboard:\n"
+    "- Sections: Goal, Strategy, Status, Open Questions, Tried\n"
+    "- Use LaTeX: $inline$ and $$display$$\n"
+    "- Abbreviations and arrows freely\n"
+    '- "WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
+    "\n"
+    "## Repo Items\n"
+    "\n"
+    "Items in the repo are [[slug]]-referenced markdown files. Each has format:\n"
+    "```\n"
+    "Summary: One sentence.\n"
+    "\n"
+    "<full content>\n"
+    "```\n"
+    "\n"
+    "Store: proven lemmas, failed attempts (brief), key observations, literature findings.\n"
+    "Don't store: trivial facts, work-in-progress that belongs on the whiteboard.\n"
+    "\n"
+    "## CRITICAL: proof_found\n"
+    "\n"
+    "NEVER use proof_found unless you have a COMPLETE, RIGOROUS proof that has been VERIFIED by an independent worker. "
+    "proof_found **terminates the session** -- there is no going back. The proof field must contain the full proof text.\n"
+    "\n"
+    "## CRITICAL: give_up\n"
+    "\n"
+    "NEVER give up early. You must use nearly all allotted steps first. "
+    '"This is a famous open problem" is NEVER a reason to give up. Try novel approaches, special cases, variations.\n'
+    "\n"
+    "## Output Format\n"
+    "\n"
+    "Think step by step, then end your response with a TOML decision block:\n"
+    "\n"
+    "```toml\n"
+    'action = "spawn"\n'
+    'summary = "One-line description for the log"\n'
+    f"whiteboard = {_TQ}\n"
+    f"Updated whiteboard (COMPLETE, replaces previous)\n"
+    f"{_TQ}\n"
+    "\n"
+    "# Action-specific fields below (include only what's relevant)\n"
+    "```\n"
+    "\n"
+    "### Action-specific TOML fields:\n"
+    "\n"
+    f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
+    '**read_items**: `read = ["slug-1", "slug-2"]`\n'
+    f'**write_item**: `write_slug = "item-slug"` and `write_content = {_TQ}Summary: ...\\n\\n...{_TQ}` (omit write_content to delete)\n'
+    f"**spawn**: one or more `[[tasks]]` sections with `description = {_TQ}...{_TQ}`\n"
+    f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
+)
 
-_STEP_OUTPUT_SEARCH = """\
-SEARCH_QUERY: <what to search for>
-"""
+WORKER_SYSTEM_PROMPT = (
+    "You are a research mathematician working on a specific task.\n"
+    "\n"
+    "Complete the task thoroughly and report your findings. Be rigorous -- "
+    "if you prove something, ensure every step follows logically. "
+    "If you find issues, be specific about where and why.\n"
+    "\n"
+    "If asked to verify a proof: be skeptical. Check every step. "
+    "Don't fill in gaps yourself. End your response with exactly one of:\n"
+    "VERDICT: CORRECT\n"
+    "VERDICT: INCORRECT\n"
+    "\n"
+    "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX. "
+    "Mark confidence: [high], [med], [low].\n"
+)
 
-_STEP_OUTPUT_LEMMA = """\
-LEMMA_NAME: <name of lemma to store>
-LEMMA_SOURCE: <citation/URL if from literature, omit if derived>
-LEMMA_CONTENT:
-<precise statement and proof of the lemma>
-END_LEMMA_CONTENT
-"""
-
-
-def _make_plan_schema(actions: list) -> dict:
-    """Return plan_schema with the given action list."""
-    import copy
-    ps = copy.deepcopy(PLAN_SCHEMA)
-    ps["properties"]["action"]["enum"] = actions
-    return ps
-
-
-def step_output_instructions(actions: list) -> str:
-    """Return the step output format instructions with the given action list."""
-    parts = [_STEP_OUTPUT_BASE.format(actions=", ".join(actions))]
-    if "literature_search" in actions:
-        parts.append(_STEP_OUTPUT_SEARCH)
-    parts.append(_STEP_OUTPUT_LEMMA)
-    return "".join(parts)
-
-
-def format_plan_prompt(
-    theorem: str,
-    whiteboard: str,
-    lemma_index: str,
-    step_num: int,
-    max_steps: int,
-    actions: list | None = None,
-    human_feedback: str = "",
-    verification_result: str = "",
-    search_result: str = "",
-) -> str:
-    parts = [
-        f"# Theorem\n\n{theorem}",
-        f"\n\n# Whiteboard\n\n{whiteboard}",
-    ]
-    if lemma_index:
-        parts.append(f"\n\n# Lemmas\n\n{lemma_index}")
-    if verification_result:
-        parts.append(f"\n\n# Verification Result\n\n{verification_result}")
-    if search_result:
-        parts.append(f"\n\n# Literature Search Result\n\n{search_result}")
-    if human_feedback:
-        parts.append(f"\n\n# Human Feedback\n\n{human_feedback}")
-    if actions and "literature_search" not in actions:
-        parts.append("\n\nNote: Literature search / web search is NOT available in this session. Do not attempt it.")
-    parts.append(f"\n\nStep {step_num}/{max_steps}. What's the most productive next move?")
-    return "".join(parts)
-
-
-def format_step_prompt(
-    theorem: str,
-    whiteboard: str,
-    lemma_index: str,
-    step_num: int,
-    max_steps: int,
-    actions: list,
-    plan: dict | None = None,
-    human_feedback: str = "",
-    verification_result: str = "",
-    search_result: str = "",
-) -> str:
-    parts = [
-        f"# Theorem\n\n{theorem}",
-        f"\n\n# Whiteboard\n\n{whiteboard}",
-    ]
-    if lemma_index:
-        parts.append(f"\n\n# Lemmas\n\n{lemma_index}")
-    if verification_result:
-        parts.append(f"\n\n# Verification Result\n\n{verification_result}")
-    if search_result:
-        parts.append(f"\n\n# Literature Search Result\n\n{search_result}")
-    if human_feedback:
-        parts.append(f"\n\n# Human Feedback\n\n{human_feedback}")
-    parts.append(f"\n\nStep {step_num}/{max_steps}.")
-    if plan:
-        parts.append(
-            f" Plan: {plan['action']} — {plan['summary']}\n\nExecute this plan."
-        )
-    else:
-        parts.append(
-            " Decide and execute the best next step."
-        )
-    parts.append(
-        "\n\nKeep the whiteboard terse. Do NOT declare_stuck or declare_proof unless you have genuinely exhausted approaches or have a complete proof."
-    )
-    if "literature_search" not in actions:
-        parts.append(
-            "\n\nNote: Literature search / web search is NOT available in this session. Do not attempt it. Work only with what you know."
-        )
-    parts.append(step_output_instructions(actions))
-    return "".join(parts)
-
-
-def format_literature_search_prompt(query: str, theorem: str) -> str:
-    return (
-        "# Literature Search\n\n"
-        f"We are working on proving: {theorem.strip().split(chr(10))[0]}\n\n"
-        f"Search the web for: {query}\n\n"
-        "Find relevant theorems, proof techniques, known results, or partial progress. "
-        "Report back concisely: what's known, what techniques are used, any useful references. "
-        "Focus on mathematical content, not summaries of summaries."
-    )
-
-LITERATURE_SEARCH_SYSTEM_PROMPT = (
+SEARCH_SYSTEM_PROMPT = (
     "You are a mathematical research assistant. Search for relevant mathematical "
     "literature and results. Report findings concisely with precise mathematical content."
 )
 
 
-def format_verify_prompt(statement: str, proof: str) -> str:
-    return (
-        "# Independent Verification\n\n"
-        "You have NOT seen the reasoning that produced this proof. "
-        "Check it cold.\n\n"
-        f"## Statement\n\n{statement}\n\n"
-        f"## Proof\n\n{proof}\n\n"
-        "Is this proof correct? Be specific about any gaps or errors.\n\n"
-        "End your response with exactly one of these verdicts on its own line:\n"
-        "VERDICT: CORRECT\n"
-        "VERDICT: INCORRECT"
-    )
+# ── Prompt formatters ───────────────────────────────────────
 
-VERIFY_SYSTEM_PROMPT = (
-    "You are a rigorous proof checker. Be skeptical. "
-    "Flag gaps, errors, unjustified steps. Don't fill in gaps yourself."
-)
+def format_planner_prompt(
+    whiteboard: str,
+    repo_index: str,
+    prev_output: str,
+    step_num: int,
+    max_steps: int,
+    isolation: bool = False,
+) -> str:
+    parts = [f"# Whiteboard\n\n{whiteboard}"]
+    if repo_index:
+        parts.append(f"\n\n# Repository\n\n{repo_index}")
+    if prev_output:
+        parts.append(f"\n\n# Output from Previous Step\n\n{prev_output}")
+    if isolation:
+        parts.append(
+            "\n\nNote: Literature search / web search is NOT available in this session."
+        )
+    parts.append(f"\n\nStep {step_num}/{max_steps}. What's the most productive next move?")
+    return "".join(parts)
+
+
+def format_worker_prompt(task_description: str, resolved_refs: str) -> str:
+    parts = [f"# Task\n\n{task_description}"]
+    if resolved_refs:
+        parts.append(f"\n\n# Referenced Materials\n\n{resolved_refs}")
+    return "\n".join(parts)
+
+
+def format_search_prompt(query: str, context: str) -> str:
+    parts = [f"# Literature Search\n\nSearch query: {query}"]
+    if context:
+        parts.append(f"\n\nContext: {context}")
+    parts.append(
+        "\n\nSearch the web for relevant theorems, proof techniques, known results, "
+        "or partial progress. Report concisely: what's known, what techniques are used, "
+        "any useful references. Focus on mathematical content."
+    )
+    return "\n".join(parts)
+
+
+def format_initial_whiteboard(theorem: str) -> str:
+    return (
+        f"## Goal\n\n{theorem.strip()}\n\n"
+        "## Strategy\n\nTBD — analyze first.\n\n"
+        "## Status\n\nStarting.\n\n"
+        "## Tried\n\n(none)\n"
+    )
 
 
 def format_discussion_prompt(
     theorem: str,
     whiteboard: str,
-    lemma_index: str,
+    repo_index: str,
     steps_taken: int,
     max_steps: int,
     proof: str = "",
@@ -261,8 +190,8 @@ def format_discussion_prompt(
         f"# Theorem\n\n{theorem}",
         f"\n\n# Final Whiteboard\n\n{whiteboard}",
     ]
-    if lemma_index:
-        parts.append(f"\n\n# Lemmas\n\n{lemma_index}")
+    if repo_index:
+        parts.append(f"\n\n# Repository\n\n{repo_index}")
     if proof:
         parts.append(f"\n\n# Proof\n\n{proof}")
     parts.append(f"\n\n{steps_taken}/{max_steps} steps used.")
@@ -273,109 +202,110 @@ def format_discussion_prompt(
     return "".join(parts)
 
 
-def format_summary_prompt(
-    theorem: str,
-    whiteboard: str,
-    lemma_index: str,
-    step_num: int,
-    max_steps: int,
-) -> str:
-    parts = [
-        f"# Theorem\n\n{theorem}",
-        f"\n\n# Whiteboard (step {step_num}/{max_steps})\n\n{whiteboard}",
-    ]
-    if lemma_index:
-        parts.append(f"\n\n# Lemmas\n\n{lemma_index}")
-    parts.append(
-        "\n\nBriefly summarize progress: what approaches have been tried, "
-        "what's working, what's the current plan. 3-5 sentences max."
-    )
-    return "".join(parts)
+# ── TOML parser ─────────────────────────────────────────────
+
+def parse_planner_toml(text: str) -> dict | None:
+    """Extract and parse the TOML decision block from planner output."""
+    # Find ```toml ... ``` block
+    match = re.search(r'```toml\s*\n(.*?)```', text, re.DOTALL)
+    if not match:
+        # Fallback: try to find TOML-like content at the end
+        match = re.search(r'(action\s*=\s*"[^"]+".*)$', text, re.DOTALL)
+        if not match:
+            return None
+
+    toml_text = match.group(1)
+
+    if tomllib is None:
+        # Minimal fallback parser for when tomllib/tomli unavailable
+        return _parse_toml_minimal(toml_text)
+
+    try:
+        return tomllib.loads(toml_text)
+    except Exception:
+        return _parse_toml_minimal(toml_text)
 
 
-def parse_step_output(text: str) -> dict | None:
-    """Parse the section-based step output format into a dict."""
-    result = {}
+def _parse_toml_minimal(text: str) -> dict | None:
+    """Minimal TOML-ish parser for our specific format.
 
-    # Extract ACTION
-    for line in text.splitlines():
-        if line.strip().startswith("ACTION:"):
-            result["action"] = line.split(":", 1)[1].strip().lower()
-            break
+    Handles: top-level key = "value", triple-quoted multiline strings,
+    key = [...] arrays, and [[tasks]] array-of-tables.
+    """
+    result: dict = {}
+    tasks: list[dict] = []
+    current_task: dict | None = None
 
-    # Extract SUMMARY
-    for line in text.splitlines():
-        if line.strip().startswith("SUMMARY:"):
-            result["summary"] = line.split(":", 1)[1].strip()
-            break
+    lines = text.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
 
-    # Extract WHITEBOARD
-    result["whiteboard"] = _extract_section(text, "WHITEBOARD:", "END_WHITEBOARD")
-
-    # Extract optional PROOF
-    proof = _extract_section(text, "PROOF:", "END_PROOF")
-    if proof:
-        result["proof"] = proof
-
-    # Extract optional VERIFY fields
-    for line in text.splitlines():
-        if line.strip().startswith("VERIFY_TARGET:"):
-            result["verify_target"] = line.split(":", 1)[1].strip()
-            break
-    verify_content = _extract_section(text, "VERIFY_CONTENT:", "END_VERIFY_CONTENT")
-    if verify_content:
-        result["verify_content"] = verify_content
-
-    # Extract optional SEARCH_QUERY
-    for line in text.splitlines():
-        if line.strip().startswith("SEARCH_QUERY:"):
-            result["search_query"] = line.split(":", 1)[1].strip()
-            break
-
-    # Extract optional LEMMA fields
-    for line in text.splitlines():
-        if line.strip().startswith("LEMMA_NAME:"):
-            result["lemma_name"] = line.split(":", 1)[1].strip()
-            break
-    for line in text.splitlines():
-        if line.strip().startswith("LEMMA_SOURCE:"):
-            result["lemma_source"] = line.split(":", 1)[1].strip()
-            break
-    lemma_content = _extract_section(text, "LEMMA_CONTENT:", "END_LEMMA_CONTENT")
-    if lemma_content:
-        result["lemma_content"] = lemma_content
-
-    if "action" not in result:
-        return None
-    result.setdefault("summary", "")
-    return result
-
-
-def _extract_section(text: str, start_marker: str, end_marker: str) -> str:
-    """Extract content between start_marker line and end_marker line."""
-    lines = text.splitlines()
-    capturing = False
-    content = []
-    for line in lines:
-        if line.strip() == end_marker:
-            capturing = False
+        # Skip empty lines and comments
+        if not line or line.startswith('#'):
+            i += 1
             continue
-        if capturing:
-            content.append(line)
-        if line.strip().startswith(start_marker) and not capturing:
-            # If there's content on the same line as the marker, grab it
-            rest = line.strip()[len(start_marker):].strip()
-            if rest:
-                content.append(rest)
-            capturing = True
-    return "\n".join(content).strip()
 
+        # [[tasks]] — start a new task table
+        if line == '[[tasks]]':
+            current_task = {}
+            tasks.append(current_task)
+            i += 1
+            continue
 
-def format_initial_whiteboard(theorem: str) -> str:
-    first_line = theorem.strip().split("\n")[0]
-    return (
-        f"## Goal\n\n{first_line}\n\n"
-        "## Plan\n\nTBD — analyze first.\n\n"
-        "## Work\n\n(start)\n\n"
-        "## Tried\n\n(none)\n"
-    )
+        # key = value
+        m = re.match(r'(\w+)\s*=\s*(.*)', line)
+        if not m:
+            i += 1
+            continue
+
+        key = m.group(1)
+        rest = m.group(2).strip()
+        target = current_task if current_task is not None else result
+
+        # Triple-quoted multiline string
+        if rest.startswith('"""'):
+            content_parts = [rest[3:]]
+            i += 1
+            while i < len(lines):
+                if '"""' in lines[i]:
+                    before = lines[i].split('"""')[0]
+                    content_parts.append(before)
+                    break
+                content_parts.append(lines[i])
+                i += 1
+            target[key] = '\n'.join(content_parts).strip()
+            i += 1
+            continue
+
+        # Single-line string
+        if rest.startswith('"') and rest.endswith('"'):
+            target[key] = rest[1:-1]
+            i += 1
+            continue
+
+        # Array
+        if rest.startswith('['):
+            arr_text = rest
+            while arr_text.count('[') > arr_text.count(']') and i + 1 < len(lines):
+                i += 1
+                arr_text += lines[i].strip()
+            items = re.findall(r'"([^"]*)"', arr_text)
+            target[key] = items
+            i += 1
+            continue
+
+        # Boolean
+        if rest in ('true', 'false'):
+            target[key] = rest == 'true'
+            i += 1
+            continue
+
+        # Bare value
+        target[key] = rest
+        i += 1
+
+    if tasks:
+        result['tasks'] = tasks
+
+    return result if 'action' in result else None

@@ -1,7 +1,8 @@
-"""Core proving loop for OpenProver."""
+"""Core proving loop for OpenProver — planner/worker architecture."""
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -17,29 +18,81 @@ def slugify(text: str) -> str:
     return text[:50].strip("-")
 
 
+class Repo:
+    """Manages the repo/ directory of markdown items."""
+
+    def __init__(self, repo_dir: Path):
+        self.dir = repo_dir
+        self.dir.mkdir(exist_ok=True)
+
+    def list_summaries(self) -> str:
+        """Return index: '- [[slug]]: summary' for each item."""
+        entries = []
+        for f in sorted(self.dir.glob("*.md")):
+            first_line = f.read_text().split("\n", 1)[0]
+            summary = first_line.removeprefix("Summary:").strip()
+            entries.append(f"- [[{f.stem}]]: {summary}")
+        return "\n".join(entries)
+
+    def read_item(self, slug: str) -> str | None:
+        path = self.dir / f"{slug}.md"
+        return path.read_text() if path.exists() else None
+
+    def read_items(self, slugs: list[str]) -> str:
+        """Read multiple items, return formatted for prev_output."""
+        parts = []
+        for slug in slugs:
+            content = self.read_item(slug)
+            if content:
+                parts.append(f"## [[{slug}]]\n\n{content}")
+            else:
+                parts.append(f"## [[{slug}]]\n\n(not found)")
+        return "\n\n".join(parts)
+
+    def write_item(self, slug: str, content: str | None):
+        """Create/update item, or delete if content is None/empty."""
+        path = self.dir / f"{slug}.md"
+        if not content:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(content)
+
+    def resolve_wikilinks(self, text: str) -> str:
+        """Find [[slug]] references, return formatted appendix."""
+        slugs = re.findall(r'\[\[([a-z0-9_-]+)\]\]', text)
+        if not slugs:
+            return ""
+        parts = []
+        seen = set()
+        for slug in slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            content = self.read_item(slug)
+            if content:
+                parts.append(f"## [[{slug}]]\n\n{content}")
+            else:
+                parts.append(f"## [[{slug}]]\n\n(not found)")
+        return "\n\n".join(parts)
+
+
 class Prover:
     def __init__(self, theorem_path: str | None, model: str, max_steps: int,
                  autonomous: bool, verbose: bool, tui: TUI,
-                 isolation: bool = False, run_dir: str | None = None):
+                 isolation: bool = False, run_dir: str | None = None,
+                 parallelism: int = 1):
         self.model = model
         self.max_steps = max_steps
         self.autonomous = autonomous
         self.verbose = verbose
         self.isolation = isolation
         self.tui = tui
+        self.parallelism = parallelism
         self.shutting_down = False
         self.step_num = 0
-        self.verification_result = ""
-        self.search_result = ""
+        self.prev_output = ""
         self.proof_text = ""
         self.resumed = False
-
-        # Pick action list and schemas based on isolation mode
-        if isolation:
-            self.actions = prompts.ACTIONS_NO_SEARCH
-        else:
-            self.actions = prompts.ACTIONS
-        self.plan_schema = prompts._make_plan_schema(self.actions)
 
         # Set up working directory
         if run_dir:
@@ -52,15 +105,16 @@ class Prover:
             self.work_dir = Path("runs") / f"{slug}-{timestamp}"
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        (self.work_dir / "lemmas").mkdir(exist_ok=True)
         (self.work_dir / "steps").mkdir(exist_ok=True)
         (self.work_dir / "archive" / "calls").mkdir(parents=True, exist_ok=True)
 
-        # Check for resume (existing run with WHITEBOARD.md)
+        # Repo
+        self.repo = Repo(self.work_dir / "repo")
+
+        # Check for resume
         whiteboard_path = self.work_dir / "WHITEBOARD.md"
         theorem_file = self.work_dir / "THEOREM.md"
         if whiteboard_path.exists() and theorem_file.exists():
-            # Resume from existing run
             self.whiteboard = whiteboard_path.read_text()
             self.theorem_text = theorem_file.read_text()
             steps_dir = self.work_dir / "steps"
@@ -82,7 +136,7 @@ class Prover:
         # LLM client
         self.llm = LLMClient(model, self.work_dir / "archive" / "calls")
 
-        # Derive theorem name for header — collapse full text into one line
+        # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()
         parts = []
         for line in lines:
@@ -92,7 +146,6 @@ class Prover:
         self.theorem_name = " ".join(parts)
 
     def run(self):
-        # Set up TUI
         self.tui.setup(
             theorem_name=self.theorem_name,
             work_dir=str(self.work_dir),
@@ -112,10 +165,10 @@ class Prover:
         try:
             while self.step_num < self.max_steps and not self.shutting_down:
                 self.step_num += 1
-                action = self._do_step()
-                if action == "stop":
+                result = self._do_step()
+                if result == "stop":
                     break
-                if action == "pause":
+                if result == "pause":
                     paused = True
                     self.tui.log("Paused.", color="yellow")
                     break
@@ -126,13 +179,10 @@ class Prover:
             self._write_discussion()
 
     def _do_step(self) -> str:
-        """Execute one step. Returns: 'continue', 'stop', 'pause'."""
-        # Sync autonomous state from TUI (user may have toggled with 'a')
+        """Execute one planner step. Returns 'continue', 'stop', 'pause'."""
         self.autonomous = self.tui.autonomous
 
-        lemma_index = self._build_lemma_index()
-
-        # Check for autonomous mode key actions
+        # Check for autonomous mode actions
         if self.autonomous:
             action = self.tui.get_pending_action()
             if action == "quit":
@@ -141,394 +191,325 @@ class Prover:
             if action == "pause":
                 return "pause"
             if action == "summarize":
-                self._do_summary()
+                pass  # TODO: on-demand summary
 
-        # Save input whiteboard for this step
+        # Save step input
         step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
         step_dir.mkdir(parents=True, exist_ok=True)
-        (step_dir / "input.md").write_text(self.whiteboard)
 
-        if not self.autonomous:
-            # Interactive: plan first, then get approval
-            plan = self._get_plan(lemma_index)
-            if plan is None:
-                if self.shutting_down:
-                    return "stop"
-                self.tui.log("Step failed — retrying...", color="red")
-                return "continue"
+        # Build planner prompt
+        repo_index = self.repo.list_summaries()
+        prompt = prompts.format_planner_prompt(
+            whiteboard=self.whiteboard,
+            repo_index=repo_index,
+            prev_output=self.prev_output,
+            step_num=self.step_num,
+            max_steps=self.max_steps,
+            isolation=self.isolation,
+        )
+        self.prev_output = ""
 
-            # Check if user toggled autonomous during planning
-            if self.tui.autonomous:
-                self.autonomous = True
-                self.tui.log("→ autonomous mode", dim=True)
-            else:
-                self.tui.show_proposal(plan)
+        # Planner LLM call
+        self.tui.stream_start("planning", tab="planner")
+        try:
+            resp = self.llm.call(
+                prompt=prompt,
+                system_prompt=prompts.PLANNER_SYSTEM_PROMPT,
+                label=f"planner_step_{self.step_num}",
+                stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
+            )
+        except RuntimeError as e:
+            self.tui.stream_end(tab="planner")
+            self.tui.log(f"Error: {e}", color="red")
+            return "continue"
+        self.tui.stream_end(tab="planner")
 
-                # Confirmation loop
-                while True:
-                    resp = self.tui.get_confirmation()
-                    if resp == "":
-                        break  # accept plan
-                    if resp == "q":
-                        self.shutting_down = True
-                        return "stop"
-                    if resp == "p":
-                        return "pause"
-                    if resp == "s":
-                        self._do_summary()
-                        self.tui.show_proposal(plan)
-                        continue
-                    if resp == "a":
-                        self.autonomous = True
-                        self.tui.log("→ autonomous mode", dim=True)
-                        break
-                    # User gave feedback — replan
-                    self.tui.log("Replanning...", color="yellow")
-                    plan = self._get_plan(lemma_index, human_feedback=resp)
-                    if plan is None:
-                        if self.shutting_down:
-                            return "stop"
-                        self.tui.log("Step failed — retrying...", color="red")
-                        return "continue"
-                    self.tui.show_proposal(plan)
-
-            result = self._execute_step(lemma_index, plan=plan)
-        else:
-            # Autonomous: single combined call
-            result = self._execute_step(lemma_index)
-
-        if result is None:
-            self.tui.log("Step failed — retrying...", color="red")
+        # Parse TOML decision
+        plan = prompts.parse_planner_toml(resp["result"])
+        if plan is None:
+            self.tui.log("Failed to parse planner output — retrying...", color="red")
             return "continue"
 
-        action = result.get("action", "continue")
+        action = plan.get("action", "")
+        summary = plan.get("summary", "")
 
-        # Update whiteboard (only if step produced one)
-        if result.get("whiteboard"):
-            self.whiteboard = result["whiteboard"]
+        # Update whiteboard (always)
+        if plan.get("whiteboard"):
+            self.whiteboard = plan["whiteboard"]
             (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
             self.tui.whiteboard = self.whiteboard
 
-        step_idx = len(self.tui.step_entries)
+        # Log step in planner tab
         self.tui.step_complete(
-            self.step_num, self.max_steps, action, result.get("summary", ""),
+            self.step_num, self.max_steps, action, summary,
         )
 
-        # Handle new/updated lemmas
-        self._process_lemmas(result)
+        # Save planner output
+        self._save_step(step_dir, plan)
 
-        # Save step data
-        self._save_step(result)
+        # Dispatch
+        if action == "proof_found":
+            return self._handle_proof_found(plan)
+        if action == "give_up":
+            return self._handle_give_up()
+        if action == "read_items":
+            return self._handle_read_items(plan)
+        if action == "write_item":
+            return self._handle_write_item(plan)
+        if action == "spawn":
+            return self._handle_spawn(plan, step_dir)
+        if action == "literature_search":
+            return self._handle_literature_search(plan, step_dir)
 
-        # Handle verification
-        if action == "verify" and result.get("verify_content"):
-            self._do_verification(result["verify_target"], result["verify_content"])
-            self.tui.update_step_detail(step_idx,
-                f"Verify: {result.get('verify_target', '')}\n\n"
-                f"{self.verification_result}")
+        self.tui.log(f"Unknown action: {action}", color="red")
+        return "continue"
 
-        # Handle literature search
-        if action == "literature_search" and result.get("search_query"):
-            if self.isolation:
-                self.tui.log("Literature search skipped (isolation mode)", color="yellow")
-            else:
-                self._do_literature_search(result["search_query"])
-            self.tui.update_step_detail(step_idx,
-                f"Query: {result['search_query']}\n\n{self.search_result}")
+    # ── Action handlers ──────────────────────────────────────
 
-        # Handle terminal actions
-        if action == "declare_proof":
-            proof = result.get("proof", "")
-            if not proof:
-                self.tui.log("✗ Proof rejected: No proof text provided", color="red")
+    def _handle_proof_found(self, plan: dict) -> str:
+        proof = plan.get("proof", "")
+        if not proof:
+            self.tui.log("proof_found but no proof text — continuing", color="red")
+            self.prev_output = "proof_found rejected: no proof text provided."
+            return "continue"
+        self.proof_text = proof
+        (self.work_dir / "PROOF.md").write_text(proof)
+        self.tui.log("Proof found!", color="green", bold=True)
+        self.tui.log(f"  {self.work_dir / 'PROOF.md'}", dim=True)
+        return "stop"
+
+    def _handle_give_up(self) -> str:
+        if self.step_num < self.max_steps * 0.8:
+            self.tui.log(
+                f"Not giving up — only {self.step_num}/{self.max_steps} steps used",
+                color="yellow",
+            )
+            self.prev_output = "give_up rejected: too many steps remaining. Keep trying."
+            return "continue"
+        self.tui.log("Stuck — no more ideas.", color="yellow")
+        return "stop"
+
+    def _handle_read_items(self, plan: dict) -> str:
+        slugs = plan.get("read", [])
+        if not slugs:
+            self.tui.log("read_items but no slugs specified", color="yellow")
+            return "continue"
+        self.prev_output = self.repo.read_items(slugs)
+        self.tui.log(f"Read {len(slugs)} item(s): {', '.join(slugs)}", dim=True)
+        return "continue"
+
+    def _handle_write_item(self, plan: dict) -> str:
+        slug = plan.get("write_slug", "")
+        if not slug:
+            self.tui.log("write_item but no slug specified", color="yellow")
+            return "continue"
+        content = plan.get("write_content")
+        self.repo.write_item(slug, content)
+        if not content:
+            self.tui.log(f"Deleted [[{slug}]]", color="yellow")
+        else:
+            first_line = content.split("\n", 1)[0]
+            self.tui.log(f"Wrote [[{slug}]]: {first_line}", color="green")
+        return "continue"
+
+    def _handle_spawn(self, plan: dict, step_dir: Path) -> str:
+        tasks = plan.get("tasks", [])
+        if not tasks:
+            self.tui.log("spawn but no tasks specified", color="yellow")
+            return "continue"
+
+        # Limit to parallelism
+        tasks = tasks[:self.parallelism]
+
+        # Interactive confirmation
+        if not self.autonomous:
+            self.tui.show_proposal(plan)
+            while True:
+                resp = self.tui.get_confirmation()
+                if resp == "":
+                    break  # accept
+                if resp == "q":
+                    self.shutting_down = True
+                    return "stop"
+                if resp == "p":
+                    return "pause"
+                if resp == "a":
+                    self.autonomous = True
+                    self.tui.log("  autonomous mode", dim=True)
+                    break
+                # Feedback — set as prev_output and retry next step
+                self.prev_output = f"Human feedback: {resp}"
+                self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
-            self.tui.update_step_detail(step_idx, f"Proof:\n\n{proof}")
-            passed = self._verify_proof(proof)
-            if passed:
-                self.proof_text = proof
-                (self.work_dir / "PROOF.md").write_text(proof)
-                self.tui.log("✓ Proof found!", color="green", bold=True)
-                self.tui.log(f"→ {self.work_dir / 'PROOF.md'}", dim=True)
-                return "stop"
-            else:
-                self.tui.log("✗ Proof rejected: Verification failed — continuing", color="red")
-                return "continue"
 
-        if action == "declare_stuck":
-            if self.step_num < self.max_steps * 0.8:
-                self.tui.log(
-                    f"Not giving up yet — only {self.step_num}/{self.max_steps} steps used",
-                    color="yellow",
-                )
-                return "continue"
-            self.tui.log("Stuck — no more ideas.", color="yellow")
-            return "stop"
+        # Create worker tabs
+        worker_ids = []
+        for i, task in enumerate(tasks):
+            wid = f"worker_{self.step_num}_{i}"
+            desc = task.get("description", "")
+            label = desc.split("\n")[0][:40] if desc else f"Worker {i}"
+            self.tui.add_worker_tab(wid, label)
+            worker_ids.append(wid)
+
+        # Run workers
+        workers_dir = step_dir / "workers"
+        workers_dir.mkdir(exist_ok=True)
+        results = [None] * len(tasks)
+
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = {}
+            for i, task in enumerate(tasks):
+                # Save task
+                desc = task.get("description", "")
+                (workers_dir / f"task_{i}.md").write_text(desc)
+
+                future = pool.submit(self._run_worker, task, worker_ids[i])
+                futures[future] = i
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = f"Worker error: {e}"
+                self.tui.mark_worker_done(worker_ids[idx])
+
+        # Save results and build prev_output
+        parts = []
+        for i, (task, result) in enumerate(zip(tasks, results)):
+            desc = task.get("description", "")
+            first_line = desc.split("\n")[0][:60] if desc else f"Worker {i}"
+            parts.append(f"## Worker {i}: {first_line}\n\n{result}")
+            (workers_dir / f"result_{i}.md").write_text(result or "")
+
+        self.prev_output = "\n\n".join(parts)
+
+        # Store worker tab snapshots for history
+        self.tui.snapshot_worker_tabs(self.step_num)
 
         return "continue"
 
-    def _get_plan(self, lemma_index: str, human_feedback: str = "") -> dict | None:
-        prompt = prompts.format_plan_prompt(
-            theorem=self.theorem_text,
-            whiteboard=self.whiteboard,
-            lemma_index=lemma_index,
-            step_num=self.step_num,
-            max_steps=self.max_steps,
-            actions=self.actions,
-            human_feedback=human_feedback,
-            verification_result=self.verification_result,
-            search_result=self.search_result,
-        )
-        self.tui.stream_start("planning")
+    def _handle_literature_search(self, plan: dict, step_dir: Path) -> str:
+        if self.isolation:
+            self.tui.log("Literature search not available (isolation mode)", color="yellow")
+            self.prev_output = "Literature search is not available in isolation mode."
+            return "continue"
+
+        query = plan.get("search_query", "")
+        context = plan.get("search_context", "")
+        if not query:
+            self.tui.log("literature_search but no query", color="yellow")
+            return "continue"
+
+        wid = f"search_{self.step_num}"
+        self.tui.add_worker_tab(wid, f"search: {query[:30]}")
+
+        prompt = prompts.format_search_prompt(query, context)
+
+        workers_dir = step_dir / "workers"
+        workers_dir.mkdir(exist_ok=True)
+        (workers_dir / "task_0.md").write_text(f"Query: {query}\n\nContext: {context}")
+
+        self.tui.stream_start("searching", tab=wid)
         try:
             resp = self.llm.call(
                 prompt=prompt,
-                system_prompt=prompts.SYSTEM_PROMPT,
-                json_schema=self.plan_schema,
-                label=f"plan_step_{self.step_num}",
-                stream_callback=self.tui.stream_text,
-            )
-        except RuntimeError as e:
-            self.tui.stream_end()
-            self.tui.log(f"Error: {e}", color="red")
-            return None
-        self.tui.stream_end()
-
-        try:
-            return json.loads(resp["result"])
-        except json.JSONDecodeError:
-            self.tui.log("Warning: failed to parse plan, using fallback", color="yellow")
-            return {"action": "continue", "summary": "Continue work",
-                    "reasoning": "Fallback due to parse error"}
-
-    def _execute_step(self, lemma_index: str, plan: dict | None = None) -> dict | None:
-        prompt = prompts.format_step_prompt(
-            theorem=self.theorem_text,
-            whiteboard=self.whiteboard,
-            lemma_index=lemma_index,
-            step_num=self.step_num,
-            max_steps=self.max_steps,
-            actions=self.actions,
-            plan=plan,
-            verification_result=self.verification_result,
-            search_result=self.search_result,
-        )
-        self.verification_result = ""
-        self.search_result = ""
-
-        action_label = plan["action"] if plan else "working"
-        self.tui.stream_start(action_label)
-        try:
-            resp = self.llm.call(
-                prompt=prompt,
-                system_prompt=prompts.SYSTEM_PROMPT,
-                label=f"step_{self.step_num}",
-                stream_callback=self.tui.stream_text,
-            )
-        except RuntimeError as e:
-            self.tui.stream_end()
-            self.tui.log(f"Error: {e}", color="red")
-            return None
-        self.tui.stream_end()
-
-        result = prompts.parse_step_output(resp["result"])
-        if result is None:
-            self.tui.log("Warning: failed to parse step output", color="yellow")
-        return result
-
-    @staticmethod
-    def _parse_verdict(text: str) -> bool:
-        for line in reversed(text.strip().splitlines()):
-            line = line.strip().upper()
-            if line == "VERDICT: CORRECT":
-                return True
-            if line == "VERDICT: INCORRECT":
-                return False
-        return False
-
-    def _verify_proof(self, proof: str) -> bool:
-        self.tui.log("Verifying: declared proof", color="yellow")
-        prompt = prompts.format_verify_prompt(self.theorem_text, proof)
-        self.tui.stream_start("verifying proof")
-        try:
-            resp = self.llm.call(
-                prompt=prompt,
-                system_prompt=prompts.VERIFY_SYSTEM_PROMPT,
-                label=f"verify_proof_step_{self.step_num}",
-                stream_callback=self.tui.stream_text,
-            )
-            self.tui.stream_end()
-            self.verification_result = resp["result"]
-            passed = self._parse_verdict(resp["result"])
-            if passed:
-                self.tui.log("✓ Passed", color="green")
-            else:
-                self.tui.log("✗ Issues found", color="red")
-            return passed
-        except RuntimeError as e:
-            self.tui.stream_end()
-            self.tui.log(f"Verification error: {e}", color="red")
-            self.verification_result = f"Verification failed due to error: {e}"
-            return False
-
-    def _do_verification(self, target: str, content: str):
-        self.tui.log(f"Verifying: {target}", color="yellow")
-        prompt = prompts.format_verify_prompt(target, content)
-        self.tui.stream_start("verifying")
-        try:
-            resp = self.llm.call(
-                prompt=prompt,
-                system_prompt=prompts.VERIFY_SYSTEM_PROMPT,
-                label=f"verify_step_{self.step_num}",
-                stream_callback=self.tui.stream_text,
-            )
-            self.tui.stream_end()
-            self.verification_result = resp["result"]
-            passed = self._parse_verdict(resp["result"])
-            if passed:
-                self.tui.log("✓ Passed", color="green")
-            else:
-                self.tui.log("✗ Issues found", color="red")
-        except RuntimeError as e:
-            self.tui.stream_end()
-            self.tui.log(f"Verification error: {e}", color="red")
-            self.verification_result = f"Verification failed due to error: {e}"
-
-    def _do_literature_search(self, query: str):
-        self.tui.log(f"Searching: {query}", color="magenta")
-        prompt = prompts.format_literature_search_prompt(query, self.theorem_text)
-        self.tui.stream_start("searching")
-        try:
-            resp = self.llm.call(
-                prompt=prompt,
-                system_prompt=prompts.LITERATURE_SEARCH_SYSTEM_PROMPT,
+                system_prompt=prompts.SEARCH_SYSTEM_PROMPT,
                 label=f"search_step_{self.step_num}",
                 web_search=True,
-                stream_callback=self.tui.stream_text,
+                stream_callback=lambda t: self.tui.stream_text(t, tab=wid),
             )
-            self.tui.stream_end()
-            self.search_result = resp["result"]
-            # Show a brief summary of findings
-            shown = 0
-            for line in self.search_result.splitlines():
-                line = line.strip().lstrip("#").strip()
-                if not line:
-                    continue
-                if len(line) > 120:
-                    line = line[:117] + "..."
-                self.tui.log(f"  {line}", dim=True)
-                shown += 1
-                if shown >= 3:
-                    break
+            self.tui.stream_end(tab=wid)
+            self.prev_output = resp["result"]
+            (workers_dir / "result_0.md").write_text(resp["result"])
         except RuntimeError as e:
-            self.tui.stream_end()
+            self.tui.stream_end(tab=wid)
             self.tui.log(f"Search error: {e}", color="red")
-            self.search_result = f"Literature search failed: {e}"
+            self.prev_output = f"Literature search failed: {e}"
 
-    def _process_lemmas(self, result: dict):
-        if result.get("lemma_name") and result.get("lemma_content"):
-            name = slugify(result["lemma_name"]) or "unnamed-lemma"
-            lemma_dir = self.work_dir / "lemmas" / name
-            lemma_dir.mkdir(parents=True, exist_ok=True)
+        self.tui.mark_worker_done(wid)
+        self.tui.snapshot_worker_tabs(self.step_num)
+        return "continue"
 
-            source = result.get("lemma_source", "")
-            content = result["lemma_content"]
+    def _run_worker(self, task: dict, worker_id: str) -> str:
+        """Execute a single worker. Thread-safe."""
+        description = task.get("description", "")
+        resolved_refs = self.repo.resolve_wikilinks(description)
+        prompt = prompts.format_worker_prompt(description, resolved_refs)
 
-            header = f"# {result['lemma_name']}\n\n"
-            if source:
-                header += f"**Source**: {source}\n\n"
-            (lemma_dir / "LEMMA.md").write_text(header + content + "\n")
+        self.tui.stream_start("working", tab=worker_id)
+        try:
+            resp = self.llm.call(
+                prompt=prompt,
+                system_prompt=prompts.WORKER_SYSTEM_PROMPT,
+                label=worker_id,
+                stream_callback=lambda t: self.tui.stream_text(t, tab=worker_id),
+            )
+            self.tui.stream_end(tab=worker_id)
+            return resp["result"]
+        except RuntimeError as e:
+            self.tui.stream_end(tab=worker_id)
+            return f"Worker error: {e}"
 
-            proof_text = ""
-            if source:
-                proof_text = f"**Source**: {source}\n\n"
-            proof_text += content
-            (lemma_dir / "PROOF.md").write_text(proof_text + "\n")
+    # ── Saving & discussion ──────────────────────────────────
 
-            if source:
-                self.tui.log(f"+ lemma: {result['lemma_name']} [{source}]", color="green")
-            else:
-                self.tui.log(f"+ lemma: {result['lemma_name']}", color="green")
-
-    def _save_step(self, result: dict):
-        step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
-        (step_dir / "output.md").write_text(result.get("whiteboard", ""))
-        (step_dir / "action.json").write_text(json.dumps({
-            "step": self.step_num,
-            "action": result.get("action"),
-            "summary": result.get("summary"),
-        }, indent=2))
-
-    def _build_lemma_index(self) -> str:
-        lemmas_dir = self.work_dir / "lemmas"
-        if not lemmas_dir.exists():
-            return ""
-        entries = []
-        for d in sorted(lemmas_dir.iterdir()):
-            if not d.is_dir():
-                continue
-            lemma_file = d / "LEMMA.md"
-            if not lemma_file.exists():
-                continue
-            has_proof = (d / "PROOF.md").exists()
-            status = "proven" if has_proof else "unproven"
-            content = lemma_file.read_text().strip().split("\n")
-            first_line = content[0] if content else d.name
-            entries.append(f"- **{d.name}** [{status}]: {first_line}")
-        return "\n".join(entries)
+    def _save_step(self, step_dir: Path, plan: dict):
+        # Save as TOML-like text (human readable)
+        lines = [f'action = "{plan.get("action", "")}"']
+        lines.append(f'summary = "{plan.get("summary", "")}"')
+        if plan.get("whiteboard"):
+            lines.append(f'whiteboard = """\n{plan["whiteboard"]}\n"""')
+        # Save action-specific fields
+        for key in ("proof", "write_slug", "write_content", "search_query", "search_context"):
+            if key in plan:
+                val = plan[key]
+                if isinstance(val, str) and "\n" in val:
+                    lines.append(f'{key} = """\n{val}\n"""')
+                else:
+                    lines.append(f'{key} = "{val}"')
+        if "read" in plan:
+            lines.append(f'read = {json.dumps(plan["read"])}')
+        if "tasks" in plan:
+            for task in plan["tasks"]:
+                lines.append("\n[[tasks]]")
+                desc = task.get("description", "")
+                lines.append(f'description = """\n{desc}\n"""')
+        (step_dir / "planner.toml").write_text("\n".join(lines) + "\n")
 
     def _write_discussion(self):
         if self.shutting_down:
-            self.tui.log("Interrupted — writing discussion... (ctrl+c again to exit immediately)", color="yellow")
-        lemma_index = self._build_lemma_index()
+            self.tui.log(
+                "Interrupted — writing discussion... (ctrl+c again to exit immediately)",
+                color="yellow",
+            )
+        repo_index = self.repo.list_summaries()
         prompt = prompts.format_discussion_prompt(
             theorem=self.theorem_text,
             whiteboard=self.whiteboard,
-            lemma_index=lemma_index,
+            repo_index=repo_index,
             steps_taken=self.step_num,
             max_steps=self.max_steps,
             proof=self.proof_text,
         )
-        self.tui.stream_start("writing discussion")
+        self.tui.stream_start("writing discussion", tab="planner")
         try:
             resp = self.llm.call(
                 prompt=prompt,
-                system_prompt=prompts.SYSTEM_PROMPT,
+                system_prompt=prompts.PLANNER_SYSTEM_PROMPT,
                 label="discussion",
-                stream_callback=self.tui.stream_text,
+                stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
             )
-            self.tui.stream_end()
+            self.tui.stream_end(tab="planner")
             (self.work_dir / "DISCUSSION.md").write_text(resp["result"])
-            self.tui.log(f"→ {self.work_dir / 'DISCUSSION.md'}", dim=True)
+            self.tui.log(f"  {self.work_dir / 'DISCUSSION.md'}", dim=True)
         except RuntimeError as e:
-            self.tui.stream_end()
+            self.tui.stream_end(tab="planner")
             self.tui.log(f"Error generating discussion: {e}", color="red")
             (self.work_dir / "DISCUSSION.md").write_text(
                 f"# Discussion\n\nSession ended after {self.step_num} steps.\n\n"
                 f"## Final Whiteboard\n\n{self.whiteboard}\n"
             )
-            self.tui.log(f"→ {self.work_dir / 'DISCUSSION.md'}", dim=True)
-
-    def _do_summary(self):
-        lemma_index = self._build_lemma_index()
-        prompt = prompts.format_summary_prompt(
-            theorem=self.theorem_text,
-            whiteboard=self.whiteboard,
-            lemma_index=lemma_index,
-            step_num=self.step_num,
-            max_steps=self.max_steps,
-        )
-        self.tui.stream_start("summarizing")
-        try:
-            self.llm.call(
-                prompt=prompt,
-                system_prompt=prompts.SYSTEM_PROMPT,
-                label=f"summary_step_{self.step_num}",
-                stream_callback=self.tui.stream_text,
-            )
-            self.tui.stream_end()
-        except RuntimeError as e:
-            self.tui.stream_end()
-            self.tui.log(f"Summary error: {e}", color="red")
+            self.tui.log(f"  {self.work_dir / 'DISCUSSION.md'}", dim=True)
 
     def request_shutdown(self):
         self.shutting_down = True

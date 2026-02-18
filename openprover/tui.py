@@ -1,4 +1,4 @@
-"""Terminal UI for OpenProver — ANSI scroll regions, fixed header, inline input."""
+"""Terminal UI for OpenProver — ANSI scroll regions, fixed header, tabs."""
 
 import os
 import queue
@@ -28,15 +28,12 @@ CYAN = "\033[38;5;116m"
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 ACTION_STYLE = {
-    "continue": CYAN,
-    "explore_avenue": BLUE,
-    "prove_lemma": GREEN,
-    "verify": YELLOW,
-    "check_counterexample": YELLOW,
+    "spawn": BLUE,
     "literature_search": MAGENTA,
-    "replan": YELLOW,
-    "declare_proof": GREEN,
-    "declare_stuck": RED,
+    "read_items": CYAN,
+    "write_item": CYAN,
+    "proof_found": GREEN,
+    "give_up": RED,
 }
 
 HELP_TEXT = f"""\
@@ -46,6 +43,8 @@ HELP_TEXT = f"""\
     t           toggle reasoning trace
     w           toggle whiteboard view
     a           toggle autonomous mode
+    {DIM}←/→{RESET}         switch tabs
+    pgup/pgdn   scroll chat history
     ?           this help
     esc/enter   dismiss overlay
 
@@ -72,24 +71,43 @@ HEADER_ROWS = 4
 
 class _LogEntry:
     """A line in the log. step_idx >= 0 marks completed-step lines."""
-    __slots__ = ("text", "step_idx")
+    __slots__ = ("text", "step_idx", "is_trace")
 
-    def __init__(self, text: str, step_idx: int = -1):
+    def __init__(self, text: str, step_idx: int = -1, is_trace: bool = False):
         self.text = text
         self.step_idx = step_idx
+        self.is_trace = is_trace
+
+
+class _Tab:
+    """A tab with its own log buffer and streaming state."""
+    __slots__ = ("id", "label", "log_lines", "trace_buf", "scroll_offset",
+                 "streaming", "spinner_label", "spinner_tick", "spinner_time",
+                 "spinner_start", "last_trace", "done")
+
+    def __init__(self, tab_id: str, label: str):
+        self.id = tab_id
+        self.label = label
+        self.log_lines: list[_LogEntry] = []
+        self.trace_buf: list[str] = []
+        self.scroll_offset = 0
+        self.streaming = False
+        self.spinner_label = ""
+        self.spinner_tick = 0
+        self.spinner_time = 0.0
+        self.spinner_start = 0.0
+        self.last_trace = ""
+        self.done = False
 
 
 class TUI:
     def __init__(self):
         self.rows = 0
         self.cols = 0
-        self.log_lines: list[_LogEntry] = []
-        self.trace_buf: list[str] = []
         self.trace_visible = True
         self.view = "main"
         self.whiteboard = ""
         self.pending_action: str | None = None
-        self.streaming = False
         self.autonomous = False
         self._old_termios = None
         self._active = False
@@ -101,11 +119,7 @@ class TUI:
         self._key_queue: queue.Queue[str] = queue.Queue()
         self._bg_thread: threading.Thread | None = None
         self._bg_stop = False
-        # Spinner state
-        self._spinner_label = ""
-        self._spinner_tick = 0
-        self._spinner_time = 0.0
-        # Step history — each entry: {action, summary, step_num, detail}
+        # Step history — each entry: {action, summary, step_num, detail, trace, worker_tabs}
         self.step_entries: list[dict] = []
         self._nav_step = -1  # -1 = options focused, 0..N-1 = step index
         self._step_detail_text = ""
@@ -116,8 +130,25 @@ class TUI:
         self._confirm_buf: list[str] = []
         # Thread safety for stdout
         self._write_lock = threading.Lock()
+        # Tabs
+        self.tabs: list[_Tab] = [_Tab("planner", "Planner")]
+        self.active_tab_idx = 0
+        # Saved worker tabs (when navigating history)
+        self._saved_worker_tabs: list[_Tab] | None = None
 
     _content_start = HEADER_ROWS + 1
+
+    @property
+    def _active_tab(self) -> _Tab:
+        if self.active_tab_idx < len(self.tabs):
+            return self.tabs[self.active_tab_idx]
+        return self.tabs[0]
+
+    def _find_tab(self, tab_id: str) -> _Tab:
+        for tab in self.tabs:
+            if tab.id == tab_id:
+                return tab
+        return self.tabs[0]
 
     def setup(self, theorem_name: str, work_dir: str,
               step_num: int = 0, max_steps: int = 50):
@@ -134,7 +165,7 @@ class TUI:
             self._old_termios = None
 
         with self._write_lock:
-            self._write_raw('\033[?1049h\033[2J')
+            self._write_raw('\033[?1049h\033[2J\033[?1000h\033[?1006h')
             self._draw_header()
             self._write_raw(f'\033[{self._content_start};{self.rows}r')
             sys.stdout.flush()
@@ -156,7 +187,7 @@ class TUI:
         if self._bg_thread:
             self._bg_thread.join(timeout=0.2)
             self._bg_thread = None
-        self._write('\033[r\033[?1049l\033[?25h')
+        self._write('\033[?1000l\033[?1006l\033[r\033[?1049l\033[?25h')
         if self._old_termios:
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_termios)
@@ -194,15 +225,15 @@ class TUI:
         step = f"step {self.step_num}/{self.max_steps}" if self.step_num else ""
 
         # Row 1
+        self._write_raw('\033[1;1H\033[2K')
+        self._write_raw(f'{BLUE}╭─{RESET} {BOLD}OpenProver{RESET} {DIM}v{__version__}{RESET}')
+        if step:
+            self._write_raw(f' {BLUE}──{RESET} {DIM}{step}{RESET}')
         r1_text = f"─ OpenProver v{__version__}"
         if step:
             r1_text += f" ── {step}"
         r1_text += " "
         fill1 = max(w - len(r1_text) - 2, 0)
-        self._write_raw('\033[1;1H\033[2K')
-        self._write_raw(f'{BLUE}╭─{RESET} {BOLD}OpenProver{RESET} {DIM}v{__version__}{RESET}')
-        if step:
-            self._write_raw(f' {BLUE}──{RESET} {DIM}{step}{RESET}')
         self._write_raw(f' {BLUE}{"─" * fill1}╮{RESET}')
 
         # Row 2 — theorem
@@ -231,9 +262,28 @@ class TUI:
         self._write_raw('\033[3;1H\033[2K')
         self._write_raw(f'{BLUE}│{RESET}{" " * pad}{hints_styled} {BLUE}│{RESET}')
 
-        # Row 4
+        # Row 4 — bottom border + tab bar
         self._write_raw('\033[4;1H\033[2K')
-        self._write_raw(f'{BLUE}╰{"─" * max(w - 2, 0)}╯{RESET}')
+        if len(self.tabs) > 1:
+            tab_parts = []
+            visible_len = 0
+            for i, tab in enumerate(self.tabs):
+                name = tab.label
+                if len(name) > 20:
+                    name = name[:17] + "..."
+                if tab.done:
+                    name += " ✓"
+                bracket = f"[{name}]"
+                visible_len += len(bracket) + 1
+                if i == self.active_tab_idx:
+                    tab_parts.append(f'{BOLD}{WHITE}{bracket}{RESET}')
+                else:
+                    tab_parts.append(f'{DIM}{bracket}{RESET}')
+            tab_str = " ".join(tab_parts)
+            fill = max(w - 2 - visible_len, 0)
+            self._write_raw(f'{BLUE}╰{RESET} {tab_str}{BLUE}{"─" * fill}╯{RESET}')
+        else:
+            self._write_raw(f'{BLUE}╰{"─" * max(w - 2, 0)}╯{RESET}')
 
     def update_step(self, step_num: int, max_steps: int):
         self.step_num = step_num
@@ -244,41 +294,92 @@ class TUI:
             self._write_raw('\033[u')
             sys.stdout.flush()
 
+    # ── Tab management ──────────────────────────────────────────
+
+    def add_worker_tab(self, tab_id: str, label: str):
+        tab = _Tab(tab_id, label)
+        self.tabs.append(tab)
+        self._redraw_header()
+
+    def mark_worker_done(self, tab_id: str):
+        for tab in self.tabs:
+            if tab.id == tab_id:
+                tab.done = True
+                tab.streaming = False
+                break
+        self._redraw_header()
+
+    def snapshot_worker_tabs(self, step_num: int):
+        """Store current worker tabs in the corresponding step entry."""
+        worker_tabs = self.tabs[1:]
+        for entry in self.step_entries:
+            if entry["step_num"] == step_num:
+                entry["worker_tabs"] = worker_tabs
+                break
+
+    def _clear_worker_tabs(self):
+        """Remove all worker tabs, keeping only planner."""
+        self.tabs = [self.tabs[0]]
+        self.active_tab_idx = 0
+        self._redraw_header()
+
+    def _switch_tab(self, delta: int):
+        if len(self.tabs) <= 1:
+            return
+        self.active_tab_idx = (self.active_tab_idx + delta) % len(self.tabs)
+        self._redraw()
+
+    def _redraw_header(self):
+        with self._write_lock:
+            self._write_raw('\033[s')
+            self._draw_header()
+            self._write_raw('\033[u')
+            sys.stdout.flush()
+
     # ── Content area (scroll region) ───────────────────────────
 
-    def _log(self, text: str, step_idx: int = -1):
+    def _tab_log(self, tab: _Tab, text: str, step_idx: int = -1):
         entry = _LogEntry(text, step_idx)
-        self.log_lines.append(entry)
-        if len(self.log_lines) > 200:
-            self.log_lines = self.log_lines[-200:]
-        if self.view == "main":
-            self._write(f' {text}\n')
+        tab.log_lines.append(entry)
+        if len(tab.log_lines) > 500:
+            tab.log_lines = tab.log_lines[-500:]
+        if tab is self._active_tab and self.view == "main":
+            if tab.scroll_offset > 0:
+                tab.scroll_offset = 0
+                self._redraw()
+            else:
+                self._write(f' {text}\n')
 
     def log(self, text: str, color: str = "", bold: bool = False, dim: bool = False):
-        self._log(self._style(text, color, bold, dim))
+        self._tab_log(self.tabs[0], self._style(text, color, bold, dim))
 
     def show_proposal(self, plan: dict):
-        # Separator between history and proposal
+        planner = self.tabs[0]
         sep = f'{DIM}{"─" * max(self.cols - 4, 20)}{RESET}'
-        self._log(sep)
-        self._log(f'{DIM}Next step:{RESET}')
+        self._tab_log(planner, sep)
+        self._tab_log(planner, f'{DIM}Next step:{RESET}')
 
         action = plan.get("action", "")
         summary = plan.get("summary", "")
         color = ACTION_STYLE.get(action, "")
-        self._log(f'{color}▸{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}')
-        if plan.get("reasoning"):
-            self._log(f'  {DIM}{plan["reasoning"]}{RESET}')
+        self._tab_log(planner, f'{color}▸{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}')
+
+        # Show task descriptions for spawn
+        tasks = plan.get("tasks", [])
+        for i, task in enumerate(tasks):
+            desc = task.get("description", "")
+            first_line = desc.split("\n")[0][:60] if desc else ""
+            self._tab_log(planner, f'  {DIM}[{i}]{RESET} {first_line}')
 
     def step_complete(self, step_num: int, max_steps: int,
                       action: str, summary: str, detail: str = ""):
+        planner = self.tabs[0]
         color = ACTION_STYLE.get(action, "")
         line = f'{color}■{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}'
-        # Save trace before clearing
-        trace = "".join(self.trace_buf)
-        self.trace_buf = []
+        trace = planner.last_trace
+        planner.last_trace = ""
         idx = len(self.step_entries)
-        self._log(line, step_idx=idx)
+        self._tab_log(planner, line, step_idx=idx)
         self.step_entries.append({
             "action": action, "summary": summary,
             "step_num": step_num, "detail": detail,
@@ -289,67 +390,74 @@ class TUI:
             self._redraw()
 
     def update_step_detail(self, step_idx: int, detail: str):
-        """Update the detail field of an existing step entry."""
         if 0 <= step_idx < len(self.step_entries):
             self.step_entries[step_idx]["detail"] = detail
 
     # ── Spinner ─────────────────────────────────────────────────
 
-    def _start_spinner(self, label: str = "thinking"):
-        self._spinner_label = label
-        self._spinner_tick = 0
-        self._spinner_time = time.monotonic()
-        if self.view == "main":
-            self._write(f'  {DIM}{SPINNER[0]} {label}{RESET}')
-
     def _update_spinner(self):
+        tab = self._active_tab
         now = time.monotonic()
-        if now - self._spinner_time < 0.08:
+        if now - tab.spinner_time < 0.08:
             return
-        self._spinner_time = now
-        self._spinner_tick = (self._spinner_tick + 1) % len(SPINNER)
+        tab.spinner_time = now
+        tab.spinner_tick = (tab.spinner_tick + 1) % len(SPINNER)
         if self.view == "main":
-            ch = SPINNER[self._spinner_tick]
+            ch = SPINNER[tab.spinner_tick]
+            elapsed = int(now - tab.spinner_start)
             with self._write_lock:
-                # Don't overwrite trace text; only spin when no trace yet
-                if not self._spinner_label or self.trace_buf:
+                if not tab.spinner_label or (tab.trace_buf and self.trace_visible):
                     return
-                self._write_raw(f'\r\033[2K  {DIM}{ch} {self._spinner_label}{RESET}')
+                self._write_raw(f'\r\033[2K  {DIM}{ch} {tab.spinner_label} {elapsed}s{RESET}')
                 sys.stdout.flush()
-
-    def _stop_spinner(self):
-        """Clear spinner from screen, reset label."""
-        with self._write_lock:
-            if self._spinner_label and self.view == "main":
-                self._write_raw('\r\033[2K')
-                sys.stdout.flush()
-            self._spinner_label = ""
 
     # ── Streaming ───────────────────────────────────────────────
 
-    def stream_start(self, label: str = "thinking"):
-        self.trace_buf = []
-        self.streaming = True
-        self._start_spinner(label)
+    def stream_start(self, label: str = "thinking", tab: str = "planner"):
+        target = self._find_tab(tab)
+        target.trace_buf = []
+        target.streaming = True
+        target.spinner_label = label
+        target.spinner_tick = 0
+        target.spinner_time = time.monotonic()
+        target.spinner_start = target.spinner_time
+        if target is self._active_tab and self.view == "main":
+            self._write(f'  {DIM}{SPINNER[0]} {label} 0s{RESET}')
 
-    def stream_text(self, text: str):
+    def stream_text(self, text: str, tab: str = "planner"):
         self._check_keys()
-        if not self.trace_buf:
-            # First chunk — replace spinner with trace (or keep spinner if trace off)
-            if self.trace_visible and self.view == "main":
-                self._stop_spinner()
-        self.trace_buf.append(text)
-        if self.trace_visible and self.view == "main":
+        target = self._find_tab(tab)
+        is_active = target is self._active_tab
+        at_bottom = target.scroll_offset == 0
+        if not target.trace_buf and self.trace_visible and self.view == "main" and is_active and at_bottom:
+            with self._write_lock:
+                self._write_raw('\r\033[2K')
+                sys.stdout.flush()
+        target.trace_buf.append(text)
+        if self.trace_visible and self.view == "main" and is_active and at_bottom:
             self._write(f'{DIM}{text}{RESET}')
 
-    def stream_end(self):
-        self.streaming = False
-        self._spinner_label = ""
-        if self.trace_visible and self.view == "main":
-            self._write('\n')
-        elif self.view == "main":
-            # Trace was off — clear the spinner that was still showing
-            self._write('\r\033[2K')
+    def stream_end(self, tab: str = "planner"):
+        target = self._find_tab(tab)
+        target.streaming = False
+        target.spinner_label = ""
+        if target.trace_buf:
+            target.last_trace = "".join(target.trace_buf)
+            target.log_lines.append(_LogEntry(target.last_trace, is_trace=True))
+            if len(target.log_lines) > 500:
+                target.log_lines = target.log_lines[-500:]
+            target.trace_buf = []
+        else:
+            target.last_trace = ""
+
+        is_active = target is self._active_tab
+        if is_active and self.view == "main":
+            if target.scroll_offset > 0:
+                self._redraw()
+            elif target.last_trace and self.trace_visible:
+                self._write('\n')
+            else:
+                self._write('\r\033[2K')
 
     # ── Background thread (key reader + spinner) ────────────────
 
@@ -357,7 +465,8 @@ class TUI:
         fd = sys.stdin.fileno()
         while not self._bg_stop:
             try:
-                if self._spinner_label and (self.streaming):
+                tab = self._active_tab
+                if tab.spinner_label and tab.streaming:
                     self._update_spinner()
 
                 if not select.select([fd], [], [], 0.04)[0]:
@@ -371,7 +480,46 @@ class TUI:
                     b = data[i]
                     if b == 0x1b:
                         if i + 2 < len(data) and data[i + 1] == 0x5b:
-                            self._key_queue.put(chr(0x1b) + '[' + chr(data[i + 2]))
+                            # SGR mouse: \033[<Btn;Col;RowM/m
+                            if data[i + 2] == 0x3c:
+                                j = i + 3
+                                while j < len(data) and data[j] not in (0x4d, 0x6d):
+                                    j += 1
+                                if j < len(data):
+                                    try:
+                                        params = data[i+3:j].decode('ascii')
+                                        btn = int(params.split(';')[0])
+                                        if btn in (64, 65):
+                                            key = 'scroll_up' if btn == 64 else 'scroll_down'
+                                            if self._can_handle_directly():
+                                                self._process_key(key)
+                                            else:
+                                                self._key_queue.put(key)
+                                    except (ValueError, IndexError):
+                                        pass
+                                    i = j + 1
+                                else:
+                                    i = len(data)
+                                continue
+                            # Check for CSI N ~ sequences (Page Up/Down etc.)
+                            if (i + 3 < len(data)
+                                    and 0x30 <= data[i + 2] <= 0x39
+                                    and data[i + 3] == 0x7e):
+                                seq = chr(0x1b) + '[' + chr(data[i + 2]) + '~'
+                                if self._can_handle_directly() and seq in ('\x1b[5~', '\x1b[6~'):
+                                    self._process_key(seq)
+                                else:
+                                    self._key_queue.put(seq)
+                                i += 4
+                                continue
+                            # Arrow keys — handle ←/→ directly for tab switching
+                            arrow = chr(data[i + 2])
+                            seq = chr(0x1b) + '[' + arrow
+                            if self._can_handle_directly() and arrow in ('C', 'D'):
+                                self._process_key(seq)
+                                i += 3
+                                continue
+                            self._key_queue.put(seq)
                             i += 3
                             continue
                         if self._can_handle_directly() and self.view != "main":
@@ -399,7 +547,7 @@ class TUI:
                 break
 
     def _can_handle_directly(self) -> bool:
-        return self.streaming and not self._confirming
+        return self._active_tab.streaming and not self._confirming
 
     # ── Key handling ────────────────────────────────────────────
 
@@ -421,6 +569,18 @@ class TUI:
         elif ch == 'a':
             self.autonomous = not self.autonomous
             self._redraw()
+        elif ch == '\x1b[C':  # right arrow — next tab
+            self._switch_tab(1)
+        elif ch == '\x1b[D':  # left arrow — prev tab
+            self._switch_tab(-1)
+        elif ch == '\x1b[5~':
+            self._scroll_up()
+        elif ch == '\x1b[6~':
+            self._scroll_down()
+        elif ch == 'scroll_up':
+            self._scroll_lines_up()
+        elif ch == 'scroll_down':
+            self._scroll_lines_down()
         elif ch == '\x1b' and self.view != "main":
             self.view = "main"
             self._redraw()
@@ -465,17 +625,34 @@ class TUI:
                         self.view = "main"
                     elif self._nav_step >= 0:
                         self._nav_step = -1
+                        self._restore_worker_tabs()
                     else:
                         self._confirm_buf.clear()
                     self._redraw()
                     continue
 
-                if len(ch) == 3 and ch[:2] == '\x1b[':
-                    if ch[2] == 'A':
+                if ch in ('scroll_up', 'scroll_down'):
+                    if ch == 'scroll_up':
+                        self._scroll_lines_up()
+                    else:
+                        self._scroll_lines_down()
+                    continue
+
+                if len(ch) >= 3 and ch[:2] == '\x1b[':
+                    if ch == '\x1b[A':
                         self._nav_up()
-                    elif ch[2] == 'B':
+                        self._redraw()
+                    elif ch == '\x1b[B':
                         self._nav_down()
-                    self._redraw()
+                        self._redraw()
+                    elif ch == '\x1b[C':
+                        self._switch_tab(1)
+                    elif ch == '\x1b[D':
+                        self._switch_tab(-1)
+                    elif ch == '\x1b[5~':
+                        self._scroll_up()
+                    elif ch == '\x1b[6~':
+                        self._scroll_down()
                     continue
 
                 if ch in ('\n', '\r'):
@@ -489,7 +666,6 @@ class TUI:
                             f"Step {entry['step_num']}: {entry['action']}"
                             f" — {entry['summary']}"
                         )
-                        # Build detail: trace (if visible) + action-specific info
                         parts = []
                         trace = entry.get("trace", "")
                         if trace and self.trace_visible:
@@ -520,6 +696,7 @@ class TUI:
                 if ch == '\t':
                     if self._nav_step >= 0:
                         self._nav_step = -1
+                        self._restore_worker_tabs()
                     else:
                         self._confirm_selected = 1 - self._confirm_selected
                     self._redraw()
@@ -543,6 +720,7 @@ class TUI:
                 if ch.isprintable():
                     if self._nav_step >= 0:
                         self._nav_step = -1
+                        self._restore_worker_tabs()
                     if self._confirm_selected == 0:
                         self._confirm_selected = 1
                     self._confirm_buf.append(ch)
@@ -551,22 +729,47 @@ class TUI:
         finally:
             self._confirming = False
             self._nav_step = -1
+            self._restore_worker_tabs()
             self._redraw()
             self._write('\033[?25l')
 
     def _nav_up(self):
         if self._nav_step == -1:
             if self.step_entries:
+                # Save current worker tabs before entering history
+                self._saved_worker_tabs = self.tabs[1:]
                 self._nav_step = len(self.step_entries) - 1
+                self._load_historical_workers()
         elif self._nav_step > 0:
             self._nav_step -= 1
+            self._load_historical_workers()
 
     def _nav_down(self):
         if self._nav_step >= 0:
             if self._nav_step < len(self.step_entries) - 1:
                 self._nav_step += 1
+                self._load_historical_workers()
             else:
                 self._nav_step = -1
+                self._restore_worker_tabs()
+
+    def _load_historical_workers(self):
+        """Load worker tabs from the selected historical step."""
+        if self._nav_step < 0:
+            return
+        entry = self.step_entries[self._nav_step]
+        historical = entry.get("worker_tabs", [])
+        self.tabs = [self.tabs[0]] + list(historical)
+        if self.active_tab_idx >= len(self.tabs):
+            self.active_tab_idx = 0
+
+    def _restore_worker_tabs(self):
+        """Restore current worker tabs after leaving history."""
+        if self._saved_worker_tabs is not None:
+            self.tabs = [self.tabs[0]] + self._saved_worker_tabs
+            self._saved_worker_tabs = None
+            if self.active_tab_idx >= len(self.tabs):
+                self.active_tab_idx = 0
 
     def _draw_confirmation(self):
         fb = "".join(self._confirm_buf)
@@ -592,6 +795,53 @@ class TUI:
         self.view = "main" if self.view == target else target
         self._redraw()
 
+    # ── Scrolling ────────────────────────────────────────────────
+
+    def _scroll_up(self):
+        tab = self._active_tab
+        page = max(self.rows - self._content_start - 2, 1)
+        tab.scroll_offset += page
+        self._redraw()
+
+    def _scroll_down(self):
+        tab = self._active_tab
+        page = max(self.rows - self._content_start - 2, 1)
+        tab.scroll_offset = max(tab.scroll_offset - page, 0)
+        self._redraw()
+
+    def _scroll_lines_up(self, n: int = 3):
+        self._active_tab.scroll_offset += n
+        self._redraw()
+
+    def _scroll_lines_down(self, n: int = 3):
+        tab = self._active_tab
+        tab.scroll_offset = max(tab.scroll_offset - n, 0)
+        self._redraw()
+
+    def _build_main_lines(self, tab: _Tab | None = None) -> list[str]:
+        """Build flat list of rendered lines for the active tab."""
+        if tab is None:
+            tab = self._active_tab
+        lines: list[str] = []
+        for entry in tab.log_lines:
+            if entry.is_trace:
+                if not self.trace_visible:
+                    continue
+                for tline in entry.text.splitlines():
+                    lines.append(f'  {DIM}{tline}{RESET}')
+            else:
+                is_step = entry.step_idx >= 0
+                if is_step and self._confirming and entry.step_idx == self._nav_step:
+                    lines.append(f' {GREEN}▎{RESET}{entry.text}')
+                else:
+                    lines.append(f' {entry.text}')
+        # Active streaming content (not yet baked)
+        if tab.streaming and tab.trace_buf and self.trace_visible:
+            joined = "".join(tab.trace_buf)
+            for tline in joined.splitlines():
+                lines.append(f'  {DIM}{tline}{RESET}')
+        return lines
+
     # ── Redraw ──────────────────────────────────────────────────
 
     def _redraw(self):
@@ -604,28 +854,36 @@ class TUI:
             self._write_raw(f'\033[{cs};1H')
 
             if self.view == "main":
-                for entry in self.log_lines:
-                    is_step = entry.step_idx >= 0
-                    if is_step and self._confirming and entry.step_idx == self._nav_step:
-                        self._write_raw(f' {GREEN}▎{RESET}{entry.text}\n')
-                    else:
-                        self._write_raw(f' {entry.text}\n')
-                # Spinner or trace
-                if self._spinner_label and (self.streaming):
-                    if not self.trace_visible or not self.trace_buf:
-                        # Show spinner (trace off, or no text yet)
-                        ch = SPINNER[self._spinner_tick]
-                        self._write_raw(f'  {DIM}{ch} {self._spinner_label}{RESET}')
-                    else:
-                        # Trace on and we have text — show trace
-                        for chunk in self.trace_buf:
-                            self._write_raw(f'{DIM}{chunk}{RESET}')
-                elif self.trace_buf:
-                    if self.trace_visible:
-                        for chunk in self.trace_buf:
-                            self._write_raw(f'{DIM}{chunk}{RESET}')
-                        if not self.streaming:
-                            self._write_raw('\n')
+                tab = self._active_tab
+                lines = self._build_main_lines(tab)
+                confirm_rows = 3 if self._confirming else 0
+                spinner_active = (tab.streaming and tab.spinner_label
+                                  and not (tab.trace_buf and self.trace_visible))
+                spinner_rows = 1 if spinner_active else 0
+                avail = self.rows - cs + 1 - confirm_rows - spinner_rows
+
+                # Clamp scroll offset
+                max_off = max(len(lines) - avail, 0)
+                if tab.scroll_offset > max_off:
+                    tab.scroll_offset = max_off
+
+                # Viewport window
+                end = len(lines) - tab.scroll_offset
+                start = max(end - avail, 0)
+                for line in lines[start:end]:
+                    self._write_raw(f'{line}\n')
+
+                # Spinner (no \n so _update_spinner can overwrite in place)
+                if spinner_active:
+                    ch = SPINNER[tab.spinner_tick]
+                    elapsed = int(time.monotonic() - tab.spinner_start)
+                    self._write_raw(f'  {DIM}{ch} {tab.spinner_label} {elapsed}s{RESET}')
+
+                # Scroll indicator
+                if tab.scroll_offset > 0:
+                    indicator = f' {DIM}↓ {tab.scroll_offset} more lines below{RESET}'
+                    self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
+
                 if self._confirming:
                     self._draw_confirmation()
                     self._write_raw('\033[?25h')

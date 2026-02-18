@@ -25,6 +25,8 @@ def main():
                         help="Working directory (resumes if it contains an existing run)")
     parser.add_argument("--isolation", action="store_true",
                         help="Disable web searches (no literature_search action)")
+    parser.add_argument("-P", "--parallelism", type=int, default=1,
+                        help="Max parallel workers per spawn step (default: 1)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show full LLM responses")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -44,6 +46,7 @@ def main():
         tui=tui,
         isolation=args.isolation,
         run_dir=args.run_dir,
+        parallelism=args.parallelism,
     )
 
     # Signal handling: first ctrl+c → graceful shutdown, second → immediate exit
