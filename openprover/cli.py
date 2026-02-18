@@ -49,6 +49,15 @@ def main():
         parallelism=args.parallelism,
     )
 
+    # Check if this is a finished run → inspect mode
+    if prover.is_finished and not args.theorem:
+        try:
+            prover.inspect()
+        finally:
+            tui.cleanup()
+            print(f"  {prover.work_dir}")
+        return
+
     # Signal handling: first ctrl+c → graceful shutdown, second → immediate exit
     def handle_sigint(signum, frame):
         if prover.shutting_down:

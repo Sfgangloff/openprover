@@ -2,7 +2,7 @@
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 
@@ -106,7 +106,6 @@ class Prover:
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
         (self.work_dir / "steps").mkdir(exist_ok=True)
-        (self.work_dir / "archive" / "calls").mkdir(parents=True, exist_ok=True)
 
         # Repo
         self.repo = Repo(self.work_dir / "repo")
@@ -133,8 +132,8 @@ class Prover:
             self.whiteboard = prompts.format_initial_whiteboard(self.theorem_text)
             whiteboard_path.write_text(self.whiteboard)
 
-        # LLM client
-        self.llm = LLMClient(model, self.work_dir / "archive" / "calls")
+        # LLM client (archive_dir is fallback; per-call paths used for step calls)
+        self.llm = LLMClient(model, self.work_dir / "archive")
 
         # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()
@@ -221,6 +220,7 @@ class Prover:
                 system_prompt=prompts.PLANNER_SYSTEM_PROMPT,
                 label=f"planner_step_{self.step_num}",
                 stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
+                archive_path=step_dir / "planner_call.json",
             )
         except RuntimeError as e:
             self.tui.stream_end(tab="planner")
@@ -258,8 +258,8 @@ class Prover:
             return self._handle_give_up()
         if action == "read_items":
             return self._handle_read_items(plan)
-        if action == "write_item":
-            return self._handle_write_item(plan)
+        if action == "write_items":
+            return self._handle_write_items(plan)
         if action == "spawn":
             return self._handle_spawn(plan, step_dir)
         if action == "literature_search":
@@ -302,18 +302,26 @@ class Prover:
         self.tui.log(f"Read {len(slugs)} item(s): {', '.join(slugs)}", dim=True)
         return "continue"
 
-    def _handle_write_item(self, plan: dict) -> str:
-        slug = plan.get("write_slug", "")
-        if not slug:
-            self.tui.log("write_item but no slug specified", color="yellow")
-            return "continue"
-        content = plan.get("write_content")
-        self.repo.write_item(slug, content)
-        if not content:
-            self.tui.log(f"Deleted [[{slug}]]", color="yellow")
-        else:
-            first_line = content.split("\n", 1)[0]
-            self.tui.log(f"Wrote [[{slug}]]: {first_line}", color="green")
+    def _handle_write_items(self, plan: dict) -> str:
+        items = plan.get("items", [])
+        # Fallback: support old write_slug/write_content format
+        if not items:
+            slug = plan.get("write_slug", "")
+            if not slug:
+                self.tui.log("write_items but no items specified", color="yellow")
+                return "continue"
+            items = [{"slug": slug, "content": plan.get("write_content")}]
+        for item in items:
+            slug = item.get("slug", "")
+            if not slug:
+                continue
+            content = item.get("content")
+            self.repo.write_item(slug, content)
+            if not content:
+                self.tui.log(f"Deleted [[{slug}]]", color="yellow")
+            else:
+                first_line = content.split("\n", 1)[0]
+                self.tui.log(f"Wrote [[{slug}]]: {first_line}", color="green")
         return "continue"
 
     def _handle_spawn(self, plan: dict, step_dir: Path) -> str:
@@ -370,21 +378,31 @@ class Prover:
                 desc = task.get("description", "")
                 (workers_dir / f"task_{i}.md").write_text(desc)
 
-                future = pool.submit(self._run_worker, task, worker_ids[i])
+                archive = workers_dir / f"worker_{i}_call.json"
+                future = pool.submit(self._run_worker, task, worker_ids[i], archive)
                 futures[future] = i
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = f"Worker error: {e}"
-                done_count += 1
-                self.tui.mark_worker_done(worker_ids[idx])
-                if done_count < n:
-                    self.tui.set_waiting_status(
-                        f"waiting for {n} worker(s) ({done_count}/{n} finished)"
-                    )
+            pending = set(futures.keys())
+            while pending:
+                if self.shutting_down:
+                    self.tui.log("Shutting down — cancelling workers", color="yellow")
+                    for f in pending:
+                        f.cancel()
+                    break
+                done_set, pending = wait(pending, timeout=0.5,
+                                         return_when=FIRST_COMPLETED)
+                for future in done_set:
+                    idx = futures[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        results[idx] = f"Worker error: {e}"
+                    done_count += 1
+                    self.tui.mark_worker_done(worker_ids[idx])
+                    if done_count < n:
+                        self.tui.set_waiting_status(
+                            f"waiting for {n} worker(s) ({done_count}/{n} finished)"
+                        )
 
         self.tui.set_waiting_status("")
 
@@ -415,9 +433,30 @@ class Prover:
             self.tui.log("literature_search but no query", color="yellow")
             return "continue"
 
+        # Interactive confirmation
+        if not self.autonomous:
+            self.tui.show_proposal(plan)
+            while True:
+                resp = self.tui.get_confirmation()
+                if resp == "":
+                    break  # accept
+                if resp == "q":
+                    self.shutting_down = True
+                    return "stop"
+                if resp == "p":
+                    return "pause"
+                if resp == "a":
+                    self.autonomous = True
+                    self.tui.log("  autonomous mode", dim=True)
+                    break
+                # Feedback — set as prev_output and retry next step
+                self.prev_output = f"Human feedback: {resp}"
+                self.tui.log("Feedback noted — will replan next step", color="yellow")
+                return "continue"
+
         wid = f"search_{self.step_num}"
         task_desc = f"Query: {query}\n\nContext: {context}"
-        self.tui.add_worker_tab(wid, f"search: {query[:30]}", task_description=task_desc)
+        self.tui.add_worker_tab(wid, "Search", task_description=task_desc)
 
         prompt = prompts.format_search_prompt(query, context)
 
@@ -425,6 +464,11 @@ class Prover:
         workers_dir.mkdir(exist_ok=True)
         (workers_dir / "task_0.md").write_text(f"Query: {query}\n\nContext: {context}")
 
+        self.tui.set_waiting_status("searching literature")
+        self.tui.tab_log(wid, f"Query: {query}", dim=True)
+        if context:
+            self.tui.tab_log(wid, f"Context: {context}", dim=True)
+        self.tui.tab_log(wid, "")
         self.tui.stream_start("searching", tab=wid)
         try:
             resp = self.llm.call(
@@ -433,6 +477,7 @@ class Prover:
                 label=f"search_step_{self.step_num}",
                 web_search=True,
                 stream_callback=lambda t: self.tui.stream_text(t, tab=wid),
+                archive_path=workers_dir / "search_call.json",
             )
             self.tui.stream_end(tab=wid)
             result = resp["result"]
@@ -443,13 +488,15 @@ class Prover:
             result = f"Literature search failed: {e}"
             self.tui.log(f"Search error: {e}", color="red")
             self.prev_output = result
-        self.tui.worker_output(wid, result)
+        self.tui.set_waiting_status("")
+        self.tui.worker_output(wid, f"Result:\n\n{result}")
 
         self.tui.mark_worker_done(wid)
         self.tui.snapshot_worker_tabs(self.step_num)
         return "continue"
 
-    def _run_worker(self, task: dict, worker_id: str) -> str:
+    def _run_worker(self, task: dict, worker_id: str,
+                    archive_path: Path | None = None) -> str:
         """Execute a single worker. Thread-safe."""
         description = task.get("description", "")
         resolved_refs = self.repo.resolve_wikilinks(description)
@@ -462,6 +509,7 @@ class Prover:
                 system_prompt=prompts.WORKER_SYSTEM_PROMPT,
                 label=worker_id,
                 stream_callback=lambda t: self.tui.stream_text(t, tab=worker_id),
+                archive_path=archive_path,
             )
             self.tui.stream_end(tab=worker_id)
             result = resp["result"]
@@ -480,7 +528,7 @@ class Prover:
         if plan.get("whiteboard"):
             lines.append(f'whiteboard = """\n{plan["whiteboard"]}\n"""')
         # Save action-specific fields
-        for key in ("proof", "write_slug", "write_content", "search_query", "search_context"):
+        for key in ("proof", "search_query", "search_context"):
             if key in plan:
                 val = plan[key]
                 if isinstance(val, str) and "\n" in val:
@@ -489,6 +537,13 @@ class Prover:
                     lines.append(f'{key} = "{val}"')
         if "read" in plan:
             lines.append(f'read = {json.dumps(plan["read"])}')
+        if "items" in plan:
+            for item in plan["items"]:
+                lines.append("\n[[items]]")
+                lines.append(f'slug = "{item.get("slug", "")}"')
+                content = item.get("content")
+                if content:
+                    lines.append(f'content = """\n{content}\n"""')
         if "tasks" in plan:
             for task in plan["tasks"]:
                 lines.append("\n[[tasks]]")
@@ -518,6 +573,7 @@ class Prover:
                 system_prompt=prompts.PLANNER_SYSTEM_PROMPT,
                 label="discussion",
                 stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
+                archive_path=self.work_dir / "discussion_call.json",
             )
             self.tui.stream_end(tab="planner")
             (self.work_dir / "DISCUSSION.md").write_text(resp["result"])
@@ -530,6 +586,92 @@ class Prover:
                 f"## Final Whiteboard\n\n{self.whiteboard}\n"
             )
             self.tui.log(f"  {self.work_dir / 'DISCUSSION.md'}", dim=True)
+
+    @property
+    def is_finished(self) -> bool:
+        """Check if this run is already finished (has discussion or proof)."""
+        return ((self.work_dir / "DISCUSSION.md").exists()
+                or (self.work_dir / "PROOF.md").exists())
+
+    def inspect(self):
+        """Enter inspect mode — browse historical run data without running steps."""
+        self.tui.setup(
+            theorem_name=self.theorem_name,
+            work_dir=str(self.work_dir),
+            step_num=self.step_num,
+            max_steps=self.max_steps,
+        )
+        self.tui.autonomous = False
+        self.tui.whiteboard = self.whiteboard
+
+        self._load_history()
+
+        # Show result status
+        if (self.work_dir / "PROOF.md").exists():
+            self.tui.log("Proof found!", color="green", bold=True)
+        elif (self.work_dir / "DISCUSSION.md").exists():
+            self.tui.log("Session ended.", dim=True)
+        self.tui.log("Inspect mode — press q to quit", dim=True)
+
+        self.tui.browse()
+
+    def _load_history(self):
+        """Load step history from disk for inspect mode."""
+        steps_dir = self.work_dir / "steps"
+        if not steps_dir.exists():
+            return
+
+        step_dirs = sorted(
+            [d for d in steps_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_")],
+        )
+
+        for idx, step_dir in enumerate(step_dirs):
+            toml_file = step_dir / "planner.toml"
+            if not toml_file.exists():
+                continue
+
+            plan = prompts.parse_planner_toml(toml_file.read_text())
+            if plan is None:
+                continue
+
+            step_num = int(step_dir.name.removeprefix("step_"))
+            action = plan.get("action", "")
+            summary = plan.get("summary", "")
+
+            # Log step in planner tab
+            self.tui.step_complete(step_num, self.max_steps, action, summary)
+
+            # Load worker tabs for spawn/search steps
+            workers_dir = step_dir / "workers"
+            if not workers_dir.exists():
+                self.tui.snapshot_worker_tabs(step_num)
+                if idx < len(step_dirs) - 1:
+                    self.tui.clear_worker_tabs()
+                continue
+
+            task_files = sorted(workers_dir.glob("task_*.md"))
+            for task_file in task_files:
+                tidx = task_file.stem.removeprefix("task_")
+                result_file = workers_dir / f"result_{tidx}.md"
+                desc = task_file.read_text()
+                result = result_file.read_text() if result_file.exists() else ""
+
+                if action == "literature_search":
+                    tab_id = f"search_{step_num}"
+                    label = "Search"
+                else:
+                    tab_id = f"worker_{step_num}_{tidx}"
+                    label = f"Worker {tidx}"
+
+                self.tui.add_worker_tab(tab_id, label, task_description=desc)
+                if result:
+                    self.tui.worker_output(tab_id, result)
+                self.tui.mark_worker_done(tab_id)
+
+            self.tui.snapshot_worker_tabs(step_num)
+            if idx < len(step_dirs) - 1:
+                self.tui.clear_worker_tabs()
 
     def request_shutdown(self):
         self.shutting_down = True

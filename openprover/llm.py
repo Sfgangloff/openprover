@@ -24,6 +24,7 @@ class LLMClient:
         label: str = "",
         web_search: bool = False,
         stream_callback=None,
+        archive_path: Path | None = None,
     ) -> dict:
         """Make an LLM call and archive it.
 
@@ -65,7 +66,7 @@ class LLMClient:
         if use_streaming:
             return self._call_streaming(
                 cmd, prompt, system_prompt, json_schema,
-                call_num, label, start, stream_callback,
+                call_num, label, start, stream_callback, archive_path,
             )
 
         proc = subprocess.run(
@@ -75,14 +76,14 @@ class LLMClient:
 
         if proc.returncode != 0:
             self._archive(call_num, label, prompt, system_prompt, json_schema,
-                          None, proc.stderr, elapsed_ms)
+                          None, proc.stderr, elapsed_ms, archive_path)
             raise RuntimeError(f"Claude CLI failed (exit {proc.returncode}): {proc.stderr[:500]}")
 
         try:
             raw = json.loads(proc.stdout)
         except json.JSONDecodeError:
             self._archive(call_num, label, prompt, system_prompt, json_schema,
-                          None, proc.stdout[:1000], elapsed_ms)
+                          None, proc.stdout[:1000], elapsed_ms, archive_path)
             raise RuntimeError(f"Failed to parse Claude response as JSON: {proc.stdout[:500]}")
 
         cost = raw.get("total_cost_usd", 0.0)
@@ -92,7 +93,7 @@ class LLMClient:
         subtype = raw.get("subtype", "")
         if "error" in subtype:
             self._archive(call_num, label, prompt, system_prompt, json_schema,
-                          raw, subtype, elapsed_ms)
+                          raw, subtype, elapsed_ms, archive_path)
             raise RuntimeError(f"Claude CLI error: {subtype}")
 
         # When using --json-schema, structured output is in 'structured_output'
@@ -102,7 +103,7 @@ class LLMClient:
             result_text = raw.get("result", "")
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      raw, None, elapsed_ms)
+                      raw, None, elapsed_ms, archive_path)
 
         return {
             "result": result_text,
@@ -112,7 +113,7 @@ class LLMClient:
         }
 
     def _call_streaming(self, cmd, prompt, system_prompt, json_schema,
-                        call_num, label, start, callback):
+                        call_num, label, start, callback, archive_path=None):
         """Stream text deltas to callback, return final result."""
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -152,7 +153,7 @@ class LLMClient:
         if result_data is None:
             stderr = proc.stderr.read()
             self._archive(call_num, label, prompt, system_prompt, json_schema,
-                          None, stderr, elapsed_ms)
+                          None, stderr, elapsed_ms, archive_path)
             raise RuntimeError(f"No result from streaming call: {stderr[:500]}")
 
         cost = result_data.get("total_cost_usd", 0.0)
@@ -163,7 +164,7 @@ class LLMClient:
             result_text = result_data.get("result", "")
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      result_data, None, elapsed_ms)
+                      result_data, None, elapsed_ms, archive_path)
 
         return {
             "result": result_text,
@@ -173,7 +174,7 @@ class LLMClient:
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,
-                 response, error, elapsed_ms):
+                 response, error, elapsed_ms, archive_path=None):
         record = {
             "call_num": call_num,
             "label": label,
@@ -185,5 +186,9 @@ class LLMClient:
             "error": error,
             "elapsed_ms": elapsed_ms,
         }
-        path = self.archive_dir / f"call_{call_num:03d}.json"
+        if archive_path:
+            path = archive_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            path = self.archive_dir / f"call_{call_num:03d}.json"
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))

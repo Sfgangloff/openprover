@@ -31,7 +31,7 @@ ACTION_STYLE = {
     "spawn": BLUE,
     "literature_search": MAGENTA,
     "read_items": CYAN,
-    "write_item": CYAN,
+    "write_items": CYAN,
     "proof_found": GREEN,
     "give_up": RED,
 }
@@ -41,6 +41,7 @@ HELP_TEXT = f"""\
 
   {DIM}Instant keys (work any time):{RESET}
     t           toggle reasoning trace
+    i           show worker input (on worker tabs)
     w           toggle whiteboard view
     a           toggle autonomous mode
     {DIM}←/→{RESET}         switch tabs
@@ -137,6 +138,8 @@ class TUI:
         self.active_tab_idx = 0
         # Saved worker tabs (when navigating history)
         self._saved_worker_tabs: list[_Tab] | None = None
+        # Proposal log range (for cleanup after confirmation)
+        self._proposal_log_start: int = -1
 
     _content_start = HEADER_ROWS + 1
 
@@ -254,15 +257,15 @@ class TUI:
         help_style = BOLD if self.view == "help" else DIM
         auto_style = BOLD if self.autonomous else DIM
         wb_style = BOLD if self.view == "whiteboard" else DIM
+        trace_style = BOLD if self.trace_visible else DIM
         if self.active_tab_idx > 0:
-            task_style = BOLD if self.view == "task" else DIM
+            input_style = BOLD if self.view == "input" else DIM
             hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
-                            f'{task_style}t task{RESET} {DIM}·{RESET} '
-                            f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
+                            f'{trace_style}t trace{RESET} {DIM}·{RESET} '
+                            f'{input_style}i input{RESET} {DIM}·{RESET} '
                             f'{auto_style}a autonomous{RESET}')
-            hints_len = len("? help · t task · w whiteboard · a autonomous")
+            hints_len = len("? help · t trace · i input · a autonomous")
         else:
-            trace_style = BOLD if self.trace_visible else DIM
             hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
                             f'{trace_style}t trace{RESET} {DIM}·{RESET} '
                             f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
@@ -283,6 +286,8 @@ class TUI:
                     name = name[:17] + "..."
                 if tab.done:
                     name += " ✓"
+                elif tab.streaming:
+                    name += " …"
                 bracket = f"[{name}]"
                 visible_len += len(bracket) + 1
                 if i == self.active_tab_idx:
@@ -393,8 +398,14 @@ class TUI:
     def log(self, text: str, color: str = "", bold: bool = False, dim: bool = False):
         self._tab_log(self.tabs[0], self._style(text, color, bold, dim))
 
+    def tab_log(self, tab_id: str, text: str, color: str = "", dim: bool = False):
+        """Log a line to a specific tab."""
+        tab = self._find_tab(tab_id)
+        self._tab_log(tab, self._style(text, color, dim=dim))
+
     def show_proposal(self, plan: dict):
         planner = self.tabs[0]
+        self._proposal_log_start = len(planner.log_lines)
         sep = f'{DIM}{"─" * max(self.cols - 4, 20)}{RESET}'
         self._tab_log(planner, sep)
         self._tab_log(planner, f'{DIM}Next step:{RESET}')
@@ -415,6 +426,17 @@ class TUI:
                     self._tab_log(planner, f'      {line}')
             else:
                 self._tab_log(planner, f'  {DIM}[{i}]{RESET} (no description)')
+
+        # Show search details for literature_search
+        if action == "literature_search":
+            query = plan.get("search_query", "")
+            context = plan.get("search_context", "")
+            if query:
+                self._tab_log(planner, f'  {DIM}Query:{RESET}   {query}')
+            if context:
+                self._tab_log(planner, f'  {DIM}Context:{RESET} {context.strip().splitlines()[0]}')
+                for line in context.strip().splitlines()[1:]:
+                    self._tab_log(planner, f'          {line}')
 
     def step_complete(self, step_num: int, max_steps: int,
                       action: str, summary: str, detail: str = ""):
@@ -514,6 +536,11 @@ class TUI:
                 if tab.spinner_label and tab.streaming:
                     self._update_spinner()
 
+                # Process queued keys when idle (no streaming, no confirmation)
+                if not self._confirming and not tab.streaming:
+                    if not self._key_queue.empty():
+                        self._check_keys()
+
                 if not select.select([fd], [], [], 0.04)[0]:
                     continue
                 data = os.read(fd, 32)
@@ -577,7 +604,7 @@ class TUI:
 
                     ch = chr(b)
                     if self._can_handle_directly():
-                        if ch in ('t', 'w', '?', 'a'):
+                        if ch in ('t', 'i', 'w', '?', 'a'):
                             self._process_key(ch)
                             i += 1
                             continue
@@ -614,12 +641,13 @@ class TUI:
 
     def _process_key(self, ch: str):
         if ch == 't':
+            self._toggle_trace()
+        elif ch == 'i':
             if self.active_tab_idx > 0:
-                self._toggle_view("task")
-            else:
-                self._toggle_trace()
+                self._toggle_view("input")
         elif ch == 'w':
-            self._toggle_view("whiteboard")
+            if self.active_tab_idx == 0:
+                self._toggle_view("whiteboard")
         elif ch == '?':
             self._toggle_view("help")
         elif ch == 'a':
@@ -763,7 +791,7 @@ class TUI:
                     continue
 
                 can_toggle = (self._confirm_selected == 0 or not self._confirm_buf)
-                if can_toggle and ch in ('t', 'w', '?'):
+                if can_toggle and ch in ('t', 'i', 'w', '?'):
                     self._process_key(ch)
                     continue
 
@@ -790,8 +818,95 @@ class TUI:
             self._confirming = False
             self._nav_step = -1
             self._restore_worker_tabs()
+            self._clear_proposal()
             self._redraw()
             self._write('\033[?25l')
+
+    def _clear_proposal(self):
+        """Remove detailed proposal lines, keeping only a compact summary."""
+        if self._proposal_log_start < 0:
+            return
+        planner = self.tabs[0]
+        planner.log_lines = planner.log_lines[:self._proposal_log_start]
+        self._proposal_log_start = -1
+
+    def browse(self):
+        """Interactive browse mode for inspect. Blocks until user presses q."""
+        self._confirming = True  # prevent bg_loop from stealing keys
+        self._nav_step = -1
+        self._redraw()
+
+        try:
+            while True:
+                try:
+                    ch = self._key_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if ch in ('q', '\x03', '\x04'):
+                    break
+
+                if ch in ('scroll_up', 'scroll_down'):
+                    if ch == 'scroll_up':
+                        self._scroll_lines_up()
+                    else:
+                        self._scroll_lines_down()
+                    continue
+
+                if len(ch) >= 3 and ch[:2] == '\x1b[':
+                    if ch == '\x1b[A':
+                        self._nav_up()
+                        self._redraw()
+                    elif ch == '\x1b[B':
+                        self._nav_down()
+                        self._redraw()
+                    elif ch == '\x1b[C':
+                        self._switch_tab(1)
+                    elif ch == '\x1b[D':
+                        self._switch_tab(-1)
+                    elif ch == '\x1b[5~':
+                        self._scroll_up()
+                    elif ch == '\x1b[6~':
+                        self._scroll_down()
+                    continue
+
+                if ch == '\x1b':
+                    if self.view != "main":
+                        self.view = "main"
+                        self._redraw()
+                    elif self._nav_step >= 0:
+                        self._nav_step = -1
+                        self._restore_worker_tabs()
+                        self._redraw()
+                    continue
+
+                if ch in ('\n', '\r'):
+                    if self.view != "main":
+                        self.view = "main"
+                        self._redraw()
+                    elif self._nav_step >= 0:
+                        entry = self.step_entries[self._nav_step]
+                        self._step_detail_title = (
+                            f"Step {entry['step_num']}: {entry['action']}"
+                            f" — {entry['summary']}"
+                        )
+                        detail = entry.get("detail", "")
+                        self._step_detail_text = detail or "(no detail)"
+                        self.view = "step_detail"
+                        self._redraw()
+                    elif self._active_tab.scroll_offset > 0:
+                        self._active_tab.scroll_offset = 0
+                        self._redraw()
+                    continue
+
+                self._process_key(ch)
+
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            self._confirming = False
+            self._nav_step = -1
+            self._restore_worker_tabs()
 
     def _nav_up(self):
         if self._nav_step == -1:
@@ -883,11 +998,15 @@ class TUI:
         if tab is None:
             tab = self._active_tab
         lines: list[str] = []
+        max_w = max(self.cols - 4, 20)
         for entry in tab.log_lines:
             if entry.is_trace:
                 if not self.trace_visible:
                     continue
                 for tline in entry.text.splitlines():
+                    while len(tline) > max_w:
+                        lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
+                        tline = tline[max_w:]
                     lines.append(f'  {DIM}{tline}{RESET}')
             else:
                 is_step = entry.step_idx >= 0
@@ -899,6 +1018,9 @@ class TUI:
         if tab.streaming and tab.trace_buf and self.trace_visible:
             joined = "".join(tab.trace_buf)
             for tline in joined.splitlines():
+                while len(tline) > max_w:
+                    lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
+                    tline = tline[max_w:]
                 lines.append(f'  {DIM}{tline}{RESET}')
         return lines
 
@@ -916,7 +1038,7 @@ class TUI:
             if self.view == "main":
                 tab = self._active_tab
                 lines = self._build_main_lines(tab)
-                confirm_rows = 3 if self._confirming else 0
+                confirm_rows = 3 if (self._confirming and self.active_tab_idx == 0) else 0
                 spinner_active = (tab.streaming and tab.spinner_label
                                   and not (tab.trace_buf and self.trace_visible))
                 spinner_rows = 1 if spinner_active else 0
@@ -944,7 +1066,7 @@ class TUI:
                     indicator = f' {DIM}↓ {tab.scroll_offset} more lines below{RESET}'
                     self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
 
-                if self._confirming:
+                if self._confirming and self.active_tab_idx == 0:
                     self._draw_confirmation()
                     self._write_raw('\033[?25h')
             elif self.view == "whiteboard":
@@ -952,9 +1074,9 @@ class TUI:
                 self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
                 for wline in self.whiteboard.splitlines():
                     self._write_raw(f'  {wline}\n')
-            elif self.view == "task":
+            elif self.view == "input":
                 tab = self._active_tab
-                self._write_raw(f'  {BOLD}Task{RESET} {DIM}(esc to return){RESET}\n')
+                self._write_raw(f'  {BOLD}Worker Input{RESET} {DIM}(esc to return){RESET}\n')
                 self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
                 desc = tab.task_description or "(no task description)"
                 for tline in desc.splitlines():
