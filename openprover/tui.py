@@ -83,9 +83,9 @@ class _Tab:
     """A tab with its own log buffer and streaming state."""
     __slots__ = ("id", "label", "log_lines", "trace_buf", "scroll_offset",
                  "streaming", "spinner_label", "spinner_tick", "spinner_time",
-                 "spinner_start", "last_trace", "done")
+                 "spinner_start", "last_trace", "done", "task_description")
 
-    def __init__(self, tab_id: str, label: str):
+    def __init__(self, tab_id: str, label: str, task_description: str = ""):
         self.id = tab_id
         self.label = label
         self.log_lines: list[_LogEntry] = []
@@ -98,6 +98,7 @@ class _Tab:
         self.spinner_start = 0.0
         self.last_trace = ""
         self.done = False
+        self.task_description = task_description
 
 
 class TUI:
@@ -130,6 +131,7 @@ class TUI:
         self._confirm_buf: list[str] = []
         # Thread safety for stdout
         self._write_lock = threading.Lock()
+        self._key_process_lock = threading.Lock()
         # Tabs
         self.tabs: list[_Tab] = [_Tab("planner", "Planner")]
         self.active_tab_idx = 0
@@ -250,14 +252,22 @@ class TUI:
 
         # Row 3 — hints
         help_style = BOLD if self.view == "help" else DIM
-        trace_style = BOLD if self.trace_visible else DIM
-        wb_style = BOLD if self.view == "whiteboard" else DIM
         auto_style = BOLD if self.autonomous else DIM
-        hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
-                        f'{trace_style}t trace{RESET} {DIM}·{RESET} '
-                        f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
-                        f'{auto_style}a autonomous{RESET}')
-        hints_len = len("? help · t trace · w whiteboard · a autonomous")
+        wb_style = BOLD if self.view == "whiteboard" else DIM
+        if self.active_tab_idx > 0:
+            task_style = BOLD if self.view == "task" else DIM
+            hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
+                            f'{task_style}t task{RESET} {DIM}·{RESET} '
+                            f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
+                            f'{auto_style}a autonomous{RESET}')
+            hints_len = len("? help · t task · w whiteboard · a autonomous")
+        else:
+            trace_style = BOLD if self.trace_visible else DIM
+            hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
+                            f'{trace_style}t trace{RESET} {DIM}·{RESET} '
+                            f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
+                            f'{auto_style}a autonomous{RESET}')
+            hints_len = len("? help · t trace · w whiteboard · a autonomous")
         pad = max(w - 2 - hints_len - 1, 0)
         self._write_raw('\033[3;1H\033[2K')
         self._write_raw(f'{BLUE}│{RESET}{" " * pad}{hints_styled} {BLUE}│{RESET}')
@@ -296,8 +306,8 @@ class TUI:
 
     # ── Tab management ──────────────────────────────────────────
 
-    def add_worker_tab(self, tab_id: str, label: str):
-        tab = _Tab(tab_id, label)
+    def add_worker_tab(self, tab_id: str, label: str, task_description: str = ""):
+        tab = _Tab(tab_id, label, task_description)
         self.tabs.append(tab)
         self._redraw_header()
 
@@ -317,7 +327,37 @@ class TUI:
                 entry["worker_tabs"] = worker_tabs
                 break
 
-    def _clear_worker_tabs(self):
+    def set_waiting_status(self, text: str):
+        """Show or clear a waiting-for-workers spinner on the planner tab."""
+        planner = self.tabs[0]
+        if text:
+            planner.spinner_label = text
+            planner.streaming = True
+            planner.spinner_start = time.monotonic()
+            planner.spinner_time = 0.0
+            planner.spinner_tick = 0
+            if planner is self._active_tab and self.view == "main":
+                ch = SPINNER[0]
+                self._write(f'  {DIM}{ch} {text} 0s{RESET}')
+        else:
+            planner.streaming = False
+            planner.spinner_label = ""
+            if planner is self._active_tab and self.view == "main":
+                self._write('\r\033[2K')
+
+    def worker_output(self, tab_id: str, text: str):
+        """Display worker result in its tab as regular (always-visible) content."""
+        tab = self._find_tab(tab_id)
+        sep_text = f'{DIM}{"─" * max(self.cols - 4, 20)}{RESET}'
+        tab.log_lines.append(_LogEntry(sep_text))
+        for line in text.splitlines():
+            tab.log_lines.append(_LogEntry(line))
+        if len(tab.log_lines) > 500:
+            tab.log_lines = tab.log_lines[-500:]
+        if tab is self._active_tab and self.view == "main":
+            self._redraw()
+
+    def clear_worker_tabs(self):
         """Remove all worker tabs, keeping only planner."""
         self.tabs = [self.tabs[0]]
         self.active_tab_idx = 0
@@ -367,9 +407,14 @@ class TUI:
         # Show task descriptions for spawn
         tasks = plan.get("tasks", [])
         for i, task in enumerate(tasks):
-            desc = task.get("description", "")
-            first_line = desc.split("\n")[0][:60] if desc else ""
-            self._tab_log(planner, f'  {DIM}[{i}]{RESET} {first_line}')
+            desc = task.get("description", "").strip()
+            if desc:
+                lines = desc.splitlines()
+                self._tab_log(planner, f'  {DIM}[{i}]{RESET} {lines[0]}')
+                for line in lines[1:]:
+                    self._tab_log(planner, f'      {line}')
+            else:
+                self._tab_log(planner, f'  {DIM}[{i}]{RESET} (no description)')
 
     def step_complete(self, step_num: int, max_steps: int,
                       action: str, summary: str, detail: str = ""):
@@ -536,7 +581,10 @@ class TUI:
                             self._process_key(ch)
                             i += 1
                             continue
-                        if ch in ('\n', '\r') and self.view != "main":
+                        if ch in ('\n', '\r') and (
+                            self.view != "main"
+                            or self._active_tab.scroll_offset > 0
+                        ):
                             self._process_key(ch)
                             i += 1
                             continue
@@ -552,16 +600,24 @@ class TUI:
     # ── Key handling ────────────────────────────────────────────
 
     def _check_keys(self):
-        while True:
-            try:
-                ch = self._key_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._process_key(ch)
+        if not self._key_process_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                try:
+                    ch = self._key_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._process_key(ch)
+        finally:
+            self._key_process_lock.release()
 
     def _process_key(self, ch: str):
         if ch == 't':
-            self._toggle_trace()
+            if self.active_tab_idx > 0:
+                self._toggle_view("task")
+            else:
+                self._toggle_trace()
         elif ch == 'w':
             self._toggle_view("whiteboard")
         elif ch == '?':
@@ -584,9 +640,13 @@ class TUI:
         elif ch == '\x1b' and self.view != "main":
             self.view = "main"
             self._redraw()
-        elif ch in ('\n', '\r') and self.view != "main":
-            self.view = "main"
-            self._redraw()
+        elif ch in ('\n', '\r'):
+            if self.view != "main":
+                self.view = "main"
+                self._redraw()
+            elif self._active_tab.scroll_offset > 0:
+                self._active_tab.scroll_offset = 0
+                self._redraw()
         elif self.autonomous and ch in ('q', 'p', 's'):
             self.pending_action = {
                 'q': 'quit', 'p': 'pause',
@@ -892,6 +952,13 @@ class TUI:
                 self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
                 for wline in self.whiteboard.splitlines():
                     self._write_raw(f'  {wline}\n')
+            elif self.view == "task":
+                tab = self._active_tab
+                self._write_raw(f'  {BOLD}Task{RESET} {DIM}(esc to return){RESET}\n')
+                self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
+                desc = tab.task_description or "(no task description)"
+                for tline in desc.splitlines():
+                    self._write_raw(f'  {tline}\n')
             elif self.view == "help":
                 self._write_raw(HELP_TEXT)
             elif self.view == "step_detail":

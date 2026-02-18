@@ -193,6 +193,9 @@ class Prover:
             if action == "summarize":
                 pass  # TODO: on-demand summary
 
+        # Clear previous step's worker tabs
+        self.tui.clear_worker_tabs()
+
         # Save step input
         step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
         step_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +209,7 @@ class Prover:
             step_num=self.step_num,
             max_steps=self.max_steps,
             isolation=self.isolation,
+            parallelism=self.parallelism,
         )
         self.prev_output = ""
 
@@ -347,16 +351,19 @@ class Prover:
         for i, task in enumerate(tasks):
             wid = f"worker_{self.step_num}_{i}"
             desc = task.get("description", "")
-            label = desc.split("\n")[0][:40] if desc else f"Worker {i}"
-            self.tui.add_worker_tab(wid, label)
+            label = f"Worker {i}"
+            self.tui.add_worker_tab(wid, label, task_description=desc)
             worker_ids.append(wid)
 
         # Run workers
         workers_dir = step_dir / "workers"
         workers_dir.mkdir(exist_ok=True)
         results = [None] * len(tasks)
+        n = len(tasks)
+        done_count = 0
+        self.tui.set_waiting_status(f"waiting for {n} worker(s) (0/{n} finished)")
 
-        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        with ThreadPoolExecutor(max_workers=n) as pool:
             futures = {}
             for i, task in enumerate(tasks):
                 # Save task
@@ -372,7 +379,14 @@ class Prover:
                     results[idx] = future.result()
                 except Exception as e:
                     results[idx] = f"Worker error: {e}"
+                done_count += 1
                 self.tui.mark_worker_done(worker_ids[idx])
+                if done_count < n:
+                    self.tui.set_waiting_status(
+                        f"waiting for {n} worker(s) ({done_count}/{n} finished)"
+                    )
+
+        self.tui.set_waiting_status("")
 
         # Save results and build prev_output
         parts = []
@@ -402,7 +416,8 @@ class Prover:
             return "continue"
 
         wid = f"search_{self.step_num}"
-        self.tui.add_worker_tab(wid, f"search: {query[:30]}")
+        task_desc = f"Query: {query}\n\nContext: {context}"
+        self.tui.add_worker_tab(wid, f"search: {query[:30]}", task_description=task_desc)
 
         prompt = prompts.format_search_prompt(query, context)
 
@@ -420,12 +435,15 @@ class Prover:
                 stream_callback=lambda t: self.tui.stream_text(t, tab=wid),
             )
             self.tui.stream_end(tab=wid)
-            self.prev_output = resp["result"]
-            (workers_dir / "result_0.md").write_text(resp["result"])
+            result = resp["result"]
+            self.prev_output = result
+            (workers_dir / "result_0.md").write_text(result)
         except RuntimeError as e:
             self.tui.stream_end(tab=wid)
+            result = f"Literature search failed: {e}"
             self.tui.log(f"Search error: {e}", color="red")
-            self.prev_output = f"Literature search failed: {e}"
+            self.prev_output = result
+        self.tui.worker_output(wid, result)
 
         self.tui.mark_worker_done(wid)
         self.tui.snapshot_worker_tabs(self.step_num)
@@ -446,10 +464,12 @@ class Prover:
                 stream_callback=lambda t: self.tui.stream_text(t, tab=worker_id),
             )
             self.tui.stream_end(tab=worker_id)
-            return resp["result"]
+            result = resp["result"]
         except RuntimeError as e:
             self.tui.stream_end(tab=worker_id)
-            return f"Worker error: {e}"
+            result = f"Worker error: {e}"
+        self.tui.worker_output(worker_id, result)
+        return result
 
     # ── Saving & discussion ──────────────────────────────────
 
