@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 # ── Action types ────────────────────────────────────────────
 
 ACTIONS = [
-    "proof_found", "give_up", "read_items", "write_item",
+    "proof_found", "give_up", "read_items", "write_items",
     "spawn", "literature_search",
 ]
 ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
@@ -35,14 +35,16 @@ PLANNER_SYSTEM_PROMPT = (
     "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning -- no web access.\n"
     "- **literature_search**: Search the web for relevant mathematical literature. Spawns one web-enabled worker.\n"
     "- **read_items**: Request full content of repo items (you only see one-line summaries by default).\n"
-    "- **write_item**: Create, update, or delete a repo item.\n"
+    "- **write_items**: Create, update, or delete one or more repo items.\n"
     "- **proof_found**: Declare success. **This terminates the session.** You must be confident the proof is correct -- it must have been independently verified by a worker.\n"
     "- **give_up**: Declare failure. Only after using nearly all allotted steps.\n"
     "\n"
     "## Principles\n"
     "\n"
-    "1. KEEP IT SIMPLE. Don't spawn workers for trivial bookkeeping -- use write_item for that.\n"
-    "2. Give workers COMPLETE context in their task descriptions. They see ONLY the task description plus any [[wikilink]]-referenced repo items. Include the theorem statement, relevant definitions, and specific instructions.\n"
+    "1. KEEP IT SIMPLE. Don't spawn workers for trivial bookkeeping -- use write_items for that.\n"
+    "2. **Write clear, direct task descriptions.** When you spawn workers, state exactly what they should do. "
+    "Do all your thinking BEFORE writing the task. The task description should be a crisp instruction, not a stream of consciousness. "
+    "Workers see ONLY the task description plus [[wikilink]]-referenced repo items -- include theorem statement, definitions, and all needed context.\n"
     "3. Before diving into a proof attempt, think about whether the approach can actually work. Catch doomed avenues early.\n"
     "4. Try small cases and examples first. Delegate exploration workers before committing to a full proof attempt.\n"
     "5. When stuck: reduce to a simpler subproblem, or generalize to a setting where the result becomes natural.\n"
@@ -73,6 +75,7 @@ PLANNER_SYSTEM_PROMPT = (
     "```\n"
     "\n"
     "Store: proven lemmas, failed attempts (brief), key observations, literature findings.\n"
+    "Each item should be self-contained and atomic -- one logical thing per item.\n"
     "Don't store: trivial facts, work-in-progress that belongs on the whiteboard.\n"
     "\n"
     "## CRITICAL: proof_found\n"
@@ -103,7 +106,20 @@ PLANNER_SYSTEM_PROMPT = (
     "\n"
     f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
     '**read_items**: `read = ["slug-1", "slug-2"]`\n'
-    f'**write_item**: `write_slug = "item-slug"` and `write_content = {_TQ}Summary: ...\\n\\n...{_TQ}` (omit write_content to delete)\n'
+    "**write_items**: one or more `[[items]]` sections:\n"
+    "```toml\n"
+    "[[items]]\n"
+    'slug = "item-slug"\n'
+    f"content = {_TQ}\n"
+    "Summary: One sentence.\n"
+    "\n"
+    "Full content here.\n"
+    f"{_TQ}\n"
+    "\n"
+    "[[items]]\n"
+    'slug = "another-item"\n'
+    "# omit content to delete\n"
+    "```\n"
     f"**spawn**: one or more `[[tasks]]` sections with `description = {_TQ}...{_TQ}`\n"
     f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
 )
@@ -150,7 +166,7 @@ def format_planner_prompt(
         parts.append(
             "\n\nNote: Literature search / web search is NOT available in this session."
         )
-    parts.append(f"\n\nStep {step_num}/{max_steps}. Max {parallelism} worker(s) per spawn. What's the most productive next move?")
+    parts.append(f"\n\nMax {parallelism} worker(s) per spawn. What's the most productive next move?")
     return "".join(parts)
 
 
@@ -234,11 +250,12 @@ def _parse_toml_minimal(text: str) -> dict | None:
     """Minimal TOML-ish parser for our specific format.
 
     Handles: top-level key = "value", triple-quoted multiline strings,
-    key = [...] arrays, and [[tasks]] array-of-tables.
+    key = [...] arrays, [[tasks]] and [[items]] array-of-tables.
     """
     result: dict = {}
-    tasks: list[dict] = []
-    current_task: dict | None = None
+    # Array-of-tables: [[tasks]] and [[items]]
+    array_tables: dict[str, list[dict]] = {"tasks": [], "items": []}
+    current_table: dict | None = None
 
     lines = text.split('\n')
     i = 0
@@ -250,10 +267,11 @@ def _parse_toml_minimal(text: str) -> dict | None:
             i += 1
             continue
 
-        # [[tasks]] — start a new task table
-        if line == '[[tasks]]':
-            current_task = {}
-            tasks.append(current_task)
+        # [[tasks]] or [[items]] — start a new table entry
+        if line in ('[[tasks]]', '[[items]]'):
+            table_name = line[2:-2]
+            current_table = {}
+            array_tables[table_name].append(current_table)
             i += 1
             continue
 
@@ -265,7 +283,7 @@ def _parse_toml_minimal(text: str) -> dict | None:
 
         key = m.group(1)
         rest = m.group(2).strip()
-        target = current_task if current_task is not None else result
+        target = current_table if current_table is not None else result
 
         # Triple-quoted multiline string
         if rest.startswith('"""'):
@@ -309,7 +327,8 @@ def _parse_toml_minimal(text: str) -> dict | None:
         target[key] = rest
         i += 1
 
-    if tasks:
-        result['tasks'] = tasks
+    for name, entries in array_tables.items():
+        if entries:
+            result[name] = entries
 
     return result if 'action' in result else None
