@@ -10,4 +10,4 @@ srun \
   --account=project_465001752 \
   --time=04:00:00 \
   --pty \
-  singularity shell -B /project/project_465001752 /project/project_465001752/nanoproof-container.sif
+  singularity shell -B /project/project_465001752 /project/project_465002619/nanoproof-container.sif

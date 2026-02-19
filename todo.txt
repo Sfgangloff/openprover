@@ -1,6 +1,10 @@
 - ResearchStep dataset
 - maybe we can try using QED-Nano? If this worked, that would be very cool.
 - integration with tools like blueprint or Corca
+- use the Reasoning Traces (RT) idea (https://arxiv.org/abs/2602.03773) - similarly to QED-Nano
+
+
+
 
 ideas:
 - single compact whiteboard state (isn't it like recursive LLMs?)

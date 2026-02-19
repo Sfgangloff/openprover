@@ -156,10 +156,12 @@ class TUI:
         return self.tabs[0]
 
     def setup(self, theorem_name: str, work_dir: str,
-              step_num: int = 0, max_steps: int = 50):
+              step_num: int = 0, max_steps: int = 50,
+              model_name: str = ""):
         self.theorem_name = theorem_name
         self.step_num = step_num
         self.max_steps = max_steps
+        self.model_name = model_name
         size = shutil.get_terminal_size()
         self.cols, self.rows = size.columns, size.lines
 
@@ -230,13 +232,18 @@ class TUI:
         step = f"step {self.step_num}/{self.max_steps}" if self.step_num else ""
 
         # Row 1
+        model = getattr(self, 'model_name', '') or ''
         self._write_raw('\033[1;1H\033[2K')
         self._write_raw(f'{BLUE}╭─{RESET} {BOLD}OpenProver{RESET} {DIM}v{__version__}{RESET}')
         if step:
             self._write_raw(f' {BLUE}──{RESET} {DIM}{step}{RESET}')
+        if model:
+            self._write_raw(f' {BLUE}·{RESET} {YELLOW}{model}{RESET}')
         r1_text = f"─ OpenProver v{__version__}"
         if step:
             r1_text += f" ── {step}"
+        if model:
+            r1_text += f" · {model}"
         r1_text += " "
         fill1 = max(w - len(r1_text) - 2, 0)
         self._write_raw(f' {BLUE}{"─" * fill1}╮{RESET}')

@@ -151,6 +151,7 @@ class Prover:
             work_dir=str(self.work_dir),
             step_num=self.step_num,
             max_steps=self.max_steps,
+            model_name=self.model,
         )
         self.tui.autonomous = self.autonomous
         self.tui.whiteboard = self.whiteboard
@@ -601,6 +602,7 @@ class Prover:
             work_dir=str(self.work_dir),
             step_num=self.step_num,
             max_steps=self.max_steps,
+            model_name=self.model,
         )
         self.tui.autonomous = False
         self.tui.whiteboard = self.whiteboard

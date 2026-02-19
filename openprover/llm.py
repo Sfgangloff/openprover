@@ -206,6 +206,19 @@ class HFClient:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.call_count = 0
         self.total_cost = 0.0
+        self._check_server()
+
+    def _check_server(self):
+        """Verify the HF server is reachable. Fail fast with a clear error."""
+        try:
+            resp = urllib.request.urlopen(f"{self.base_url}/health", timeout=5)
+            json.loads(resp.read())
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            raise SystemExit(
+                f"Error: cannot reach HF server at {self.base_url}\n"
+                f"  Start it with: python scripts/serve_hf.py\n"
+                f"  ({e})"
+            )
 
     def call(
         self,
