@@ -1,8 +1,10 @@
-"""Claude CLI wrapper for LLM calls."""
+"""LLM client wrappers — Claude CLI and OpenAI-compatible HTTP."""
 
 import json
 import subprocess
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 
@@ -171,6 +173,150 @@ class LLMClient:
             "cost": cost,
             "duration_ms": result_data.get("duration_ms", elapsed_ms),
             "raw": result_data,
+        }
+
+    def _archive(self, call_num, label, prompt, system_prompt, json_schema,
+                 response, error, elapsed_ms, archive_path=None):
+        record = {
+            "call_num": call_num,
+            "label": label,
+            "model": self.model,
+            "system_prompt": system_prompt,
+            "prompt": prompt,
+            "json_schema": json_schema,
+            "response": response,
+            "error": error,
+            "elapsed_ms": elapsed_ms,
+        }
+        if archive_path:
+            path = archive_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            path = self.archive_dir / f"call_{call_num:03d}.json"
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+
+
+class HFClient:
+    """Calls an OpenAI-compatible HTTP server (e.g. serve_hf.py) and archives interactions."""
+
+    def __init__(self, model: str, archive_dir: Path, base_url: str = "http://localhost:8000"):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.archive_dir = archive_dir
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        self.call_count = 0
+        self.total_cost = 0.0
+
+    def call(
+        self,
+        prompt: str,
+        system_prompt: str,
+        json_schema: dict | None = None,
+        label: str = "",
+        web_search: bool = False,
+        stream_callback=None,
+        archive_path: Path | None = None,
+    ) -> dict:
+        """Make an LLM call via HTTP and archive it.
+
+        Same interface as LLMClient.call(). web_search and json_schema are ignored.
+        """
+        self.call_count += 1
+        call_num = self.call_count
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 32768,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "stream": bool(stream_callback),
+        }
+
+        start = time.time()
+
+        try:
+            if stream_callback:
+                return self._call_streaming(
+                    payload, prompt, system_prompt, json_schema,
+                    call_num, label, start, stream_callback, archive_path,
+                )
+            else:
+                return self._call_non_streaming(
+                    payload, prompt, system_prompt, json_schema,
+                    call_num, label, start, archive_path,
+                )
+        except (urllib.error.URLError, ConnectionError) as e:
+            elapsed_ms = int((time.time() - start) * 1000)
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, str(e), elapsed_ms, archive_path)
+            raise RuntimeError(f"HF server request failed: {e}")
+
+    def _call_non_streaming(self, payload, prompt, system_prompt, json_schema,
+                            call_num, label, start, archive_path):
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=600)
+        raw = json.loads(resp.read())
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        result_text = raw["choices"][0]["message"]["content"]
+        usage = raw.get("usage", {})
+
+        self._archive(call_num, label, prompt, system_prompt, json_schema,
+                      raw, None, elapsed_ms, archive_path)
+
+        return {
+            "result": result_text,
+            "cost": 0.0,
+            "duration_ms": elapsed_ms,
+            "raw": raw,
+        }
+
+    def _call_streaming(self, payload, prompt, system_prompt, json_schema,
+                        call_num, label, start, callback, archive_path):
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=600)
+
+        collected = []
+        for raw_line in resp:
+            line = raw_line.decode().strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+            if content:
+                callback(content)
+                collected.append(content)
+
+        elapsed_ms = int((time.time() - start) * 1000)
+        result_text = "".join(collected)
+
+        self._archive(call_num, label, prompt, system_prompt, json_schema,
+                      {"result": result_text}, None, elapsed_ms, archive_path)
+
+        return {
+            "result": result_text,
+            "cost": 0.0,
+            "duration_ms": elapsed_ms,
+            "raw": {"result": result_text},
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,

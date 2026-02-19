@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 
 from . import prompts
-from .llm import LLMClient
 from .tui import TUI
 
 
@@ -77,11 +76,13 @@ class Repo:
 
 
 class Prover:
-    def __init__(self, theorem_path: str | None, model: str, max_steps: int,
+    def __init__(self, theorem_path: str | None, make_llm, model_name: str,
+                 max_steps: int,
                  autonomous: bool, verbose: bool, tui: TUI,
                  isolation: bool = False, run_dir: str | None = None,
                  parallelism: int = 1):
-        self.model = model
+        self.model = model_name
+        self._make_llm = make_llm
         self.max_steps = max_steps
         self.autonomous = autonomous
         self.verbose = verbose
@@ -133,7 +134,7 @@ class Prover:
             whiteboard_path.write_text(self.whiteboard)
 
         # LLM client (archive_dir is fallback; per-call paths used for step calls)
-        self.llm = LLMClient(model, self.work_dir / "archive")
+        self.llm = self._make_llm(self.work_dir / "archive")
 
         # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()

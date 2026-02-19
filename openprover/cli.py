@@ -5,6 +5,7 @@ import signal
 import sys
 
 from openprover import __version__
+from .llm import LLMClient, HFClient
 from .prover import Prover
 from .tui import TUI
 
@@ -15,8 +16,10 @@ def main():
         description="Theorem prover powered by language models",
     )
     parser.add_argument("theorem", nargs="?", help="Path to theorem statement file (.md)")
-    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus"],
+    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "qed-nano"],
                         help="Model to use (default: sonnet)")
+    parser.add_argument("--hf-url", default="http://localhost:8000",
+                        help="HF server URL for qed-nano (default: http://localhost:8000)")
     parser.add_argument("--max-steps", type=int, default=50,
                         help="Maximum number of proving steps (default: 50)")
     parser.add_argument("--autonomous", action="store_true",
@@ -35,11 +38,23 @@ def main():
     if not args.theorem and not args.run_dir:
         parser.error("theorem is required (or use --run-dir to resume an existing run)")
 
+    # QED-Nano has no web search capability — force isolation
+    if args.model == "qed-nano" and not args.isolation:
+        args.isolation = True
+
     tui = TUI()
+
+    # Construct LLM client — Prover.setup_work_dir needs to run first to know
+    # the archive dir, so we pass a factory that Prover calls after setup.
+    def make_llm(archive_dir):
+        if args.model == "qed-nano":
+            return HFClient("lm-provers/QED-Nano", archive_dir, base_url=args.hf_url)
+        return LLMClient(args.model, archive_dir)
 
     prover = Prover(
         theorem_path=args.theorem,
-        model=args.model,
+        make_llm=make_llm,
+        model_name=args.model,
         max_steps=args.max_steps,
         autonomous=args.autonomous,
         verbose=args.verbose,
