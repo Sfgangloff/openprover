@@ -1,9 +1,11 @@
 - ResearchStep dataset
 - maybe we can try using QED-Nano? If this worked, that would be very cool.
 - integration with tools like blueprint or Corca
-- use the Reasoning Traces (RT) idea (https://arxiv.org/abs/2602.03773) - similarly to QED-Nano
+- use the Reasoning Cache (RT) idea (https://arxiv.org/abs/2602.03773) - similarly to QED-Nano
+- add a mode where OpenProver also tries to 1) simplify the final proof or make it nicer and 2) generalize the proof
 
-
+- use LeanExplore (https://github.com/justincasher/lean-explore) during autoformalization.
+  Instruct the agent to search at most once for each thing (we don't want to get stuck on the searching).
 
 
 ideas:
@@ -32,6 +34,27 @@ ideas:
 - we want to use formal verification (Lean) - but not for proof search
   -> synthesis of formal methods (AlphaProof) and informal methods (Aletheia)
 
+----------
+
+We now need to integrate Lean verification into the process. We need to add
+support for the case where the theorem to be proven is formalized in Lean.
+Enforce that the input file is either .md or .lean. When .lean, our goal will be
+to generate both PROOF.lean and PROOF.md. The resulting lean file (if produced)
+must be a valid Lean file with all `sorry` keywords replaced (and nothing else
+changed - think of a way to check that).  Let's use
+https://github.com/oOo0oOo/lean-lsp-mcp - research how it works. We'll only use
+the lean_diagnostic_messages (Lean file execution + feedback) and lean_verify (check theorem soundness) actions.  Proof search
+should be done purely in natural language, as it is now. Lean should only be
+used for autoformalization to verify the final proof. To autoformalize something
+should be another type of thing that the planner can task a worker to do. Also,
+make it so that if the run dir already contains PROOF.md, and it also contains
+THEOREM.lean (THEOREM.md is mandatory), the planner will just ask a worker to
+formalize the proof.
+
+To enable a worker to formalize a proof (which might require multiple steps), we
+need to allow workers to do more than one steps. Right now, worker simply does
+reasoning+output and finishes (directly submits the output to planner). Instead,
+the `formalize` action should have a budget of 
 
 ----------
 
