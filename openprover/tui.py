@@ -128,6 +128,7 @@ class TUI:
         self._step_detail_title = ""
         # Confirmation state
         self._confirming = False
+        self._browsing = False
         self._confirm_selected = 0
         self._confirm_buf: list[str] = []
         # Thread safety for stdout
@@ -840,6 +841,7 @@ class TUI:
     def browse(self):
         """Interactive browse mode for inspect. Blocks until user presses q."""
         self._confirming = True  # prevent bg_loop from stealing keys
+        self._browsing = True
         self._nav_step = -1
         self._redraw()
 
@@ -912,6 +914,7 @@ class TUI:
             pass
         finally:
             self._confirming = False
+            self._browsing = False
             self._nav_step = -1
             self._restore_worker_tabs()
 
@@ -1045,7 +1048,7 @@ class TUI:
             if self.view == "main":
                 tab = self._active_tab
                 lines = self._build_main_lines(tab)
-                confirm_rows = 3 if (self._confirming and self.active_tab_idx == 0) else 0
+                confirm_rows = 3 if (self._confirming and not self._browsing and self.active_tab_idx == 0) else 0
                 spinner_active = (tab.streaming and tab.spinner_label
                                   and not (tab.trace_buf and self.trace_visible))
                 spinner_rows = 1 if spinner_active else 0
@@ -1073,7 +1076,7 @@ class TUI:
                     indicator = f' {DIM}↓ {tab.scroll_offset} more lines below{RESET}'
                     self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
 
-                if self._confirming and self.active_tab_idx == 0:
+                if self._confirming and not self._browsing and self.active_tab_idx == 0:
                     self._draw_confirmation()
                     self._write_raw('\033[?25h')
             elif self.view == "whiteboard":
