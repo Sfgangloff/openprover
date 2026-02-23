@@ -8,6 +8,7 @@ per second across all requests.
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -63,6 +64,14 @@ def single_request(
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {body}") from None
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, TimeoutError) or isinstance(reason, socket.timeout):
+            raise RuntimeError(
+                f"request timed out after {request_timeout_s:.1f}s "
+                f"(increase --request-timeout)"
+            ) from None
+        raise RuntimeError(f"request failed: {e}") from None
 
     data = json.loads(resp.read())
     elapsed = time.perf_counter() - t0
@@ -119,7 +128,9 @@ def run_bench(args):
                     r = fut.result()
                     results.append(r)
                 except Exception as e:
-                    errors.append((idx, str(e)))
+                    err_msg = str(e)
+                    errors.append((idx, err_msg))
+                    print(f"[ERROR] Request {idx}: {err_msg}")
         except KeyboardInterrupt:
             interrupted = True
             print("\nInterrupted. Aborting now; disconnects will cancel server requests.")
@@ -159,13 +170,8 @@ def run_bench(args):
     print(f"Successful requests:  {len(results)}/{args.total_requests}")
     if errors:
         print(f"Failed requests:       {len(errors)}")
-        if len(errors) <= 5:
-            for idx, err_msg in errors:
-                print(f"  Request {idx}: {err_msg}")
-        else:
-            print(f"  (showing first 5 errors)")
-            for idx, err_msg in errors[:5]:
-                print(f"  Request {idx}: {err_msg}")
+        for idx, err_msg in errors:
+            print(f"  Request {idx}: {err_msg}")
     print(f"Total completion tokens: {total_completion_tokens}")
     print(f"Total wall-clock time:   {total_elapsed:.2f}s")
     print(f"{'─' * 60}")
@@ -183,14 +189,14 @@ def main():
                         help="Model name (default: auto-detect)")
     parser.add_argument("--max-output-tokens", type=int, default=512,
                         help="Max output tokens (default: 512)")
-    parser.add_argument("--max-thinking-tokens", type=int, default=None,
+    parser.add_argument("--max-thinking-tokens", type=int, default=10000,
                         help="Max thinking tokens (default: no explicit cap)")
     parser.add_argument("--total-requests", "-n", type=int, default=100,
                         help="Total number of requests to send (default: 100)")
     parser.add_argument("--concurrency", "-c", type=int, default=32,
                         help="Client-side concurrent requests (default: 32)")
-    parser.add_argument("--request-timeout", type=float, default=60.0,
-                        help="Per-request HTTP timeout in seconds (default: 60)")
+    parser.add_argument("--request-timeout", type=float, default=300.0,
+                        help="Per-request HTTP timeout in seconds (default: 300)")
     args = parser.parse_args()
 
     run_bench(args)

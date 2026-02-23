@@ -33,38 +33,61 @@ class ThinkBudgetProcessor(LogitsProcessor):
     so the model transitions to answer generation.
     """
 
-    def __init__(self, end_think_ids: list[int], budget: int, prompt_len: int):
+    def __init__(
+        self,
+        end_think_ids: list[int],
+        forced_close_ids: list[int],
+        max_thinking_tokens: int,
+        max_output_tokens: int,
+        eos_token_id: int | None,
+        prompt_len: int,
+    ):
         self.end_ids = end_think_ids
-        self.budget = budget
+        self.forced_ids = forced_close_ids if forced_close_ids else end_think_ids
+        self.max_thinking_tokens = max_thinking_tokens
+        self.max_output_tokens = max_output_tokens
+        self.eos_token_id = eos_token_id
         self.prompt_len = prompt_len
         self.in_thinking = True
-        self.force_idx = 0  # which token of </think> we're forcing next
+        self.force_idx = 0  # which token of forced close sequence to emit next
+        self.answer_start_len = None
 
     def __call__(self, input_ids: torch.LongTensor,
                  scores: torch.FloatTensor) -> torch.FloatTensor:
+        seq_len = input_ids.shape[1]
+
         if not self.in_thinking:
+            if self.answer_start_len is None:
+                self.answer_start_len = seq_len
+            answer_tokens = seq_len - self.answer_start_len
+            if self.eos_token_id is not None and answer_tokens >= self.max_output_tokens:
+                forced = torch.full_like(scores, float("-inf"))
+                forced[:, self.eos_token_id] = 0
+                return forced
             return scores
 
         # Check if </think> was naturally generated
         n = len(self.end_ids)
-        if n > 0 and input_ids.shape[1] >= n:
+        if n > 0 and seq_len >= n:
             last_n = input_ids[0, -n:].tolist()
             if last_n == self.end_ids:
                 self.in_thinking = False
+                self.answer_start_len = seq_len
                 return scores
 
-        generated = input_ids.shape[1] - self.prompt_len
+        generated = seq_len - self.prompt_len
 
-        # Budget exceeded — force </think> token by token
-        if generated >= self.budget:
-            if self.force_idx < len(self.end_ids):
-                target = self.end_ids[self.force_idx]
+        # Budget exceeded — force fallback close sequence token by token
+        if generated >= self.max_thinking_tokens:
+            if self.force_idx < len(self.forced_ids):
+                target = self.forced_ids[self.force_idx]
                 self.force_idx += 1
                 forced = torch.full_like(scores, float('-inf'))
                 forced[:, target] = 0
                 return forced
             else:
                 self.in_thinking = False
+                self.answer_start_len = seq_len
 
         return scores
 
@@ -72,33 +95,56 @@ class ThinkBudgetProcessor(LogitsProcessor):
 class BatchThinkBudgetProcessor(LogitsProcessor):
     """Batch-aware variant of ThinkBudgetProcessor."""
 
-    def __init__(self, end_think_ids: list[int], budget: int, prompt_len: int, batch_size: int):
+    def __init__(
+        self,
+        end_think_ids: list[int],
+        forced_close_ids: list[int],
+        max_thinking_tokens: int,
+        max_output_tokens: int,
+        eos_token_id: int | None,
+        prompt_len: int,
+        batch_size: int,
+    ):
         self.end_ids = end_think_ids
-        self.budget = budget
+        self.forced_ids = forced_close_ids if forced_close_ids else end_think_ids
+        self.max_thinking_tokens = max_thinking_tokens
+        self.max_output_tokens = max_output_tokens
+        self.eos_token_id = eos_token_id
         self.prompt_len = prompt_len
         self.in_thinking = [True] * batch_size
         self.force_idx = [0] * batch_size
+        self.answer_start_len = [None] * batch_size
 
     def __call__(self, input_ids: torch.LongTensor,
                  scores: torch.FloatTensor) -> torch.FloatTensor:
         n = len(self.end_ids)
-        generated = input_ids.shape[1] - self.prompt_len
+        seq_len = input_ids.shape[1]
+        generated = seq_len - self.prompt_len
         forced_scores = None
 
         for i in range(input_ids.shape[0]):
             if not self.in_thinking[i]:
+                if self.answer_start_len[i] is None:
+                    self.answer_start_len[i] = seq_len
+                answer_tokens = seq_len - self.answer_start_len[i]
+                if self.eos_token_id is not None and answer_tokens >= self.max_output_tokens:
+                    if forced_scores is None:
+                        forced_scores = scores.clone()
+                    forced_scores[i, :] = float("-inf")
+                    forced_scores[i, self.eos_token_id] = 0
                 continue
 
             # Check if </think> was naturally generated for this sequence.
-            if n > 0 and input_ids.shape[1] >= n:
+            if n > 0 and seq_len >= n:
                 last_n = input_ids[i, -n:].tolist()
                 if last_n == self.end_ids:
                     self.in_thinking[i] = False
+                    self.answer_start_len[i] = seq_len
                     continue
 
-            if generated >= self.budget:
-                if self.force_idx[i] < len(self.end_ids):
-                    target = self.end_ids[self.force_idx[i]]
+            if generated >= self.max_thinking_tokens:
+                if self.force_idx[i] < len(self.forced_ids):
+                    target = self.forced_ids[self.force_idx[i]]
                     self.force_idx[i] += 1
                     if forced_scores is None:
                         forced_scores = scores.clone()
@@ -106,6 +152,7 @@ class BatchThinkBudgetProcessor(LogitsProcessor):
                     forced_scores[i, target] = 0
                 else:
                     self.in_thinking[i] = False
+                    self.answer_start_len[i] = seq_len
 
         return forced_scores if forced_scores is not None else scores
 
@@ -142,6 +189,10 @@ class Worker:
 
         # Pre-compute </think> token IDs for thinking budget enforcement
         self.end_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
+        self.forced_think_close_ids = tokenizer.encode(
+            "\n\nThinking budget depleted. We'll now provide answer.\n</think>\n",
+            add_special_tokens=False,
+        )
 
         print(f"  Loading on cuda:{gpu_id}...")
         # Serialize from_pretrained to avoid meta-tensor race conditions,
@@ -150,6 +201,10 @@ class Worker:
             model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
         self.model = model.to(self.device)
         self.model.eval()
+        model_eos = self.model.config.eos_token_id
+        if isinstance(model_eos, list):
+            model_eos = model_eos[0] if model_eos else None
+        self.eos_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else model_eos
         print(f"  cuda:{gpu_id} ready")
 
     def generate(
@@ -171,7 +226,11 @@ class Worker:
 
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=max_output_tokens + (max_thinking_tokens or 0),
+            max_new_tokens=(
+                max_output_tokens
+                + (max_thinking_tokens or 0)
+                + (len(self.forced_think_close_ids) if max_thinking_tokens is not None else 0)
+            ),
             do_sample=temperature > 0,
         )
         if temperature > 0:
@@ -185,7 +244,12 @@ class Worker:
         # Thinking budget enforcement
         if max_thinking_tokens is not None and self.end_think_ids:
             processor = ThinkBudgetProcessor(
-                self.end_think_ids, max_thinking_tokens, input_len,
+                self.end_think_ids,
+                self.forced_think_close_ids,
+                max_thinking_tokens,
+                max_output_tokens,
+                self.eos_token_id,
+                input_len,
             )
             gen_kwargs["logits_processor"] = [processor]
         if cancel_event is not None:
@@ -243,7 +307,11 @@ class Worker:
         first = batch_items[0]
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=first.max_output_tokens,
+            max_new_tokens=(
+                first.max_output_tokens
+                + (first.max_thinking_tokens or 0)
+                + (len(self.forced_think_close_ids) if first.max_thinking_tokens is not None else 0)
+            ),
             do_sample=first.temperature > 0,
         )
         if first.temperature > 0:
@@ -264,7 +332,10 @@ class Worker:
             prompt_len = inputs.input_ids.shape[1]
             processor = BatchThinkBudgetProcessor(
                 self.end_think_ids,
+                self.forced_think_close_ids,
                 first.max_thinking_tokens,
+                first.max_output_tokens,
+                self.eos_token_id,
                 prompt_len,
                 batch_size,
             )
@@ -394,7 +465,6 @@ class BatchScheduler:
                 for w in self.workers:
                     with w.state_lock:
                         if w.active_requests == 0:
-                            w.active_requests += 1
                             free_workers.append(w)
                 
                 if not free_workers:
@@ -406,6 +476,12 @@ class BatchScheduler:
 
                 # Dispatch batches to free workers
                 for worker in free_workers:
+                    # Reserve this worker. It may have been claimed since we built free_workers.
+                    with worker.state_lock:
+                        if worker.active_requests != 0:
+                            continue
+                        worker.active_requests += 1
+
                     # Keep queue clean while looping workers.
                     self.pending_queue = [req for req in self.pending_queue if not req.is_cancelled()]
                     if not self.pending_queue:
@@ -874,6 +950,10 @@ class Handler(BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
+    # Default TCPServer backlog is small (typically 5), which can cause
+    # connection resets under high client concurrency.
+    request_queue_size = 1024
 
 
 def main():
