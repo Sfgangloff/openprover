@@ -38,6 +38,13 @@ ideas:
 
 We now need to integrate Lean verification into the process. We need to add
 support for the case where the theorem to be proven is formalized in Lean.
+Also, let's add a mode where the goal is only to formalize a theorem, not to prove it.
+
+First let's describe the autoformalization mode. The user will run something like `openprover formalize theorem.md`.
+You can also say `prove` instead of `formalize`, but `prove` is implicit if no action is given.
+The formalization mode is very similar to proof mode.
+
+
 Enforce that the input file is either .md or .lean. When .lean, our goal will be
 to generate both PROOF.lean and PROOF.md. The resulting lean file (if produced)
 must be a valid Lean file with all `sorry` keywords replaced (and nothing else

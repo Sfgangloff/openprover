@@ -79,8 +79,11 @@ class CancelBatchCriteria(StoppingCriteria):
         return self.cancel_event.is_set()
 
 
-# Request batch item for batched generation
-BatchItem = namedtuple("BatchItem", ["messages", "max_tokens", "temperature", "top_p", "thinking_budget"])
+# Request batch item for generation scheduling.
+BatchItem = namedtuple(
+    "BatchItem",
+    ["messages", "max_output_tokens", "temperature", "top_p", "max_thinking_tokens"],
+)
 
 
 class Worker:
@@ -107,8 +110,16 @@ class Worker:
         self.model.eval()
         print(f"  cuda:{gpu_id} ready")
 
-    def generate(self, messages, max_tokens, temperature, top_p,
-                 stream=False, thinking_budget=None):
+    def generate(
+        self,
+        messages,
+        max_output_tokens,
+        temperature,
+        top_p,
+        stream=False,
+        max_thinking_tokens=None,
+        cancel_event: threading.Event | None = None,
+    ):
         """Single-request generation (legacy, for streaming)."""
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
@@ -118,7 +129,7 @@ class Worker:
 
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=max_tokens,
+            max_new_tokens=max_output_tokens,
             do_sample=temperature > 0,
         )
         if temperature > 0:
@@ -130,11 +141,15 @@ class Worker:
             gen_kwargs["top_k"] = None
 
         # Thinking budget enforcement
-        if thinking_budget is not None and self.end_think_ids:
+        if max_thinking_tokens is not None and self.end_think_ids:
             processor = ThinkBudgetProcessor(
-                self.end_think_ids, thinking_budget, input_len,
+                self.end_think_ids, max_thinking_tokens, input_len,
             )
             gen_kwargs["logits_processor"] = [processor]
+        if cancel_event is not None:
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                CancelBatchCriteria(cancel_event),
+            ])
 
         if stream:
             streamer = TextIteratorStreamer(
@@ -186,7 +201,7 @@ class Worker:
         first = batch_items[0]
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=first.max_tokens,
+            max_new_tokens=first.max_output_tokens,
             do_sample=first.temperature > 0,
         )
         if first.temperature > 0:
@@ -204,8 +219,8 @@ class Worker:
 
         # Thinking budget enforcement (if specified, applies to all)
         # Note: ThinkBudgetProcessor is per-sample, so we'd need batch-aware version
-        # For now, skip thinking_budget in batched mode (or implement batch processor)
-        if first.thinking_budget is not None:
+        # For now, skip max_thinking_tokens in batched mode (batch-aware logits processor TODO).
+        if first.max_thinking_tokens is not None:
             # TODO: Implement batch-aware ThinkBudgetProcessor if needed
             pass
 
@@ -295,8 +310,8 @@ class BatchScheduler:
     @staticmethod
     def _config_key(batch_item: BatchItem) -> tuple:
         """Get generation config key for grouping requests."""
-        return (batch_item.max_tokens, batch_item.temperature,
-                batch_item.top_p, batch_item.thinking_budget)
+        return (batch_item.max_output_tokens, batch_item.temperature,
+                batch_item.top_p, batch_item.max_thinking_tokens)
 
     def enqueue(self, batch_item: BatchItem) -> PendingRequest:
         """Enqueue a request and return a PendingRequest to wait on."""
@@ -457,8 +472,15 @@ class LoadBalancer:
         self._counter = 0
         self._lock = threading.Lock()
 
-    def get_worker(self) -> Worker:
+    def get_worker(self, prefer_free: bool = False) -> Worker:
         with self._lock:
+            if prefer_free:
+                for offset in range(len(self.workers)):
+                    idx = (self._counter + offset) % len(self.workers)
+                    worker = self.workers[idx]
+                    if not worker.busy:
+                        self._counter = idx + 1
+                        return worker
             worker = self.workers[self._counter % len(self.workers)]
             self._counter += 1
         return worker
@@ -494,33 +516,36 @@ class Handler(BaseHTTPRequestHandler):
 
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = body.get("messages", [])
-        max_tokens = body.get("max_tokens", 4096)
+        if "max_output_tokens" not in body:
+            self._json_response(400, {"error": "missing required field: max_output_tokens"})
+            return
+        max_output_tokens = body["max_output_tokens"]
         temperature = body.get("temperature", 0.6)
         top_p = body.get("top_p", 0.95)
         stream = body.get("stream", False)
-        thinking_budget = body.get("thinking_budget")  # None = no limit
+        max_thinking_tokens = body.get("max_thinking_tokens")
 
         if not batching_enabled:
             self._handle_direct_request(
-                messages, max_tokens, temperature, top_p, stream, thinking_budget,
+                messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
             )
             return
 
-        # Batching with batch_size > 1: non-streaming only.
+        # Keep streaming simple: in batched mode, stream requests take
+        # the direct single-request path (effectively batch size 1).
         if stream:
-            self._json_response(400, {
-                "error": "streaming disabled in batched mode",
-                "message": "Set --batch-size 1 to enable streaming",
-            })
+            self._handle_direct_request(
+                messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
+            )
             return
 
         # Enqueue for batched processing
         batch_item = BatchItem(
             messages=messages,
-            max_tokens=max_tokens,
+            max_output_tokens=max_output_tokens,
             temperature=temperature,
             top_p=top_p,
-            thinking_budget=thinking_budget,
+            max_thinking_tokens=max_thinking_tokens,
         )
         req = scheduler.enqueue(batch_item)
 
@@ -620,32 +645,36 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return False
 
-    def _handle_direct_request(self, messages, max_tokens, temperature, top_p, stream, thinking_budget):
-        worker = lb.get_worker()
-        with worker.lock:
-            try:
-                if stream:
-                    self._handle_streaming(worker, messages, max_tokens, temperature, top_p, thinking_budget)
-                else:
-                    self._handle_non_streaming(worker, messages, max_tokens, temperature, top_p, thinking_budget)
-            except BrokenPipeError:
-                pass
-            except Exception as e:
-                traceback.print_exc()
+    def _handle_direct_request(self, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens):
+        worker = lb.get_worker(prefer_free=True)
+        worker.busy = True
+        try:
+            with worker.lock:
                 try:
-                    self._json_response(500, {"error": str(e)})
+                    if stream:
+                        self._handle_streaming(worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
+                    else:
+                        self._handle_non_streaming(worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
                 except BrokenPipeError:
                     pass
+                except Exception as e:
+                    traceback.print_exc()
+                    try:
+                        self._json_response(500, {"error": str(e)})
+                    except BrokenPipeError:
+                        pass
+        finally:
+            worker.busy = False
 
-    def _handle_non_streaming(self, worker, messages, max_tokens, temperature, top_p, thinking_budget=None):
+    def _handle_non_streaming(self, worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
         t0 = time.time()
         text, completion_tokens, prompt_tokens = worker.generate(
             messages,
-            max_tokens,
+            max_output_tokens,
             temperature,
             top_p,
             stream=False,
-            thinking_budget=thinking_budget,
+            max_thinking_tokens=max_thinking_tokens,
         )
         self._json_response(200, {
             "id": f"chatcmpl-{int(t0)}",
@@ -664,14 +693,16 @@ class Handler(BaseHTTPRequestHandler):
             },
         })
 
-    def _handle_streaming(self, worker, messages, max_tokens, temperature, top_p, thinking_budget=None):
+    def _handle_streaming(self, worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
+        cancel_event = threading.Event()
         streamer, input_len, gen_thread, result = worker.generate(
             messages,
-            max_tokens,
+            max_output_tokens,
             temperature,
             top_p,
             stream=True,
-            thinking_budget=thinking_budget,
+            max_thinking_tokens=max_thinking_tokens,
+            cancel_event=cancel_event,
         )
 
         self.send_response(200)
@@ -681,25 +712,31 @@ class Handler(BaseHTTPRequestHandler):
 
         chunk_id = f"chatcmpl-{int(time.time())}"
 
-        for token_text in streamer:
-            if not token_text:
-                continue
-            chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "model": model_name_global,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": token_text},
-                    "finish_reason": None,
-                }],
-            }
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.flush()
+        disconnected = False
+        try:
+            for token_text in streamer:
+                if not token_text:
+                    continue
+                chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "model": model_name_global,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": token_text},
+                        "finish_reason": None,
+                    }],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+        except BrokenPipeError:
+            disconnected = True
+            cancel_event.set()
+            raise
+        finally:
+            gen_thread.join(timeout=10)
 
-        gen_thread.join()
-        completion_tokens = result["completion_tokens"]
-
+        completion_tokens = result.get("completion_tokens", 0)
         final = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
@@ -711,9 +748,10 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": input_len + completion_tokens,
             },
         }
-        self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        if not disconnected:
+            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
 
 
     def _json_response(self, code, data):
@@ -781,10 +819,10 @@ def main():
                 lambda i: Worker(i, args.model, dtype, tokenizer),
                 range(1, args.num_gpus),
             ))
+    # Direct lane is always available for streaming (and all requests when batch_size == 1).
+    lb = LoadBalancer(workers)
     if batching_enabled:
         scheduler = BatchScheduler(workers, args.batch_size, args.batch_timeout, args.verbose)
-    else:
-        lb = LoadBalancer(workers)
 
     server = ThreadedHTTPServer((args.host, args.port), Handler)
     print(f"\nServing on http://{args.host}:{args.port}")
