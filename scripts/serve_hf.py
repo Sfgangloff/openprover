@@ -230,6 +230,12 @@ class BatchScheduler:
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self.scheduler_thread.start()
 
+    @staticmethod
+    def _config_key(batch_item: BatchItem) -> tuple:
+        """Get generation config key for grouping requests."""
+        return (batch_item.max_tokens, batch_item.temperature,
+                batch_item.top_p, batch_item.thinking_budget)
+
     def enqueue(self, batch_item: BatchItem) -> PendingRequest:
         """Enqueue a request and return a PendingRequest to wait on."""
         req = PendingRequest(
@@ -263,11 +269,9 @@ class BatchScheduler:
                     continue
 
                 # Group pending requests by generation config key
-                # (max_tokens, temperature, top_p, thinking_budget)
                 config_groups = {}
                 for req in self.pending_queue:
-                    item = req.batch_item
-                    key = (item.max_tokens, item.temperature, item.top_p, item.thinking_budget)
+                    key = self._config_key(req.batch_item)
                     if key not in config_groups:
                         config_groups[key] = []
                     config_groups[key].append(req)
@@ -297,12 +301,7 @@ class BatchScheduler:
                     # Priority 2: Timeout trigger - batch oldest request's config group
                     if not batch_requests and oldest_wait and oldest_wait >= self.batch_timeout_s:
                         if oldest_req:
-                            oldest_key = (
-                                oldest_req.batch_item.max_tokens,
-                                oldest_req.batch_item.temperature,
-                                oldest_req.batch_item.top_p,
-                                oldest_req.batch_item.thinking_budget,
-                            )
+                            oldest_key = self._config_key(oldest_req.batch_item)
                             if oldest_key in config_groups:
                                 group = config_groups[oldest_key]
                                 batch_requests = group[:min(self.batch_size, len(group))]
@@ -310,15 +309,10 @@ class BatchScheduler:
                     if not batch_requests:
                         continue
 
-                    # Remove from queue and config groups
+                    # Remove from queue
                     batch_items = [req.batch_item for req in batch_requests]
                     for req in batch_requests:
                         self.pending_queue.remove(req)
-                        key = (req.batch_item.max_tokens, req.batch_item.temperature,
-                               req.batch_item.top_p, req.batch_item.thinking_budget)
-                        config_groups[key].remove(req)
-                        if len(config_groups[key]) == 0:
-                            del config_groups[key]
 
                     # Dispatch to worker in background thread
                     worker.busy = True

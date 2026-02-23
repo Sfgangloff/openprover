@@ -18,8 +18,8 @@ def main():
                         help="Prompt to send")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Stream tokens to console (default: true)")
+                        default=False,
+                        help="Stream tokens to console (default: false, batched server doesn't support streaming)")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -70,6 +70,10 @@ def main():
 
     try:
         resp = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"ERROR: HTTP {e.code}: {body}", file=sys.stderr)
+        sys.exit(1)
     except urllib.error.URLError as e:
         print(f"ERROR: Request failed: {e}", file=sys.stderr)
         sys.exit(1)
