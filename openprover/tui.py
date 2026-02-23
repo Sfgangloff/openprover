@@ -152,6 +152,8 @@ class TUI:
         self._saved_worker_tabs: list[_Tab] | None = None
         # Proposal log range (for cleanup after confirmation)
         self._proposal_log_start: int = -1
+        # Run parameters (shown in help view)
+        self.run_params: dict[str, str] = {}
 
     _content_start = HEADER_ROWS + 1
 
@@ -171,6 +173,7 @@ class TUI:
               step_num: int = 0, max_steps: int = 50,
               model_name: str = ""):
         self.theorem_name = theorem_name
+        self.work_dir = work_dir
         self.step_num = step_num
         self.max_steps = max_steps
         self.model_name = model_name
@@ -294,30 +297,40 @@ class TUI:
         self._write_raw('\033[3;1H\033[2K')
         self._write_raw(f'{BLUE}│{RESET}{" " * pad}{hints_styled} {BLUE}│{RESET}')
 
-        # Row 4 — bottom border + tab bar
+        # Row 4 — bottom border + run dir + tab bar
         self._write_raw('\033[4;1H\033[2K')
-        if len(self.tabs) > 1:
-            tab_parts = []
-            visible_len = 0
-            for i, tab in enumerate(self.tabs):
-                name = tab.label
-                if len(name) > 20:
-                    name = name[:17] + "..."
-                if tab.done:
-                    name += " ✓"
-                elif tab.streaming:
-                    name += " …"
-                bracket = f"[{name}]"
-                visible_len += len(bracket) + 1
-                if i == self.active_tab_idx:
-                    tab_parts.append(f'{BOLD}{WHITE}{bracket}{RESET}')
-                else:
-                    tab_parts.append(f'{DIM}{bracket}{RESET}')
-            tab_str = " ".join(tab_parts)
+        run_dir = getattr(self, 'work_dir', '') or ''
+        tab_parts = []
+        visible_len = 0
+        for i, tab in enumerate(self.tabs):
+            name = tab.label
+            if len(name) > 20:
+                name = name[:17] + "..."
+            if tab.done:
+                name += " ✓"
+            elif tab.streaming:
+                name += " …"
+            bracket = f"[{name}]"
+            visible_len += len(bracket) + 1
+            if i == self.active_tab_idx:
+                tab_parts.append(f'{BOLD}{WHITE}{bracket}{RESET}')
+            else:
+                tab_parts.append(f'{DIM}{bracket}{RESET}')
+        tab_str = " ".join(tab_parts)
+        if run_dir:
+            # Show tabs on the left, run dir on the right
+            dir_text = run_dir
+            max_dir = w - visible_len - 6  # leave room for borders + tabs
+            if len(dir_text) > max_dir:
+                dir_text = "…" + dir_text[-(max_dir - 1):]
+            fill = max(w - 2 - len(dir_text) - 1 - visible_len, 0)
+            self._write_raw(
+                f'{BLUE}╰{RESET} {tab_str}'
+                f'{BLUE}{"─" * fill}{RESET}'
+                f' {DIM}{dir_text}{RESET}{BLUE}╯{RESET}')
+        else:
             fill = max(w - 2 - visible_len, 0)
             self._write_raw(f'{BLUE}╰{RESET} {tab_str}{BLUE}{"─" * fill}╯{RESET}')
-        else:
-            self._write_raw(f'{BLUE}╰{"─" * max(w - 2, 0)}╯{RESET}')
 
     def update_step(self, step_num: int, max_steps: int):
         self.step_num = step_num
@@ -1284,6 +1297,10 @@ class TUI:
                     self._write_raw(f'  {tline}\n')
             elif self.view == "help":
                 self._write_raw(HELP_TEXT)
+                if self.run_params:
+                    self._write_raw(f'\n  {BOLD}Parameters{RESET}\n\n')
+                    for key, val in self.run_params.items():
+                        self._write_raw(f'    {DIM}{key:<16}{RESET}{val}\n')
             elif self.view == "step_detail":
                 self._write_raw(f'  {BOLD}{self._step_detail_title}{RESET}')
                 self._write_raw(f' {DIM}(esc to return){RESET}\n')
