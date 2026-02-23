@@ -195,8 +195,8 @@ def main():
                         help="Total number of requests to send (default: 100)")
     parser.add_argument("--concurrency", "-c", type=int, default=32,
                         help="Client-side concurrent requests (default: 32)")
-    parser.add_argument("--request-timeout", type=float, default=300.0,
-                        help="Per-request HTTP timeout in seconds (default: 300)")
+    parser.add_argument("--request-timeout", type=float, default=600.0,
+                        help="Per-request HTTP timeout in seconds (default: 600)")
     args = parser.parse_args()
 
     run_bench(args)
