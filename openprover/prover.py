@@ -80,13 +80,14 @@ class Prover:
                  max_steps: int,
                  autonomous: bool, verbose: bool, tui: TUI,
                  isolation: bool = False, run_dir: str | None = None,
-                 parallelism: int = 1):
+                 parallelism: int = 1, give_up_ratio: float = 0.5):
         self.model = model_name
         self._make_llm = make_llm
         self.max_steps = max_steps
         self.autonomous = autonomous
         self.verbose = verbose
         self.isolation = isolation
+        self.give_up_ratio = give_up_ratio
         self.tui = tui
         self.parallelism = parallelism
         self.shutting_down = False
@@ -218,9 +219,12 @@ class Prover:
         try:
             resp = self.llm.call(
                 prompt=prompt,
-                system_prompt=prompts.planner_system_prompt(isolation=self.isolation),
+                system_prompt=prompts.planner_system_prompt(
+                    isolation=self.isolation,
+                    allow_give_up=self.step_num >= self.max_steps * self.give_up_ratio,
+                ),
                 label=f"planner_step_{self.step_num}",
-                stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
+                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
                 archive_path=step_dir / "planner_call.json",
             )
         except RuntimeError as e:
@@ -293,7 +297,7 @@ class Prover:
         return "stop"
 
     def _handle_give_up(self) -> str:
-        if self.step_num < self.max_steps * 0.8:
+        if self.step_num < self.max_steps * max(self.give_up_ratio, 0.8):
             self.tui.log(
                 f"Not giving up — only {self.step_num}/{self.max_steps} steps used",
                 color="yellow",
@@ -505,7 +509,7 @@ class Prover:
                 system_prompt=prompts.SEARCH_SYSTEM_PROMPT,
                 label=f"search_step_{self.step_num}",
                 web_search=True,
-                stream_callback=lambda t: self.tui.stream_text(t, tab=wid),
+                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab=wid),
                 archive_path=workers_dir / "search_call.json",
             )
             self.tui.stream_end(tab=wid)
@@ -548,7 +552,7 @@ class Prover:
                 prompt=prompt,
                 system_prompt=prompts.WORKER_SYSTEM_PROMPT,
                 label=worker_id,
-                stream_callback=lambda t: self.tui.stream_text(t, tab=worker_id),
+                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab=worker_id),
                 archive_path=archive_path,
             )
             self.tui.stream_end(tab=worker_id)
@@ -676,7 +680,7 @@ class Prover:
                 prompt=prompt,
                 system_prompt=prompts.planner_system_prompt(isolation=self.isolation),
                 label="discussion",
-                stream_callback=lambda t: self.tui.stream_text(t, tab="planner"),
+                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
                 archive_path=self.work_dir / "discussion_call.json",
             )
             self.tui.stream_end(tab="planner")

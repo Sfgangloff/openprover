@@ -30,6 +30,8 @@ def main():
                         help="Disable web searches (no literature_search action)")
     parser.add_argument("-P", "--parallelism", type=int, default=1,
                         help="Max parallel workers per spawn step (default: 1)")
+    parser.add_argument("--give-up-after", type=float, default=0.5, metavar="RATIO",
+                        help="Fraction of steps before give_up action is offered (default: 0.5)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show full LLM responses")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -62,6 +64,7 @@ def main():
         isolation=args.isolation,
         run_dir=args.run_dir,
         parallelism=args.parallelism,
+        give_up_ratio=args.give_up_after,
     )
 
     # Check if this is a finished run → inspect mode

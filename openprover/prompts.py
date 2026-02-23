@@ -24,31 +24,34 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
 _TQ = '"""'  # triple-quote for embedding in prompts
 
-def planner_system_prompt(*, isolation: bool = False) -> str:
-    """Build the planner system prompt, omitting literature_search when isolated."""
+def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True) -> str:
+    """Build the planner system prompt, conditionally omitting actions."""
     actions = (
         "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning - they only see the context you provide to them.\n"
         "- **read_items**: Request full content of repo items (you only see one-line summaries by default).\n"
         "- **write_items**: Create, update, or delete one or more repo items.\n"
         "- **proof_found**: Declare success. **This terminates the session.** You must be confident the proof is correct - it must have been independently verified by a worker.\n"
-        "- **give_up**: Declare failure. Only after using nearly all allotted steps.\n"
     )
+    if allow_give_up:
+        actions += "- **give_up**: Declare failure. Only after using nearly all allotted steps.\n"
     if not isolation:
         actions += (
             "- **literature_search**: Search the web for relevant mathematical literature. Spawns one web-enabled worker.\n"
         )
 
     principles = (
-        "1. KEEP IT SIMPLE. Don't spawn workers for trivial bookkeeping - use write_items for that.\n"
-        "2. **Write clear, direct task descriptions.** State exactly what the worker should do. "
-        "Workers see ONLY the task description plus [[wikilink]]-referenced repo items - include theorem statement, definitions, and all needed context.\n"
-        "3. **You decide the proof strategy.** Balance exploration and direct proof attempts based on the problem. Don't be afraid to attempt a full proof early.\n"
-        "4. Store failed attempts in the repo - they prevent repeating mistakes.\n"
-        "5. Verify the proof with an independent worker before declaring proof_found. The verifier should check the proof cold.\n"
+        "- Keep it simple when possible.\n"
+        "- Write clear, direct task descriptions. State exactly what the worker should do. "
+        "Workers see ONLY the task description plus [[wikilink]]-referenced repo items - include and all needed context.\n"
+        "- You decide the proof strategy. Balance exploration and direct proof attempts based on the problem. Don't be afraid to attempt a full proof early to see where it fails.\n"
+        "- Store failed attempts in the repo - they prevent repeating mistakes.\n"
+        "- Verify the proof with an independent worker before declaring proof_found.\n"
+        "- One focused task per worker. Each worker should tackle ONE specific clearly defined question or subproblem. "
+        "It's your job as the senior researcher to come up with the general direction.\n"
+        "- Don't get stuck. If the first proof avenue does not work, try others.\n"
     )
     if not isolation:
-        principles += "6. Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
-    principles += "7. **One focused task per worker.** Each worker should tackle ONE specific question or subproblem.\n"
+        principles += "- Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
 
     toml_fields = (
         f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
@@ -71,6 +74,16 @@ def planner_system_prompt(*, isolation: bool = False) -> str:
     )
     if not isolation:
         toml_fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
+
+    give_up_section = ""
+    if allow_give_up:
+        give_up_section = (
+            "## CRITICAL: give_up\n"
+            "\n"
+            "NEVER give up early. You must use nearly all allotted steps first. "
+            '"This is a famous open problem" is NEVER a reason to give up. Try novel approaches, special cases, variations.\n'
+            "\n"
+        )
 
     return (
         "You are a senior research mathematician coordinating a proof effort. "
@@ -112,11 +125,7 @@ def planner_system_prompt(*, isolation: bool = False) -> str:
         "NEVER use proof_found unless you have a COMPLETE, RIGOROUS proof that has been VERIFIED by an independent worker. "
         "proof_found **terminates the session** - there is no going back. The proof field must contain the full proof text.\n"
         "\n"
-        "## CRITICAL: give_up\n"
-        "\n"
-        "NEVER give up early. You must use nearly all allotted steps first. "
-        '"This is a famous open problem" is NEVER a reason to give up. Try novel approaches, special cases, variations.\n'
-        "\n"
+        f"{give_up_section}"
         "## Output Format\n"
         "\n"
         "Think step by step, then end your response with a TOML decision block:\n"
