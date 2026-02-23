@@ -218,6 +218,14 @@ class Prover:
         self._setup_tui_logging()
         self.tui.autonomous = self.autonomous
         self.tui.whiteboard = self.whiteboard
+        self.tui.run_params = {
+            "model": self.model,
+            "max_steps": str(self.max_steps),
+            "parallelism": str(self.parallelism),
+            "give_up_after": f"{self.give_up_ratio:.0%}",
+            "isolation": "on" if self.isolation else "off",
+            "mode": self.mode,
+        }
 
         if self.resumed:
             self.tui.log(
@@ -1024,6 +1032,14 @@ class Prover:
         )
         self.tui.autonomous = False
         self.tui.whiteboard = self.whiteboard
+        self.tui.run_params = {
+            "model": self.model,
+            "max_steps": str(self.max_steps),
+            "parallelism": str(self.parallelism),
+            "give_up_after": f"{self.give_up_ratio:.0%}",
+            "isolation": "on" if self.isolation else "off",
+            "mode": self.mode,
+        }
 
         self._load_history()
 
