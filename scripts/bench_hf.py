@@ -7,6 +7,7 @@ per second across all requests.
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -33,7 +34,7 @@ def get_model(base: str, model_arg: str | None) -> str:
     return model
 
 
-def single_request(base: str, model: str, prompt: str, max_tokens: int) -> dict:
+def single_request(base: str, model: str, prompt: str, max_tokens: int, request_timeout_s: float) -> dict:
     """One non-streaming request, return completion tokens and timing."""
     payload = json.dumps({
         "model": model,
@@ -50,7 +51,7 @@ def single_request(base: str, model: str, prompt: str, max_tokens: int) -> dict:
 
     t0 = time.perf_counter()
     try:
-        resp = urllib.request.urlopen(req, timeout=600)
+        resp = urllib.request.urlopen(req, timeout=request_timeout_s)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {body}") from None
@@ -63,6 +64,8 @@ def single_request(base: str, model: str, prompt: str, max_tokens: int) -> dict:
         "completion_tokens": completion_tokens,
         "elapsed_s": elapsed,
     }
+
+
 
 
 def run_bench(args):
@@ -84,19 +87,53 @@ def run_bench(args):
     t_start = time.perf_counter()
     results = []
     errors = []
+    interrupted = False
 
-    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+    pool = ThreadPoolExecutor(max_workers=args.concurrency)
+    try:
         futures = {
-            pool.submit(single_request, base, model, LONG_PROMPT, args.max_tokens): i
+            pool.submit(
+                single_request,
+                base,
+                model,
+                LONG_PROMPT,
+                args.max_tokens,
+                args.request_timeout,
+            ): i
             for i in range(args.total_requests)
         }
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                r = fut.result()
-                results.append(r)
-            except Exception as e:
-                errors.append((idx, str(e)))
+        try:
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    r = fut.result()
+                    results.append(r)
+                except Exception as e:
+                    errors.append((idx, str(e)))
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nInterrupted. Aborting now; disconnects will cancel server requests.")
+            # Shutdown executor immediately without waiting
+            pool.shutdown(wait=False, cancel_futures=True)
+            
+            # Print brief interrupted summary
+            print(f"\n{'─' * 60}")
+            print("INTERRUPTED")
+            print(f"{'─' * 60}")
+            print(f"Completed before interrupt: {len(results)}/{args.total_requests}")
+            print(f"Errors before interrupt:    {len(errors)}")
+            if results:
+                total_tokens = sum(r["completion_tokens"] for r in results)
+                elapsed = time.perf_counter() - t_start
+                print(f"Partial throughput:         {total_tokens / elapsed:.1f} completion tokens/sec")
+            print(f"{'─' * 60}")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
+    finally:
+        # Only wait for completion if not interrupted
+        if not interrupted:
+            pool.shutdown(wait=True)
 
     t_end = time.perf_counter()
     total_elapsed = t_end - t_start
@@ -140,6 +177,8 @@ def main():
                         help="Total number of requests to send (default: 100)")
     parser.add_argument("--concurrency", "-c", type=int, default=32,
                         help="Client-side concurrent requests (default: 32)")
+    parser.add_argument("--request-timeout", type=float, default=60.0,
+                        help="Per-request HTTP timeout in seconds (default: 60)")
     args = parser.parse_args()
 
     run_bench(args)

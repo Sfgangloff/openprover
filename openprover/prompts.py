@@ -40,9 +40,9 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         )
 
     principles = (
-        "- Keep it simple when possible (some proofs might be easy). Be brief and focused. Separate generation from verification.\n"
-        "- Write clear, direct task descriptions. State exactly what the worker should do. "
-        "Workers see ONLY the task description plus [[wikilink]]-referenced repo items - include and all needed context.\n"
+        "- Keep it simple when possible (some proofs might be easy). Be brief and focused.\n"
+        "- You don't have to spawn workers when it is not useful. Use common sense."
+        "- Write clear, direct task descriptions. State exactly what the worker should do.\n"
         "- You decide the proof strategy. Balance exploration and direct proof attempts based on the problem. Don't be afraid to attempt a full proof early to see where it fails.\n"
         "- Store failed attempts in the repo - they prevent repeating mistakes.\n"
         "- Verify the proof with an independent worker before declaring proof_found.\n"

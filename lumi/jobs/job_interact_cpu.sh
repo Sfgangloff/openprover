@@ -4,8 +4,9 @@
 
 srun \
   --job-name interact_cpu \
-  --cpus-per-task 8 \
-  --mem=16G \
+  --cpus-per-task 64 \
+  --mem=128G \
+  --nodes=1 \
   --partition=small \
   --account=project_465001752 \
   --time=04:00:00 \

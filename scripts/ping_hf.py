@@ -18,8 +18,8 @@ def main():
                         help="Prompt to send")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Stream tokens to console (default: false, batched server doesn't support streaming)")
+                        default=True,
+                        help="Stream tokens to console (default: true)")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -72,6 +72,9 @@ def main():
         resp = urllib.request.urlopen(req, timeout=120)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
+        if e.code == 499:
+            print("ERROR: Request was cancelled (client disconnected)", file=sys.stderr)
+            sys.exit(130)
         print(f"ERROR: HTTP {e.code}: {body}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
