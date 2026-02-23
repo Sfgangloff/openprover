@@ -89,8 +89,8 @@ class _Tab:
     __slots__ = ("id", "label", "log_lines", "trace_buf", "output_buf",
                  "scroll_offset",
                  "streaming", "spinner_label", "spinner_tick", "spinner_time",
-                 "spinner_start", "last_trace", "last_output", "done",
-                 "task_description")
+                 "spinner_start", "spinner_tokens", "last_trace", "last_output",
+                 "done", "task_description")
 
     def __init__(self, tab_id: str, label: str, task_description: str = ""):
         self.id = tab_id
@@ -104,6 +104,7 @@ class _Tab:
         self.spinner_tick = 0
         self.spinner_time = 0.0
         self.spinner_start = 0.0
+        self.spinner_tokens = 0
         self.last_trace = ""
         self.last_output = ""
         self.done = False
@@ -377,9 +378,10 @@ class TUI:
             planner.spinner_start = time.monotonic()
             planner.spinner_time = 0.0
             planner.spinner_tick = 0
+            planner.spinner_tokens = 0
             if planner is self._active_tab and self.view == "main":
                 ch = SPINNER[0]
-                self._write(f'  {DIM}{ch} {text} 0s{RESET}')
+                self._write(f'  {DIM}{ch} {text} {self._spinner_status(0, 0)}{RESET}')
         else:
             planner.streaming = False
             planner.spinner_label = ""
@@ -507,6 +509,17 @@ class TUI:
 
     # ── Spinner ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _spinner_status(elapsed: int, tokens: int) -> str:
+        """Format the elapsed time + token count suffix for spinner display."""
+        parts = [f"{elapsed}s"]
+        if tokens > 0:
+            if tokens >= 1000:
+                parts.append(f"{tokens / 1000:.1f}k tok")
+            else:
+                parts.append(f"{tokens} tok")
+        return " · ".join(parts)
+
     def _update_spinner(self):
         tab = self._active_tab
         now = time.monotonic()
@@ -517,11 +530,12 @@ class TUI:
         if self.view == "main":
             ch = SPINNER[tab.spinner_tick]
             elapsed = int(now - tab.spinner_start)
+            status = self._spinner_status(elapsed, tab.spinner_tokens)
             with self._write_lock:
                 if (not tab.spinner_label or tab.output_buf
                         or (tab.trace_buf and self.trace_visible)):
                     return
-                self._write_raw(f'\r\033[2K  {DIM}{ch} {tab.spinner_label} {elapsed}s{RESET}')
+                self._write_raw(f'\r\033[2K  {DIM}{ch} {tab.spinner_label} {status}{RESET}')
                 sys.stdout.flush()
 
     # ── Streaming ───────────────────────────────────────────────
@@ -533,14 +547,16 @@ class TUI:
         target.streaming = True
         target.spinner_label = label
         target.spinner_tick = 0
+        target.spinner_tokens = 0
         target.spinner_time = time.monotonic()
         target.spinner_start = target.spinner_time
         if target is self._active_tab and self.view == "main":
-            self._write(f'  {DIM}{SPINNER[0]} {label} 0s{RESET}')
+            self._write(f'  {DIM}{SPINNER[0]} {label} {self._spinner_status(0, 0)}{RESET}')
 
     def stream_text(self, text: str, kind: str = "text", tab: str = "planner"):
         self._check_keys()
         target = self._find_tab(tab)
+        target.spinner_tokens += 1
         is_active = target is self._active_tab
         at_bottom = target.scroll_offset == 0
         is_thinking = kind == "thinking"
@@ -1273,7 +1289,8 @@ class TUI:
                 if spinner_active:
                     ch = SPINNER[tab.spinner_tick]
                     elapsed = int(time.monotonic() - tab.spinner_start)
-                    self._write_raw(f'  {DIM}{ch} {tab.spinner_label} {elapsed}s{RESET}')
+                    status = self._spinner_status(elapsed, tab.spinner_tokens)
+                    self._write_raw(f'  {DIM}{ch} {tab.spinner_label} {status}{RESET}')
 
                 # Scroll indicator
                 if tab.scroll_offset > 0:
