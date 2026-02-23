@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -65,6 +66,10 @@ class ThinkBudgetProcessor(LogitsProcessor):
         return scores
 
 
+# Request batch item for batched generation
+BatchItem = namedtuple("BatchItem", ["messages", "max_tokens", "temperature", "top_p", "thinking_budget"])
+
+
 class Worker:
     """One model replica on one GPU."""
 
@@ -75,6 +80,7 @@ class Worker:
         self.device = f"cuda:{gpu_id}"
         self.lock = threading.Lock()
         self.tokenizer = tokenizer
+        self.busy = False  # Track if worker is processing a batch
 
         # Pre-compute </think> token IDs for thinking budget enforcement
         self.end_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
@@ -90,6 +96,7 @@ class Worker:
 
     def generate(self, messages, max_tokens, temperature, top_p,
                  stream=False, thinking_budget=None):
+        """Single-request generation (legacy, for streaming)."""
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -138,24 +145,220 @@ class Worker:
             text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             return text_out, len(new_tokens), input_len
 
+    def generate_batch(self, batch_items: list[BatchItem]) -> list[dict]:
+        """Batched non-streaming generation.
+        
+        Returns list of dicts with keys: text, completion_tokens, prompt_tokens
+        """
+        # Build prompts for all items
+        texts = []
+        for item in batch_items:
+            text = self.tokenizer.apply_chat_template(
+                item.messages, tokenize=False, add_generation_prompt=True,
+            )
+            texts.append(text)
 
-class LoadBalancer:
-    """Round-robin across workers."""
+        # Tokenize batch with padding
+        inputs = self.tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
+        batch_size = inputs.input_ids.shape[0]
+        input_lens = (inputs.attention_mask.sum(dim=1)).tolist()
 
-    def __init__(self, workers: list[Worker]):
+        # All items in batch must have same generation params (enforced by scheduler)
+        first = batch_items[0]
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=first.max_tokens,
+            do_sample=first.temperature > 0,
+        )
+        if first.temperature > 0:
+            gen_kwargs["temperature"] = first.temperature
+            gen_kwargs["top_p"] = first.top_p
+        else:
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+            gen_kwargs["top_k"] = None
+
+        # Thinking budget enforcement (if specified, applies to all)
+        # Note: ThinkBudgetProcessor is per-sample, so we'd need batch-aware version
+        # For now, skip thinking_budget in batched mode (or implement batch processor)
+        if first.thinking_budget is not None:
+            # TODO: Implement batch-aware ThinkBudgetProcessor if needed
+            pass
+
+        # Generate batch
+        with torch.inference_mode():
+            output = self.model.generate(**gen_kwargs)
+
+        # Decode per-sample and compute stats
+        results = []
+        for i in range(batch_size):
+            input_len = input_lens[i]
+            new_tokens = output[i][input_len:]
+            text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            completion_tokens = len(new_tokens)
+            results.append({
+                "text": text_out,
+                "completion_tokens": completion_tokens,
+                "prompt_tokens": input_len,
+            })
+
+        return results
+
+
+class PendingRequest:
+    """Pending request with completion synchronization."""
+    def __init__(self, batch_item, enqueue_time, completion_event):
+        self.batch_item = batch_item
+        self.enqueue_time = enqueue_time
+        self.completion_event = completion_event
+        self.result = None
+        self.error = None
+
+
+class BatchScheduler:
+    """Dynamic batching scheduler with timeout and batch-size triggers."""
+
+    def __init__(self, workers: list[Worker], batch_size: int, batch_timeout_s: float):
         self.workers = workers
-        self._counter = 0
-        self._lock = threading.Lock()
+        self.batch_size = batch_size
+        self.batch_timeout_s = batch_timeout_s
+        self.pending_queue = []
+        self.queue_lock = threading.Condition()
+        self.running = True
+        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
+        self.scheduler_thread.start()
 
-    def get_worker(self) -> Worker:
-        with self._lock:
-            w = self.workers[self._counter % len(self.workers)]
-            self._counter += 1
-        return w
+    def enqueue(self, batch_item: BatchItem) -> PendingRequest:
+        """Enqueue a request and return a PendingRequest to wait on."""
+        req = PendingRequest(
+            batch_item=batch_item,
+            enqueue_time=time.time(),
+            completion_event=threading.Event(),
+        )
+        with self.queue_lock:
+            self.pending_queue.append(req)
+            self.queue_lock.notify()
+        return req
+
+    def _scheduler_loop(self):
+        """Main scheduler loop: dispatch batches to free workers."""
+        while self.running:
+            with self.queue_lock:
+                # Wait until we have requests or shutdown
+                while self.running and len(self.pending_queue) == 0:
+                    self.queue_lock.wait(timeout=0.1)
+
+                if not self.running:
+                    break
+
+                # Find free workers
+                free_workers = [w for w in self.workers if not w.busy]
+                if len(self.pending_queue) == 0:
+                    continue
+                if not free_workers:
+                    # No free workers, wait a bit before checking again
+                    self.queue_lock.wait(timeout=0.05)
+                    continue
+
+                # Group pending requests by generation config key
+                # (max_tokens, temperature, top_p, thinking_budget)
+                config_groups = {}
+                for req in self.pending_queue:
+                    item = req.batch_item
+                    key = (item.max_tokens, item.temperature, item.top_p, item.thinking_budget)
+                    if key not in config_groups:
+                        config_groups[key] = []
+                    config_groups[key].append(req)
+
+                # Check timeout trigger: oldest request waited too long
+                now = time.time()
+                oldest_wait = None
+                oldest_req = None
+                if self.pending_queue:
+                    oldest_req = self.pending_queue[0]
+                    oldest_wait = now - oldest_req.enqueue_time
+
+                # Dispatch batches to free workers
+                for worker in free_workers:
+                    if len(self.pending_queue) == 0:
+                        break
+
+                    # Find a config group to batch
+                    batch_requests = None
+                    
+                    # Priority 1: Full batch available for any config
+                    for key, group in config_groups.items():
+                        if len(group) >= self.batch_size:
+                            batch_requests = group[:self.batch_size]
+                            break
+                    
+                    # Priority 2: Timeout trigger - batch oldest request's config group
+                    if not batch_requests and oldest_wait and oldest_wait >= self.batch_timeout_s:
+                        if oldest_req:
+                            oldest_key = (
+                                oldest_req.batch_item.max_tokens,
+                                oldest_req.batch_item.temperature,
+                                oldest_req.batch_item.top_p,
+                                oldest_req.batch_item.thinking_budget,
+                            )
+                            if oldest_key in config_groups:
+                                group = config_groups[oldest_key]
+                                batch_requests = group[:min(self.batch_size, len(group))]
+
+                    if not batch_requests:
+                        continue
+
+                    # Remove from queue and config groups
+                    batch_items = [req.batch_item for req in batch_requests]
+                    for req in batch_requests:
+                        self.pending_queue.remove(req)
+                        key = (req.batch_item.max_tokens, req.batch_item.temperature,
+                               req.batch_item.top_p, req.batch_item.thinking_budget)
+                        config_groups[key].remove(req)
+                        if len(config_groups[key]) == 0:
+                            del config_groups[key]
+
+                    # Dispatch to worker in background thread
+                    worker.busy = True
+                    threading.Thread(
+                        target=self._process_batch,
+                        args=(worker, batch_requests, batch_items),
+                        daemon=True
+                    ).start()
+
+    def _process_batch(self, worker: Worker, requests: list[PendingRequest],
+                       batch_items: list[BatchItem]):
+        """Process a batch on a worker and signal completion."""
+        try:
+            with worker.lock:
+                results = worker.generate_batch(batch_items)
+            # Assign results to requests
+            for req, result in zip(requests, results):
+                req.result = result
+                req.completion_event.set()
+        except Exception as e:
+            # Propagate error to all requests in batch
+            for req in requests:
+                req.error = e
+                req.completion_event.set()
+        finally:
+            worker.busy = False
+            # Wake scheduler to check for more work
+            with self.queue_lock:
+                self.queue_lock.notify()
+
+    def shutdown(self):
+        """Stop scheduler and wait for completion."""
+        self.running = False
+        with self.queue_lock:
+            self.queue_lock.notify_all()
+        self.scheduler_thread.join(timeout=5.0)
 
 
 # Globals set in main
-lb: LoadBalancer = None
+scheduler: BatchScheduler = None
 model_name_global: str = ""
 
 
@@ -188,97 +391,64 @@ class Handler(BaseHTTPRequestHandler):
         stream = body.get("stream", False)
         thinking_budget = body.get("thinking_budget")  # None = no limit
 
-        worker = lb.get_worker()
+        # Reject streaming in batched mode
+        if stream:
+            self._json_response(400, {
+                "error": "streaming disabled in batched mode",
+                "message": "Set 'stream': false to use batched generation"
+            })
+            return
 
-        with worker.lock:
-            try:
-                if stream:
-                    self._handle_streaming(worker, messages, max_tokens,
-                                           temperature, top_p, thinking_budget)
-                else:
-                    self._handle_non_streaming(worker, messages, max_tokens,
-                                               temperature, top_p, thinking_budget)
-            except BrokenPipeError:
-                pass
-            except Exception as e:
+        # Enqueue for batched processing
+        batch_item = BatchItem(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            thinking_budget=thinking_budget,
+        )
+        req = scheduler.enqueue(batch_item)
+
+        # Wait for completion (with timeout)
+        if not req.completion_event.wait(timeout=600):  # 10 min timeout
+            self._json_response(504, {"error": "request timeout"})
+            return
+
+        try:
+            if req.error:
                 import traceback
                 traceback.print_exc()
-                try:
-                    self._json_response(500, {"error": str(e)})
-                except BrokenPipeError:
-                    pass
+                self._json_response(500, {"error": str(req.error)})
+                return
 
-    def _handle_non_streaming(self, worker, messages, max_tokens, temperature,
-                              top_p, thinking_budget=None):
-        t0 = time.time()
-        text, completion_tokens, prompt_tokens = worker.generate(
-            messages, max_tokens, temperature, top_p, stream=False,
-            thinking_budget=thinking_budget,
-        )
-        self._json_response(200, {
-            "id": f"chatcmpl-{int(t0)}",
-            "object": "chat.completion",
-            "created": int(t0),
-            "model": model_name_global,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": int(completion_tokens),
-                "total_tokens": prompt_tokens + int(completion_tokens),
-            },
-        })
-
-    def _handle_streaming(self, worker, messages, max_tokens, temperature,
-                          top_p, thinking_budget=None):
-        streamer, input_len, gen_thread, result = worker.generate(
-            messages, max_tokens, temperature, top_p, stream=True,
-            thinking_budget=thinking_budget,
-        )
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-
-        chunk_id = f"chatcmpl-{int(time.time())}"
-
-        for token_text in streamer:
-            if not token_text:
-                continue
-            chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
+            result = req.result
+            t0 = int(time.time())
+            self._json_response(200, {
+                "id": f"chatcmpl-{t0}",
+                "object": "chat.completion",
+                "created": t0,
                 "model": model_name_global,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": token_text},
-                    "finish_reason": None,
+                    "message": {"role": "assistant", "content": result["text"]},
+                    "finish_reason": "stop",
                 }],
-            }
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.flush()
+                "usage": {
+                    "prompt_tokens": result["prompt_tokens"],
+                    "completion_tokens": result["completion_tokens"],
+                    "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+                },
+            })
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json_response(500, {"error": str(e)})
+            except BrokenPipeError:
+                pass
 
-        gen_thread.join()
-        completion_tokens = result["completion_tokens"]
-
-        final = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "model": model_name_global,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {
-                "prompt_tokens": input_len,
-                "completion_tokens": completion_tokens,
-                "total_tokens": input_len + completion_tokens,
-            },
-        }
-        self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
 
     def _json_response(self, code, data):
         body = json.dumps(data).encode()
@@ -294,10 +464,10 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    global lb, model_name_global
+    global scheduler, model_name_global
 
     parser = argparse.ArgumentParser(
-        description="Serve a HuggingFace model on multiple GPUs with load balancing",
+        description="Serve a HuggingFace model on multiple GPUs with dynamic batching",
     )
     parser.add_argument("--model", default="lm-provers/QED-Nano",
                         help="HuggingFace model name (default: lm-provers/QED-Nano)")
@@ -310,6 +480,10 @@ def main():
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["float16", "bfloat16", "float32"],
                         help="Model dtype (default: bfloat16)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Batch size for dynamic batching (default: 32)")
+    parser.add_argument("--batch-timeout", type=float, default=1.0,
+                        help="Batch timeout in seconds (default: 1.0)")
     args = parser.parse_args()
 
     n_available = torch.cuda.device_count()
@@ -338,18 +512,21 @@ def main():
                 lambda i: Worker(i, args.model, dtype, tokenizer),
                 range(1, args.num_gpus),
             ))
-    lb = LoadBalancer(workers)
+    scheduler = BatchScheduler(workers, args.batch_size, args.batch_timeout)
 
     server = ThreadedHTTPServer((args.host, args.port), Handler)
     print(f"\nServing on http://{args.host}:{args.port}")
     print(f"  Model: {args.model}")
     print(f"  GPUs:  {args.num_gpus}")
     print(f"  dtype: {args.dtype}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Batch timeout: {args.batch_timeout}s")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
+        scheduler.shutdown()
         server.shutdown()
 
 
