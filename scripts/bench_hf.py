@@ -54,7 +54,11 @@ def single_request(base: str, model: str, prompt: str, max_tokens: int,
     )
 
     t0 = time.perf_counter()
-    resp = urllib.request.urlopen(req, timeout=600)
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body}") from None
 
     if not stream:
         data = json.loads(resp.read())
@@ -218,7 +222,7 @@ def main():
                         help="Server base URL (default: http://localhost:8000)")
     parser.add_argument("--model", default=None,
                         help="Model name (default: auto-detect)")
-    parser.add_argument("--prompt", default="medium", choices=list(PROMPTS.keys()),
+    parser.add_argument("--prompt", default="long", choices=list(PROMPTS.keys()),
                         help="Prompt preset (default: medium)")
     parser.add_argument("--custom-prompt", default=None,
                         help="Custom prompt text (overrides --prompt)")

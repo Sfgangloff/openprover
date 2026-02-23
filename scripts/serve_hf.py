@@ -7,17 +7,68 @@ at /v1/chat/completions (streaming and non-streaming) and /v1/models.
 
 import argparse
 import json
+import logging
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import LogitsProcessor
+
+
+class ThinkBudgetProcessor(LogitsProcessor):
+    """Force </think> after a token budget to reserve room for the answer.
+
+    Thinking models (e.g. QED-Nano) start generating reasoning tokens
+    immediately and emit </think> before the answer.  If thinking exceeds
+    `budget` new tokens, this processor forces the </think> token sequence
+    so the model transitions to answer generation.
+    """
+
+    def __init__(self, end_think_ids: list[int], budget: int, prompt_len: int):
+        self.end_ids = end_think_ids
+        self.budget = budget
+        self.prompt_len = prompt_len
+        self.in_thinking = True
+        self.force_idx = 0  # which token of </think> we're forcing next
+
+    def __call__(self, input_ids: torch.LongTensor,
+                 scores: torch.FloatTensor) -> torch.FloatTensor:
+        if not self.in_thinking:
+            return scores
+
+        # Check if </think> was naturally generated
+        n = len(self.end_ids)
+        if input_ids.shape[1] >= n:
+            last_n = input_ids[0, -n:].tolist()
+            if last_n == self.end_ids:
+                self.in_thinking = False
+                return scores
+
+        generated = input_ids.shape[1] - self.prompt_len
+
+        # Budget exceeded — force </think> token by token
+        if generated >= self.budget:
+            if self.force_idx < len(self.end_ids):
+                target = self.end_ids[self.force_idx]
+                self.force_idx += 1
+                forced = torch.full_like(scores, float('-inf'))
+                forced[:, target] = 0
+                return forced
+            else:
+                self.in_thinking = False
+
+        return scores
 
 
 class Worker:
     """One model replica on one GPU."""
+
+    _load_lock = threading.Lock()
 
     def __init__(self, gpu_id: int, model_name: str, dtype: torch.dtype, tokenizer):
         self.gpu_id = gpu_id
@@ -25,14 +76,20 @@ class Worker:
         self.lock = threading.Lock()
         self.tokenizer = tokenizer
 
+        # Pre-compute </think> token IDs for thinking budget enforcement
+        self.end_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
+
         print(f"  Loading on cuda:{gpu_id}...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype,
-        ).to(self.device)
+        # Serialize from_pretrained to avoid meta-tensor race conditions,
+        # but .to(device) runs outside the lock so GPU transfers overlap.
+        with Worker._load_lock:
+            model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
+        self.model = model.to(self.device)
         self.model.eval()
         print(f"  cuda:{gpu_id} ready")
 
-    def generate(self, messages, max_tokens, temperature, top_p, stream=False):
+    def generate(self, messages, max_tokens, temperature, top_p,
+                 stream=False, thinking_budget=None):
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -47,20 +104,33 @@ class Worker:
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["top_p"] = top_p
+        else:
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+            gen_kwargs["top_k"] = None
+
+        # Thinking budget enforcement
+        if thinking_budget is not None and self.end_think_ids:
+            processor = ThinkBudgetProcessor(
+                self.end_think_ids, thinking_budget, input_len,
+            )
+            gen_kwargs["logits_processor"] = [processor]
 
         if stream:
             streamer = TextIteratorStreamer(
                 self.tokenizer, skip_prompt=True, skip_special_tokens=True,
             )
             gen_kwargs["streamer"] = streamer
+            result = {}
 
             def _run():
                 with torch.inference_mode():
-                    self.model.generate(**gen_kwargs)
+                    output = self.model.generate(**gen_kwargs)
+                result["completion_tokens"] = output.shape[1] - input_len
 
             thread = threading.Thread(target=_run)
             thread.start()
-            return streamer, input_len, thread
+            return streamer, input_len, thread, result
         else:
             with torch.inference_mode():
                 output = self.model.generate(**gen_kwargs)
@@ -116,22 +186,34 @@ class Handler(BaseHTTPRequestHandler):
         temperature = body.get("temperature", 0.6)
         top_p = body.get("top_p", 0.95)
         stream = body.get("stream", False)
+        thinking_budget = body.get("thinking_budget")  # None = no limit
 
         worker = lb.get_worker()
 
         with worker.lock:
             try:
                 if stream:
-                    self._handle_streaming(worker, messages, max_tokens, temperature, top_p)
+                    self._handle_streaming(worker, messages, max_tokens,
+                                           temperature, top_p, thinking_budget)
                 else:
-                    self._handle_non_streaming(worker, messages, max_tokens, temperature, top_p)
+                    self._handle_non_streaming(worker, messages, max_tokens,
+                                               temperature, top_p, thinking_budget)
+            except BrokenPipeError:
+                pass
             except Exception as e:
-                self._json_response(500, {"error": str(e)})
+                import traceback
+                traceback.print_exc()
+                try:
+                    self._json_response(500, {"error": str(e)})
+                except BrokenPipeError:
+                    pass
 
-    def _handle_non_streaming(self, worker, messages, max_tokens, temperature, top_p):
+    def _handle_non_streaming(self, worker, messages, max_tokens, temperature,
+                              top_p, thinking_budget=None):
         t0 = time.time()
         text, completion_tokens, prompt_tokens = worker.generate(
             messages, max_tokens, temperature, top_p, stream=False,
+            thinking_budget=thinking_budget,
         )
         self._json_response(200, {
             "id": f"chatcmpl-{int(t0)}",
@@ -150,9 +232,11 @@ class Handler(BaseHTTPRequestHandler):
             },
         })
 
-    def _handle_streaming(self, worker, messages, max_tokens, temperature, top_p):
-        streamer, input_len, gen_thread = worker.generate(
+    def _handle_streaming(self, worker, messages, max_tokens, temperature,
+                          top_p, thinking_budget=None):
+        streamer, input_len, gen_thread, result = worker.generate(
             messages, max_tokens, temperature, top_p, stream=True,
+            thinking_budget=thinking_budget,
         )
 
         self.send_response(200)
@@ -178,17 +262,23 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
             self.wfile.flush()
 
+        gen_thread.join()
+        completion_tokens = result["completion_tokens"]
+
         final = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "model": model_name_global,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": input_len,
+                "completion_tokens": completion_tokens,
+                "total_tokens": input_len + completion_tokens,
+            },
         }
         self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
-
-        gen_thread.join()
 
     def _json_response(self, code, data):
         body = json.dumps(data).encode()
@@ -235,7 +325,19 @@ def main():
 
     print(f"Loading {args.num_gpus} replica(s) of {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    workers = [Worker(i, args.model, dtype, tokenizer) for i in range(args.num_gpus)]
+
+    # Load first replica with full output (shows warnings like MISSING weights)
+    workers = [Worker(0, args.model, dtype, tokenizer)]
+
+    if args.num_gpus > 1:
+        # Suppress noisy progress bars / load reports for remaining replicas
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+        with ThreadPoolExecutor(max_workers=args.num_gpus - 1) as pool:
+            workers += list(pool.map(
+                lambda i: Worker(i, args.model, dtype, tokenizer),
+                range(1, args.num_gpus),
+            ))
     lb = LoadBalancer(workers)
 
     server = ThreadedHTTPServer((args.host, args.port), Handler)

@@ -17,6 +17,9 @@ def main():
     parser.add_argument("--prompt", default="Prove that the square root of 2 is irrational.",
                         help="Prompt to send")
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Stream tokens to console (default: true)")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -52,6 +55,8 @@ def main():
         "messages": [{"role": "user", "content": args.prompt}],
         "max_tokens": args.max_tokens,
         "temperature": 0.6,
+        "stream": args.stream,
+        **({"stream_options": {"include_usage": True}} if args.stream else {}),
     }).encode()
 
     req = urllib.request.Request(
@@ -60,23 +65,46 @@ def main():
         headers={"Content-Type": "application/json"},
     )
 
+    print(f"Prompt: {args.prompt}")
+    print(f"{'─' * 60}")
+
     try:
         resp = urllib.request.urlopen(req, timeout=120)
-        data = json.loads(resp.read())
     except urllib.error.URLError as e:
         print(f"ERROR: Request failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Print results
-    choice = data["choices"][0]
-    message = choice["message"]["content"]
-    usage = data.get("usage", {})
+    if args.stream:
+        finish_reason = None
+        usage = {}
+        for line in resp:
+            line = line.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[len("data: "):]
+            if data_str == "[DONE]":
+                break
+            chunk = json.loads(data_str)
+            delta = chunk["choices"][0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                sys.stdout.write(content)
+                sys.stdout.flush()
+            fr = chunk["choices"][0].get("finish_reason")
+            if fr:
+                finish_reason = fr
+            if "usage" in chunk:
+                usage = chunk["usage"]
+        print()
+    else:
+        data = json.loads(resp.read())
+        choice = data["choices"][0]
+        print(choice["message"]["content"])
+        finish_reason = choice.get("finish_reason", "?")
+        usage = data.get("usage", {})
 
-    print(f"Prompt: {args.prompt}")
     print(f"{'─' * 60}")
-    print(message)
-    print(f"{'─' * 60}")
-    print(f"Finish reason: {choice.get('finish_reason', '?')}")
+    print(f"Finish reason: {finish_reason or '?'}")
     print(f"Prompt tokens:     {usage.get('prompt_tokens', '?')}")
     print(f"Completion tokens: {usage.get('completion_tokens', '?')}")
     print(f"Total tokens:      {usage.get('total_tokens', '?')}")
