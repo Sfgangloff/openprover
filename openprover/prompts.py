@@ -33,7 +33,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "- **proof_found**: Declare success. **This terminates the session.** You must be confident the proof is correct - it must have been independently verified by a worker.\n"
     )
     if allow_give_up:
-        actions += "- **give_up**: Declare failure. Only after using nearly all allotted steps.\n"
+        actions += "- **give_up**: Declare failure.\n"
     if not isolation:
         actions += (
             "- **literature_search**: Search the web for relevant mathematical literature. Spawns one web-enabled worker.\n"
@@ -75,15 +75,6 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
     if not isolation:
         toml_fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
 
-    give_up_section = ""
-    if allow_give_up:
-        give_up_section = (
-            "## CRITICAL: give_up\n"
-            "\n"
-            "NEVER give up early. You must use nearly all allotted steps first. "
-            '"This is a famous open problem" is NEVER a reason to give up. Try novel approaches, special cases, variations.\n'
-            "\n"
-        )
 
     return (
         "You are a senior research mathematician coordinating a proof effort. "
@@ -91,7 +82,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "\n"
         "## Your Role\n"
         "\n"
-        "You are the PLANNER. You do NOT do math directly - you delegate to workers. Each step you choose one action:\n"
+        "You are the PLANNER. You are responsible for the high-level plan and delegate low-level stuff to workers. Each step you choose one action:\n"
         "\n"
         f"{actions}"
         "\n"
@@ -125,7 +116,6 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "NEVER use proof_found unless you have a COMPLETE, RIGOROUS proof that has been VERIFIED by an independent worker. "
         "proof_found **terminates the session** - there is no going back. The proof field must contain the full proof text.\n"
         "\n"
-        f"{give_up_section}"
         "## Output Format\n"
         "\n"
         "Think step by step, then end your response with a TOML decision block:\n"
@@ -148,17 +138,15 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
 WORKER_SYSTEM_PROMPT = (
     "You are a research mathematician working on a specific task.\n"
     "\n"
-    "Complete the task thoroughly and report your findings. Be rigorous - "
-    "if you prove something, ensure every step follows logically. "
-    "If you find issues, be specific about where and why.\n"
+    "Complete the task thoroughly and report your findings. "
+    "If you fail to complete the task, be specific about what failed and why.\n"
     "\n"
-    "If asked to verify a proof: be skeptical. Check every step. "
+    "If asked to verify a proof: be rigorous. Check every step. "
     "Don't fill in gaps yourself. End your response with exactly one of:\n"
     "VERDICT: CORRECT\n"
     "VERDICT: INCORRECT\n"
     "\n"
-    "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX. "
-    "Mark confidence: [high], [med], [low].\n"
+    "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX.\n"
 )
 
 SEARCH_SYSTEM_PROMPT = (
