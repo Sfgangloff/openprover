@@ -15,6 +15,11 @@ class Interrupted(Exception):
     pass
 
 
+class StreamingUnavailable(RuntimeError):
+    """Raised when HF server cannot stream in current configuration."""
+    pass
+
+
 def _split_think_tags(text: str) -> tuple[str, str]:
     """Split thinking from model output at </think> boundary.
 
@@ -289,8 +294,11 @@ class HFClient:
         self.total_cost = 0.0
         self._interrupted = threading.Event()
         self.max_context_length = MODEL_CONTEXT_LENGTHS[model]
-        self.thinking_budget = max(self.max_context_length - answer_reserve,
-                                   self.max_context_length // 2)
+        self.max_output_tokens = self.max_context_length
+        self.max_thinking_tokens = max(
+            self.max_context_length - answer_reserve,
+            self.max_context_length // 2,
+        )
         self._check_server()
 
     def interrupt(self):
@@ -337,21 +345,39 @@ class HFClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_context_length,
+            "max_output_tokens": self.max_output_tokens,
+            "max_thinking_tokens": self.max_thinking_tokens,
             "temperature": 0.6,
             "top_p": 0.95,
             "stream": bool(stream_callback),
-            "thinking_budget": self.thinking_budget,
         }
 
         start = time.time()
 
+        if self._interrupted.is_set():
+            elapsed_ms = int((time.time() - start) * 1000)
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
+
         try:
             if stream_callback:
-                return self._call_streaming(
-                    payload, prompt, system_prompt, json_schema,
-                    call_num, label, start, stream_callback, archive_path,
-                )
+                try:
+                    return self._call_streaming(
+                        payload, prompt, system_prompt, json_schema,
+                        call_num, label, start, stream_callback, archive_path,
+                    )
+                except StreamingUnavailable:
+                    # Keep callers working when server runs with batch_size > 1.
+                    # Fallback to non-streaming and emit the full text once.
+                    out = self._call_non_streaming(
+                        {**payload, "stream": False},
+                        prompt, system_prompt, json_schema,
+                        call_num, label, start, archive_path,
+                    )
+                    if out.get("result"):
+                        stream_callback(out["result"], "text")
+                    return out
             else:
                 return self._call_non_streaming(
                     payload, prompt, system_prompt, json_schema,
@@ -365,14 +391,36 @@ class HFClient:
 
     def _call_non_streaming(self, payload, prompt, system_prompt, json_schema,
                             call_num, label, start, archive_path):
+        if self._interrupted.is_set():
+            elapsed_ms = int((time.time() - start) * 1000)
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
+
         req = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        resp = urllib.request.urlopen(req, timeout=600)
-        raw = json.loads(resp.read())
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+            raw = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            elapsed_ms = int((time.time() - start) * 1000)
+            if e.code == 499:
+                self._archive(call_num, label, prompt, system_prompt, json_schema,
+                              None, "interrupted", elapsed_ms, archive_path)
+                raise Interrupted()
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, f"HTTP {e.code}: {body}", elapsed_ms, archive_path)
+            raise
         elapsed_ms = int((time.time() - start) * 1000)
+
+        if self._interrupted.is_set():
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
 
         full_text = raw["choices"][0]["message"]["content"]
         result_text, thinking_text = _split_think_tags(full_text)
@@ -395,7 +443,24 @@ class HFClient:
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        resp = urllib.request.urlopen(req, timeout=600)
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            elapsed_ms = int((time.time() - start) * 1000)
+            if e.code == 499:
+                self._archive(call_num, label, prompt, system_prompt, json_schema,
+                              None, "interrupted", elapsed_ms, archive_path)
+                raise Interrupted()
+            if e.code == 400 and "streaming disabled in batched mode" in body.lower():
+                # server uses batch_size > 1 and does not support streaming there
+                raise StreamingUnavailable(
+                    "HF streaming unavailable in batched mode "
+                    "(set serve_hf --batch-size 1 for streaming)"
+                )
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, f"HTTP {e.code}: {body}", elapsed_ms, archive_path)
+            raise
 
         thinking_parts: list[str] = []
         output_parts: list[str] = []

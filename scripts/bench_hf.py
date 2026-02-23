@@ -34,12 +34,20 @@ def get_model(base: str, model_arg: str | None) -> str:
     return model
 
 
-def single_request(base: str, model: str, prompt: str, max_tokens: int, request_timeout_s: float) -> dict:
+def single_request(
+    base: str,
+    model: str,
+    prompt: str,
+    max_output_tokens: int,
+    max_thinking_tokens: int | None,
+    request_timeout_s: float,
+) -> dict:
     """One non-streaming request, return completion tokens and timing."""
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
+        "max_output_tokens": max_output_tokens,
+        "max_thinking_tokens": max_thinking_tokens,
         "temperature": 0.0,
         "stream": False,
     }).encode()
@@ -78,7 +86,8 @@ def run_bench(args):
         sys.exit(1)
 
     print(f"Prompt: {LONG_PROMPT[:80]}{'...' if len(LONG_PROMPT) > 80 else ''}")
-    print(f"Max tokens: {args.max_tokens}")
+    print(f"Max output tokens: {args.max_output_tokens}")
+    print(f"Max thinking tokens: {args.max_thinking_tokens}")
     print(f"Total requests: {args.total_requests}")
     print(f"Client concurrency: {args.concurrency}")
     print()
@@ -97,7 +106,8 @@ def run_bench(args):
                 base,
                 model,
                 LONG_PROMPT,
-                args.max_tokens,
+                args.max_output_tokens,
+                args.max_thinking_tokens,
                 args.request_timeout,
             ): i
             for i in range(args.total_requests)
@@ -171,8 +181,10 @@ def main():
                         help="Server base URL (default: http://localhost:8000)")
     parser.add_argument("--model", default=None,
                         help="Model name (default: auto-detect)")
-    parser.add_argument("--max-tokens", type=int, default=512,
+    parser.add_argument("--max-output-tokens", type=int, default=512,
                         help="Max output tokens (default: 512)")
+    parser.add_argument("--max-thinking-tokens", type=int, default=None,
+                        help="Max thinking tokens (default: no explicit cap)")
     parser.add_argument("--total-requests", "-n", type=int, default=100,
                         help="Total number of requests to send (default: 100)")
     parser.add_argument("--concurrency", "-c", type=int, default=32,

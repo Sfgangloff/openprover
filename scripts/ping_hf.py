@@ -16,7 +16,8 @@ def main():
                         help="Model name (default: auto-detect from /v1/models)")
     parser.add_argument("--prompt", default="Prove that the square root of 2 is irrational.",
                         help="Prompt to send")
-    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--max-output-tokens", type=int, default=256)
+    parser.add_argument("--max-thinking-tokens", type=int, default=None)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Stream tokens to console (default: true)")
@@ -53,7 +54,8 @@ def main():
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": args.prompt}],
-        "max_tokens": args.max_tokens,
+        "max_output_tokens": args.max_output_tokens,
+        "max_thinking_tokens": args.max_thinking_tokens,
         "temperature": 0.6,
         "stream": args.stream,
         **({"stream_options": {"include_usage": True}} if args.stream else {}),
@@ -72,6 +74,13 @@ def main():
         resp = urllib.request.urlopen(req, timeout=120)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
+        if e.code == 400 and "streaming disabled in batched mode" in body.lower():
+            print(
+                "ERROR: Streaming is disabled when serve_hf runs with --batch-size > 1.\n"
+                "       Start server with --batch-size 1 for streaming.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if e.code == 499:
             print("ERROR: Request was cancelled (client disconnected)", file=sys.stderr)
             sys.exit(130)
