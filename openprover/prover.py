@@ -1,14 +1,18 @@
 """Core proving loop for OpenProver — planner/worker architecture."""
 
 import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts
+from .lean import LeanTheorem, LeanWorkDir, run_lean_check
 from .llm import Interrupted
 from .tui import TUI
+
+logger = logging.getLogger("openprover")
 
 
 def slugify(text: str) -> str:
@@ -76,12 +80,29 @@ class Repo:
         return "\n\n".join(parts)
 
 
+class _TUILogHandler(logging.Handler):
+    """Logging handler that forwards messages to the TUI logs tab."""
+
+    def __init__(self, tui: TUI):
+        super().__init__()
+        self.tui = tui
+
+    def emit(self, record):
+        try:
+            self.tui.log_trace(self.format(record))
+        except Exception:
+            pass
+
+
 class Prover:
     def __init__(self, theorem_path: str | None, make_llm, model_name: str,
                  max_steps: int,
                  autonomous: bool, verbose: bool, tui: TUI,
                  isolation: bool = False, run_dir: str | None = None,
-                 parallelism: int = 1, give_up_ratio: float = 0.5):
+                 parallelism: int = 1, give_up_ratio: float = 0.5,
+                 lean_project_dir: Path | None = None,
+                 lean_theorem_path: Path | None = None,
+                 proof_path: Path | None = None):
         self.model = model_name
         self._make_llm = make_llm
         self.max_steps = max_steps
@@ -93,9 +114,31 @@ class Prover:
         self.parallelism = parallelism
         self.shutting_down = False
         self.step_num = 0
-        self.prev_output = ""
+        self.prev_outputs: list[str] = []  # rolling window of last 3 outputs
         self.proof_text = ""
         self.resumed = False
+
+        # Lean configuration
+        self.lean_project_dir = lean_project_dir
+        self.lean_theorem: LeanTheorem | None = None
+        self.lean_theorem_text: str = ""
+        self.lean_work_dir: LeanWorkDir | None = None
+        self.proof_md_text: str = ""
+
+        if lean_theorem_path:
+            self.lean_theorem_text = lean_theorem_path.read_text()
+            self.lean_theorem = LeanTheorem(self.lean_theorem_text)
+            self.lean_work_dir = LeanWorkDir(lean_project_dir)
+        if proof_path:
+            self.proof_md_text = proof_path.read_text()
+
+        # Operating mode
+        if lean_theorem_path and proof_path:
+            self.mode = "formalize_only"
+        elif lean_theorem_path:
+            self.mode = "prove_and_formalize"
+        else:
+            self.mode = "prove"
 
         # Set up working directory
         if run_dir:
@@ -132,8 +175,20 @@ class Prover:
                 )
             self.theorem_text = Path(theorem_path).read_text()
             (self.work_dir / "THEOREM.md").write_text(self.theorem_text)
-            self.whiteboard = prompts.format_initial_whiteboard(self.theorem_text)
+            if self.lean_theorem_text:
+                (self.work_dir / "THEOREM.lean").write_text(self.lean_theorem_text)
+            if self.proof_md_text and self.mode == "formalize_only":
+                (self.work_dir / "PROOF.md").write_text(self.proof_md_text)
+            self.whiteboard = prompts.format_initial_whiteboard(
+                self.theorem_text, mode=self.mode,
+            )
             whiteboard_path.write_text(self.whiteboard)
+
+        # Logging
+        self._setup_logging()
+        logger.info("Mode: %s, Model: %s", self.mode, self.model)
+        if self.resumed:
+            logger.info("Resuming from step %d/%d", self.step_num, self.max_steps)
 
         # LLM client (archive_dir is fallback; per-call paths used for step calls)
         self.llm = self._make_llm(self.work_dir / "archive")
@@ -155,6 +210,7 @@ class Prover:
             max_steps=self.max_steps,
             model_name=self.model,
         )
+        self._setup_tui_logging()
         self.tui.autonomous = self.autonomous
         self.tui.whiteboard = self.whiteboard
 
@@ -176,8 +232,36 @@ class Prover:
         if not self.shutting_down and self.tui.step_entries:
             self._write_discussion()
 
+    def _push_output(self, text: str):
+        """Add output to the rolling window (last 3 kept)."""
+        if text:
+            self.prev_outputs.append(text)
+            if len(self.prev_outputs) > 3:
+                self.prev_outputs = self.prev_outputs[-3:]
+
+    def _setup_logging(self):
+        """Configure file logging to trace.log in the run directory."""
+        root = logging.getLogger("openprover")
+        root.setLevel(logging.INFO)
+        # Remove any stale handlers (e.g. from a previous init)
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+        fh = logging.FileHandler(self.work_dir / "trace.log")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+    def _setup_tui_logging(self):
+        """Add TUI log handler (call after tui.setup)."""
+        root = logging.getLogger("openprover")
+        fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+        handler = _TUILogHandler(self.tui)
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
+
     def _do_step(self) -> str:
         """Execute one planner step. Returns 'continue', 'stop', 'pause'."""
+        logger.info("Step %d/%d", self.step_num, self.max_steps)
         self.autonomous = self.tui.autonomous
 
         # Check for autonomous mode actions
@@ -203,12 +287,11 @@ class Prover:
         prompt = prompts.format_planner_prompt(
             whiteboard=self.whiteboard,
             repo_index=repo_index,
-            prev_output=self.prev_output,
+            prev_outputs=list(self.prev_outputs),
             step_num=self.step_num,
             max_steps=self.max_steps,
             parallelism=self.parallelism,
         )
-        self.prev_output = ""
 
         # Planner LLM call
         self.tui.stream_start("planning", tab="planner")
@@ -218,6 +301,8 @@ class Prover:
                 system_prompt=prompts.planner_system_prompt(
                     isolation=self.isolation,
                     allow_give_up=self.step_num >= self.max_steps * self.give_up_ratio,
+                    lean_mode=self.mode,
+                    num_sorries=self.lean_theorem.num_sorries if self.lean_theorem else 0,
                 ),
                 label=f"planner_step_{self.step_num}",
                 stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
@@ -225,13 +310,17 @@ class Prover:
             )
         except Interrupted:
             self.tui.stream_end(tab="planner")
+            logger.info("Planner interrupted")
             return self._handle_interrupt(step_dir)
         except RuntimeError as e:
             self.tui.stream_end(tab="planner")
+            logger.error("Planner error: %s", e)
             self.tui.log(f"Error: {e}", color="red")
             self._save_step_meta(step_dir, status="llm_error", error=str(e))
             return "continue"
         self.tui.stream_end(tab="planner")
+        logger.info("Planner: %dms $%.4f",
+                     resp.get("duration_ms", 0), resp.get("cost", 0))
 
         # Parse TOML decision
         plan = prompts.parse_planner_toml(resp["result"])
@@ -243,6 +332,7 @@ class Prover:
 
         action = plan.get("action", "")
         summary = plan.get("summary", "")
+        logger.info("Action: %s — %s", action, summary)
 
         # Update whiteboard (required every step)
         if not plan.get("whiteboard"):
@@ -274,11 +364,17 @@ class Prover:
             return self._handle_read_items(plan)
         if action == "write_items":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
-            return self._handle_write_items(plan)
+            return self._handle_write_items(plan, step_dir)
         if action == "spawn":
             return self._handle_spawn(plan, step_dir, resp)
         if action == "literature_search":
             return self._handle_literature_search(plan, step_dir, resp)
+        if action == "submit_lean_proof":
+            self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
+            return self._handle_submit_lean_proof(plan, step_dir)
+        if action == "read_theorem":
+            self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
+            return self._handle_read_theorem()
 
         self.tui.log(f"Unknown action: {action}", color="red")
         self._save_step_meta(step_dir, status="unknown_action", action=action,
@@ -314,20 +410,39 @@ class Prover:
                 self.shutting_down = True
                 return "stop"
             # Feedback
-            self.prev_output = f"Human feedback: {user_resp}"
+            self._push_output(f"Human feedback: {user_resp}")
             self.tui.log("Feedback noted — will replan next step", color="yellow")
             return "continue"
 
     def _handle_proof_found(self, plan: dict) -> str:
+        if self.mode == "formalize_only":
+            self.tui.log("proof_found not available in formalize-only mode", color="red")
+            self._push_output(
+                "proof_found rejected: in formalize-only mode, use submit_lean_proof instead."
+            )
+            return "continue"
+
         proof = plan.get("proof", "")
         if not proof:
             self.tui.log("proof_found but no proof text — continuing", color="red")
-            self.prev_output = "proof_found rejected: no proof text provided."
+            self._push_output("proof_found rejected: no proof text provided.")
             return "continue"
         self.proof_text = proof
         (self.work_dir / "PROOF.md").write_text(proof)
         self.tui.log("Proof found!", color="green", bold=True)
         self.tui.log(f"  {self.work_dir / 'PROOF.md'}", dim=True)
+        logger.info("Proof found! PROOF.md written")
+
+        if self.mode == "prove_and_formalize":
+            if not (self.work_dir / "PROOF.lean").exists():
+                self.tui.log("PROOF.lean not yet produced — continuing", color="yellow")
+                self._push_output(
+                    "PROOF.md written. Now formalize the proof in Lean via submit_lean_proof."
+                )
+                return "continue"
+            self.tui.log("Both PROOF.md and PROOF.lean complete!", color="green", bold=True)
+            logger.info("Both PROOF.md and PROOF.lean complete")
+
         return "stop"
 
     def _handle_give_up(self) -> str:
@@ -336,8 +451,9 @@ class Prover:
                 f"Not giving up — only {self.step_num}/{self.max_steps} steps used",
                 color="yellow",
             )
-            self.prev_output = "give_up rejected: too many steps remaining. Keep trying."
+            self._push_output("give_up rejected: too many steps remaining. Keep trying.")
             return "continue"
+        logger.info("Giving up at step %d/%d", self.step_num, self.max_steps)
         self.tui.log("Stuck — no more ideas.", color="yellow")
         return "stop"
 
@@ -346,11 +462,11 @@ class Prover:
         if not slugs:
             self.tui.log("read_items but no slugs specified", color="yellow")
             return "continue"
-        self.prev_output = self.repo.read_items(slugs)
+        self._push_output(self.repo.read_items(slugs))
         self.tui.log(f"Read {len(slugs)} item(s): {', '.join(slugs)}", dim=True)
         return "continue"
 
-    def _handle_write_items(self, plan: dict) -> str:
+    def _handle_write_items(self, plan: dict, step_dir: Path) -> str:
         items = plan.get("items", [])
         # Fallback: support old write_slug/write_content format
         if not items:
@@ -359,17 +475,139 @@ class Prover:
                 self.tui.log("write_items but no items specified", color="yellow")
                 return "continue"
             items = [{"slug": slug, "content": plan.get("write_content")}]
+
+        lean_feedback: list[str] = []
+        lean_idx = 0
         for item in items:
             slug = item.get("slug", "")
             if not slug:
                 continue
             content = item.get("content")
+            fmt = item.get("format", "markdown")
+
             self.repo.write_item(slug, content)
-            if not content:
+
+            if fmt == "lean" and content and self.lean_work_dir:
+                # Write lean file and auto-verify
+                path = self.lean_work_dir.make_file(slug, content)
+                self.tui.log(f"Verifying [[{slug}]]...", dim=True)
+                success, feedback = run_lean_check(path, self.lean_project_dir)
+
+                # Archive lean I/O
+                lean_dir = step_dir / "lean"
+                lean_dir.mkdir(exist_ok=True)
+                (lean_dir / f"item_{lean_idx}_{slug}.lean").write_text(content)
+                (lean_dir / f"result_{lean_idx}_{slug}.txt").write_text(
+                    "OK" if success else feedback)
+                lean_idx += 1
+
+                if success:
+                    self.tui.log(f"Wrote [[{slug}]] (lean, verified OK)", color="green")
+                    logger.info("Lean item [[%s]] verified OK", slug)
+                    lean_feedback.append(f"[[{slug}]]: Lean verification PASSED")
+                else:
+                    self.tui.log(f"Wrote [[{slug}]] (lean, errors)", color="yellow")
+                    logger.info("Lean item [[%s]] failed verification", slug)
+                    lean_feedback.append(
+                        f"[[{slug}]]: Lean verification FAILED\n```\n{feedback}\n```"
+                    )
+            elif not content:
                 self.tui.log(f"Deleted [[{slug}]]", color="yellow")
             else:
                 first_line = content.split("\n", 1)[0]
                 self.tui.log(f"Wrote [[{slug}]]: {first_line}", color="green")
+
+        if lean_feedback:
+            self._push_output(
+                "## Lean Verification Results\n\n" + "\n\n".join(lean_feedback)
+            )
+        return "continue"
+
+    def _handle_submit_lean_proof(self, plan: dict, step_dir: Path) -> str:
+        if not self.lean_theorem:
+            self.tui.log("submit_lean_proof requires --lean-theorem", color="red")
+            self._push_output("submit_lean_proof rejected: no THEOREM.lean configured.")
+            return "continue"
+
+        blocks = plan.get("lean_blocks", [])
+        context = plan.get("lean_context", "")
+        logger.info("Submitting Lean proof (%d blocks)", len(blocks))
+
+        if not blocks:
+            self.tui.log("submit_lean_proof: no lean_blocks provided", color="red")
+            self._push_output(
+                f"submit_lean_proof rejected: no lean_blocks provided. "
+                f"Expected {self.lean_theorem.num_sorries} block(s)."
+            )
+            return "continue"
+
+        # Assemble the proof file
+        try:
+            proof_text = self.lean_theorem.assemble_proof(blocks, context)
+        except ValueError as e:
+            self.tui.log(f"Assembly error: {e}", color="red")
+            logger.warning("Assembly error: %s", e)
+            self._push_output(f"submit_lean_proof assembly error: {e}")
+            return "continue"
+
+        # Write to temp file and verify
+        proof_path = self.lean_work_dir.make_file("proof-attempt", proof_text)
+        self.tui.log(f"Verifying Lean proof: {proof_path.name}...", dim=True)
+
+        success, feedback = run_lean_check(proof_path, self.lean_project_dir)
+
+        # Archive lean I/O
+        lean_dir = step_dir / "lean"
+        lean_dir.mkdir(exist_ok=True)
+        (lean_dir / "proof_attempt.lean").write_text(proof_text)
+        (lean_dir / "proof_result.txt").write_text("OK" if success else feedback)
+
+        if success:
+            self.lean_work_dir.write_proof(proof_text)
+            (self.work_dir / "PROOF.lean").write_text(proof_text)
+            self.tui.log("Lean proof verified!", color="green", bold=True)
+            self.tui.log(f"  {self.work_dir / 'PROOF.lean'}", dim=True)
+            logger.info("Lean proof verified! PROOF.lean written")
+
+            if self.mode == "formalize_only":
+                return "stop"
+
+            # prove_and_formalize: check if PROOF.md also exists
+            if (self.work_dir / "PROOF.md").exists():
+                self.tui.log("Both PROOF.md and PROOF.lean complete!",
+                             color="green", bold=True)
+                logger.info("Both PROOF.md and PROOF.lean complete")
+                return "stop"
+
+            self._push_output(
+                "Lean proof verified! PROOF.lean has been written.\n"
+                "Now produce the informal proof using proof_found."
+            )
+            return "continue"
+        else:
+            self.tui.log("Lean verification failed", color="red")
+            logger.info("Lean proof verification failed")
+            self._push_output(
+                f"submit_lean_proof verification FAILED.\n\n"
+                f"Lean feedback:\n```\n{feedback}\n```\n\n"
+                f"Fix the issues and try again."
+            )
+            return "continue"
+
+    def _handle_read_theorem(self) -> str:
+        parts = [f"## THEOREM.md\n\n{self.theorem_text}"]
+        if self.lean_theorem_text:
+            parts.append(
+                f"\n\n## THEOREM.lean\n\n```lean\n{self.lean_theorem_text}\n```"
+            )
+            parts.append(
+                f"\n\nNumber of `sorry` keywords to replace: "
+                f"{self.lean_theorem.num_sorries}"
+            )
+        if self.proof_md_text:
+            parts.append(f"\n\n## PROOF.md (provided)\n\n{self.proof_md_text}")
+        self._push_output("\n".join(parts))
+        self.tui.log("Read theorem content", dim=True)
         return "continue"
 
     def _handle_spawn(self, plan: dict, step_dir: Path,
@@ -401,9 +639,11 @@ class Prover:
                     self.tui.log("  autonomous mode", dim=True)
                     break
                 # Feedback — set as prev_output and retry next step
-                self.prev_output = f"Human feedback: {user_resp}"
+                self._push_output(f"Human feedback: {user_resp}")
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
+
+        logger.info("Spawning %d worker(s)", len(tasks))
 
         # Create worker tabs
         worker_ids = []
@@ -447,6 +687,7 @@ class Prover:
                             "duration_ms": 0, "raw": {}, "error": str(e),
                         }
                     done_count += 1
+                    logger.info("Worker %d/%d done", done_count, n)
                     self.tui.mark_worker_done(worker_ids[idx])
                     if done_count < n:
                         self.tui.set_waiting_status(
@@ -475,7 +716,7 @@ class Prover:
             parts.append(f"## Worker {i}: {first_line}\n\n{result}")
             (workers_dir / f"result_{i}.md").write_text(result or "")
 
-        self.prev_output = "\n\n".join(parts)
+        self._push_output("\n\n".join(parts))
 
         # Save step metadata with worker details
         self._save_step_meta(
@@ -492,7 +733,7 @@ class Prover:
                                    planner_resp: dict | None = None) -> str:
         if self.isolation:
             self.tui.log("Literature search not available (isolation mode)", color="yellow")
-            self.prev_output = "Literature search is not available in isolation mode."
+            self._push_output("Literature search is not available in isolation mode.")
             self._save_step_meta(step_dir, status="ok", action="literature_search",
                                  resp=planner_resp, error="Isolation mode")
             return "continue"
@@ -522,10 +763,11 @@ class Prover:
                     self.tui.log("  autonomous mode", dim=True)
                     break
                 # Feedback — set as prev_output and retry next step
-                self.prev_output = f"Human feedback: {user_resp}"
+                self._push_output(f"Human feedback: {user_resp}")
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
 
+        logger.info("Literature search: %s", query)
         wid = f"search_{self.step_num}"
         task_desc = f"Query: {query}\n\nContext: {context}"
         self.tui.add_worker_tab(wid, "Search", task_description=task_desc)
@@ -555,7 +797,7 @@ class Prover:
             self.tui.stream_end(tab=wid)
             result = search_resp["result"]
             search_resp["error"] = ""
-            self.prev_output = result
+            self._push_output(result)
             (workers_dir / "result_0.md").write_text(result)
         except Interrupted:
             self.tui.stream_end(tab=wid)
@@ -565,14 +807,14 @@ class Prover:
                 self.tui.autonomous = False
                 self.tui.log("Interrupted — switching to manual mode", color="yellow")
             result = "(terminated by user)"
-            self.prev_output = result
+            self._push_output(result)
             search_resp = {"result": result, "cost": 0.0, "duration_ms": 0,
                            "raw": {}, "error": "interrupted"}
         except RuntimeError as e:
             self.tui.stream_end(tab=wid)
             result = f"Literature search failed: {e}"
             self.tui.log(f"Search error: {e}", color="red")
-            self.prev_output = result
+            self._push_output(result)
             search_resp = {"result": result, "cost": 0.0, "duration_ms": 0,
                            "raw": {}, "error": str(e)}
         self.tui.set_waiting_status("")
@@ -628,7 +870,7 @@ class Prover:
         if plan.get("whiteboard"):
             lines.append(f'whiteboard = """\n{plan["whiteboard"]}\n"""')
         # Save action-specific fields
-        for key in ("proof", "search_query", "search_context"):
+        for key in ("proof", "search_query", "search_context", "lean_context"):
             if key in plan:
                 val = plan[key]
                 if isinstance(val, str) and "\n" in val:
@@ -649,6 +891,9 @@ class Prover:
                 lines.append("\n[[tasks]]")
                 desc = task.get("description", "")
                 lines.append(f'description = """\n{desc}\n"""')
+        if "lean_blocks" in plan:
+            for i, block in enumerate(plan["lean_blocks"]):
+                lines.append(f'\nlean_block_{i} = """\n{block}\n"""')
         (step_dir / "planner.toml").write_text("\n".join(lines) + "\n")
 
     @staticmethod
@@ -715,6 +960,7 @@ class Prover:
         (step_dir / "step_meta.toml").write_text("\n".join(lines) + "\n")
 
     def _write_discussion(self):
+        logger.info("Writing discussion")
         repo_index = self.repo.list_summaries()
         prompt = prompts.format_discussion_prompt(
             theorem=self.theorem_text,
@@ -728,7 +974,9 @@ class Prover:
         try:
             resp = self.llm.call(
                 prompt=prompt,
-                system_prompt=prompts.planner_system_prompt(isolation=self.isolation),
+                system_prompt=prompts.planner_system_prompt(
+                    isolation=self.isolation, lean_mode=self.mode,
+                ),
                 label="discussion",
                 stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
                 archive_path=self.work_dir / "discussion_call.json",
@@ -749,8 +997,16 @@ class Prover:
     @property
     def is_finished(self) -> bool:
         """Check if this run is already finished (has discussion or proof)."""
-        return ((self.work_dir / "DISCUSSION.md").exists()
-                or (self.work_dir / "PROOF.md").exists())
+        has_discussion = (self.work_dir / "DISCUSSION.md").exists()
+        has_proof_md = (self.work_dir / "PROOF.md").exists()
+        has_proof_lean = (self.work_dir / "PROOF.lean").exists()
+
+        if self.mode == "formalize_only":
+            return has_proof_lean or has_discussion
+        elif self.mode == "prove_and_formalize":
+            return (has_proof_md and has_proof_lean) or has_discussion
+        else:
+            return has_proof_md or has_discussion
 
     def inspect(self):
         """Enter inspect mode — browse historical run data without running steps."""

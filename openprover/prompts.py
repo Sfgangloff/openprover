@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 ACTIONS = [
     "proof_found", "give_up", "read_items", "write_items",
     "spawn", "literature_search",
+    "submit_lean_proof", "read_theorem",
 ]
 ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
@@ -24,19 +25,37 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
 _TQ = '"""'  # triple-quote for embedding in prompts
 
-def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True) -> str:
+def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True,
+                          lean_mode: str = "prove", num_sorries: int = 0) -> str:
     """Build the planner system prompt, conditionally omitting actions."""
+    has_lean = lean_mode in ("prove_and_formalize", "formalize_only")
+
     actions = (
         "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning - they only see the context you provide to them.\n"
         "- **read_items**: Request full content of repo items (you only see one-line summaries by default).\n"
         "- **write_items**: Create, update, or delete one or more repo items.\n"
-        "- **proof_found**: Declare success. **This terminates the session.** You must be confident the proof is correct - it must have been independently verified by a worker.\n"
+        "- **read_theorem**: Re-read the original theorem statement(s) and any provided proof.\n"
     )
+    if lean_mode == "formalize_only":
+        actions += (
+            "- **proof_found**: NOT AVAILABLE in formalize-only mode. Use submit_lean_proof instead.\n"
+        )
+    else:
+        actions += (
+            "- **proof_found**: Declare success with an informal proof. **This terminates the session** (unless a formal Lean proof is also required). "
+            "You must be confident the proof is correct - it must have been independently verified by a worker.\n"
+        )
     if allow_give_up:
         actions += "- **give_up**: Declare failure.\n"
     if not isolation:
         actions += (
             "- **literature_search**: Search the web for relevant mathematical literature. Spawns one web-enabled worker.\n"
+        )
+    if has_lean:
+        actions += (
+            f"- **submit_lean_proof**: Submit a formal Lean 4 proof. Provide {num_sorries} replacement block(s) "
+            f"(one per `sorry` in THEOREM.lean), plus optional context. No `import` statements allowed in injected code. "
+            f"The completed file is automatically verified via `lake env lean`. **If verification succeeds, PROOF.lean is written.**\n"
         )
 
     principles = (
@@ -52,9 +71,24 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
     )
     if not isolation:
         principles += "- Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
+    if lean_mode == "prove_and_formalize":
+        principles += (
+            "- A formal Lean 4 proof (PROOF.lean) is also required. The session ends only when BOTH proof_found AND submit_lean_proof succeed.\n"
+            "- Use write_items with format=\"lean\" to test Lean snippets (they get auto-verified by `lake env lean`).\n"
+            "- Use submit_lean_proof for the final formal proof submission.\n"
+        )
+    elif lean_mode == "formalize_only":
+        principles += (
+            "- An informal proof (PROOF.md) is already provided. Your only goal is to produce PROOF.lean.\n"
+            "- Use read_theorem to view the informal proof and Lean theorem statement.\n"
+            "- Use write_items with format=\"lean\" to iteratively develop and test Lean code snippets.\n"
+            "- Use submit_lean_proof to submit the final formalized proof. The session ends when it succeeds.\n"
+        )
 
-    toml_fields = (
-        f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
+    toml_fields = ""
+    if lean_mode != "formalize_only":
+        toml_fields += f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
+    toml_fields += (
         f'**read_items**: `read = ["slug-1", "slug-2"]`\n'
         "**write_items**: one or more `[[items]]` sections:\n"
         "```toml\n"
@@ -74,6 +108,35 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
     )
     if not isolation:
         toml_fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
+    if has_lean:
+        toml_fields += (
+            f"\n**write_items** (lean format — auto-verified): add `format = \"lean\"` to the item:\n"
+            "```toml\n"
+            "[[items]]\n"
+            'slug = "helper-lemma"\n'
+            'format = "lean"\n'
+            f"content = {_TQ}\n"
+            "-- Lean 4 code here\n"
+            f"{_TQ}\n"
+            "```\n"
+            f"\n**submit_lean_proof**: provide {num_sorries} `[[lean_blocks]]` section(s) + optional `lean_context`:\n"
+            "```toml\n"
+            f"lean_context = {_TQ}\n"
+            "optional helper definitions (placed after imports, no import statements allowed)\n"
+            f"{_TQ}\n"
+            "\n"
+        )
+        for i in range(min(num_sorries, 3)):
+            toml_fields += (
+                f"[[lean_blocks]]\n"
+                f"code = {_TQ}\n"
+                f"replacement for sorry #{i}\n"
+                f"{_TQ}\n"
+                "\n"
+            )
+        if num_sorries > 3:
+            toml_fields += f"# ... up to {num_sorries} [[lean_blocks]] total\n\n"
+        toml_fields += "```\n"
 
 
     return (
@@ -160,7 +223,7 @@ SEARCH_SYSTEM_PROMPT = (
 def format_planner_prompt(
     whiteboard: str,
     repo_index: str,
-    prev_output: str,
+    prev_outputs: list[str],
     step_num: int,
     max_steps: int,
     parallelism: int = 1,
@@ -168,8 +231,11 @@ def format_planner_prompt(
     parts = [f"# Whiteboard\n\n{whiteboard}"]
     if repo_index:
         parts.append(f"\n\n# Repository\n\n{repo_index}")
-    if prev_output:
-        parts.append(f"\n\n# Output from Previous Step\n\n{prev_output}")
+    if prev_outputs:
+        n = len(prev_outputs)
+        for i, output in enumerate(prev_outputs):
+            label = f"Step -{n - i}" if n > 1 else "Previous Step"
+            parts.append(f"\n\n# Output from {label}\n\n{output}")
     parts.append(f"\n\nMax {parallelism} worker(s) per spawn. What's the most productive next move?")
     return "".join(parts)
 
@@ -193,9 +259,22 @@ def format_search_prompt(query: str, context: str) -> str:
     return "\n".join(parts)
 
 
-def format_initial_whiteboard(theorem: str) -> str:
+def format_initial_whiteboard(theorem: str, mode: str = "prove") -> str:
+    goal = theorem.strip()
+    if mode == "prove_and_formalize":
+        goal += (
+            "\n\n**Mode: Prove and Formalize**\n"
+            "Produce both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean).\n"
+            "Formal statement available — use read_theorem to view THEOREM.lean."
+        )
+    elif mode == "formalize_only":
+        goal += (
+            "\n\n**Mode: Formalize Only**\n"
+            "An informal proof is provided. Formalize it in Lean 4 (produce PROOF.lean).\n"
+            "Use read_theorem to view PROOF.md and THEOREM.lean."
+        )
     return (
-        f"## Goal\n\n{theorem.strip()}\n\n"
+        f"## Goal\n\n{goal}\n\n"
         "## Strategy\n\nTBD — analyze first.\n\n"
         "## Status\n\nStarting.\n\n"
         "## Tried\n\n(none)\n"
@@ -241,13 +320,48 @@ def parse_planner_toml(text: str) -> dict | None:
     toml_text = match.group(1)
 
     if tomllib is None:
-        # Minimal fallback parser for when tomllib/tomli unavailable
-        return _parse_toml_minimal(toml_text)
+        parsed = _parse_toml_minimal(toml_text)
+    else:
+        try:
+            parsed = tomllib.loads(toml_text)
+        except Exception:
+            parsed = _parse_toml_minimal(toml_text)
 
-    try:
-        return tomllib.loads(toml_text)
-    except Exception:
-        return _parse_toml_minimal(toml_text)
+    if parsed is not None:
+        _collect_lean_blocks(parsed)
+
+    return parsed
+
+
+def _collect_lean_blocks(parsed: dict):
+    """Normalize lean_block_N numbered keys into a lean_blocks list.
+
+    Supports two styles from the LLM:
+    1. ``[[lean_blocks]]`` array-of-tables with ``code`` field (preferred)
+    2. ``lean_block_0``, ``lean_block_1``, ... numbered top-level keys
+
+    Also rescues ``lean_context`` if it ended up inside a lean_blocks entry
+    (TOML puts keys after [[lean_blocks]] into that table).
+    """
+    # Style 1: already collected by parser as list of dicts with "code"
+    if "lean_blocks" in parsed and isinstance(parsed["lean_blocks"], list):
+        blocks = parsed["lean_blocks"]
+        if blocks and isinstance(blocks[0], dict):
+            # Rescue lean_context from last entry if present
+            for b in blocks:
+                if "lean_context" in b and "lean_context" not in parsed:
+                    parsed["lean_context"] = b.pop("lean_context")
+            parsed["lean_blocks"] = [b.get("code", "") for b in blocks]
+        return
+
+    # Style 2: numbered keys
+    lean_blocks = []
+    i = 0
+    while f"lean_block_{i}" in parsed:
+        lean_blocks.append(parsed.pop(f"lean_block_{i}"))
+        i += 1
+    if lean_blocks:
+        parsed["lean_blocks"] = lean_blocks
 
 
 def _parse_toml_minimal(text: str) -> dict | None:
@@ -257,8 +371,8 @@ def _parse_toml_minimal(text: str) -> dict | None:
     key = [...] arrays, [[tasks]] and [[items]] array-of-tables.
     """
     result: dict = {}
-    # Array-of-tables: [[tasks]] and [[items]]
-    array_tables: dict[str, list[dict]] = {"tasks": [], "items": []}
+    # Array-of-tables: [[tasks]], [[items]], [[lean_blocks]]
+    array_tables: dict[str, list[dict]] = {"tasks": [], "items": [], "lean_blocks": []}
     current_table: dict | None = None
 
     lines = text.split('\n')
@@ -271,8 +385,8 @@ def _parse_toml_minimal(text: str) -> dict | None:
             i += 1
             continue
 
-        # [[tasks]] or [[items]] — start a new table entry
-        if line in ('[[tasks]]', '[[items]]'):
+        # [[tasks]], [[items]], or [[lean_blocks]] — start a new table entry
+        if line in ('[[tasks]]', '[[items]]', '[[lean_blocks]]'):
             table_name = line[2:-2]
             current_table = {}
             array_tables[table_name].append(current_table)

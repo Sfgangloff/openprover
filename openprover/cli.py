@@ -2,6 +2,7 @@
 
 import argparse
 import signal
+from pathlib import Path
 
 from openprover import __version__
 from .llm import LLMClient, HFClient
@@ -20,16 +21,39 @@ def main():
     parser.add_argument("--max-steps", type=int, default=50, help="Maximum number of proving steps (default: 50)")
     parser.add_argument("--autonomous", action="store_true", help="Start in autonomous mode (default: interactive)")
     parser.add_argument("--run-dir", help="Working directory (resumes if it contains an existing run)")
-    parser.add_argument("--isolation", action="store_true", help="Disable web searches (no literature_search action)")
+    parser.add_argument("--isolation", action=argparse.BooleanOptionalAction, default=True, help="Disable web searches (no literature_search action)")
     parser.add_argument("-P", "--parallelism", type=int, default=1, help="Max parallel workers per spawn step (default: 1)")
     parser.add_argument("--give-up-after", type=float, default=0.5, metavar="RATIO", help="Fraction of steps before give_up action is allowed (default: 0.5)")
     parser.add_argument("--answer-reserve", type=int, default=4096, metavar="TOKENS", help="Tokens reserved for answer after thinking (qed-nano, default: 4096)")
     parser.add_argument("--verbose", action="store_true", help="Show full LLM responses")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    # Lean verification
+    parser.add_argument("--lean-project-dir", type=Path, metavar="DIR",
+                        help="Path to Lean project with lakefile (enables formal verification)")
+    parser.add_argument("--lean-theorem", type=Path, metavar="FILE",
+                        help="Path to THEOREM.lean file (requires --lean-project-dir)")
+    parser.add_argument("--proof", type=Path, metavar="FILE",
+                        help="Path to existing PROOF.md (formalize-only mode, requires --lean-theorem)")
+    parser.add_argument("--repl-dir", type=Path, metavar="DIR",
+                        help="Path to lean-repl directory (reserved for future use)")
+
     args = parser.parse_args()
 
     if not args.theorem and not args.run_dir:
         parser.error("theorem is required (or use --run-dir to resume an existing run)")
+
+    # Lean validation
+    if args.lean_theorem and not args.lean_project_dir:
+        parser.error("--lean-theorem requires --lean-project-dir")
+    if args.proof and not args.lean_theorem:
+        parser.error("--proof requires --lean-theorem (formalize-only mode needs a Lean theorem)")
+    if args.lean_project_dir and not args.lean_project_dir.is_dir():
+        parser.error(f"--lean-project-dir not found: {args.lean_project_dir}")
+    if args.lean_theorem and not args.lean_theorem.is_file():
+        parser.error(f"--lean-theorem not found: {args.lean_theorem}")
+    if args.proof and not args.proof.is_file():
+        parser.error(f"--proof not found: {args.proof}")
 
     # QED-Nano has no web search capability — force isolation
     if args.model == "qed-nano" and not args.isolation:
@@ -56,6 +80,9 @@ def main():
         run_dir=args.run_dir,
         parallelism=args.parallelism,
         give_up_ratio=args.give_up_after,
+        lean_project_dir=args.lean_project_dir,
+        lean_theorem_path=args.lean_theorem,
+        proof_path=args.proof,
     )
 
     # Check if this is a finished run → inspect mode
@@ -82,5 +109,7 @@ def main():
         # Print summary to regular stdout after TUI is gone
         print(f"  {calls} calls · ${cost:.4f}")
         if (prover.work_dir / "PROOF.md").exists():
-            print(f"  PROOF.md → {prover.work_dir / 'PROOF.md'}")
+            print(f"  PROOF.md  → {prover.work_dir / 'PROOF.md'}")
+        if (prover.work_dir / "PROOF.lean").exists():
+            print(f"  PROOF.lean → {prover.work_dir / 'PROOF.lean'}")
         print(f"  {prover.work_dir}")

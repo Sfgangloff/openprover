@@ -8,9 +8,10 @@ You give it a theorem statement (a `.md` file). A planner LLM maintains a **whit
 
 Workers run in parallel (up to `-P` at a time), each focused on a single task. They can reference repository items via `[[wikilinks]]`. Results flow back to the planner, which updates the whiteboard and decides the next step.
 
-Two modes:
+Modes:
 - **Interactive** (default): see each step's plan, accept or give feedback
 - **Autonomous** (`--autonomous`): runs hands-off until proof found or step budget exhausted
+- **Formal verification** (`--lean-theorem`): when a Lean 4 theorem statement is provided, proof attempts are automatically verified via `lake env lean`. The planner gets direct feedback from the Lean compiler to iterate on the proof.
 
 ## Requirements
 
@@ -43,6 +44,17 @@ openprover examples/cauchy_schwarz.md --isolation
 
 # Use a HuggingFace-compatible model
 openprover examples/infinite_primes.md --model qed-nano --hf-url http://localhost:8000
+
+# Prove and formalize in Lean 4
+openprover examples/putnam_1962_a2.md \
+  --lean-project-dir ~/mathlib4 \
+  --lean-theorem examples/putnam_1962_a2.lean
+
+# Formalize an existing proof (translate PROOF.md → PROOF.lean)
+openprover examples/putnam_1962_a2.md \
+  --lean-project-dir ~/mathlib4 \
+  --lean-theorem examples/putnam_1962_a2.lean \
+  --proof runs/putnam-1962-a2-20260223/PROOF.md
 ```
 
 ### Options
@@ -56,6 +68,9 @@ openprover examples/infinite_primes.md --model qed-nano --hf-url http://localhos
 | `--run-dir` | | Resume from an existing run directory |
 | `--isolation` | off | Disable literature search / web access |
 | `-P, --parallelism` | `1` | Max parallel workers per step |
+| `--lean-project-dir` | | Path to Lean project with lakefile |
+| `--lean-theorem` | | Path to THEOREM.lean (requires `--lean-project-dir`) |
+| `--proof` | | Path to existing PROOF.md (formalize-only mode) |
 | `--verbose` | off | Show full LLM responses |
 
 ### TUI controls
@@ -83,7 +98,9 @@ Each step, the planner chooses one action:
 | `spawn` | Delegate tasks to parallel workers |
 | `literature_search` | Web-enabled search for relevant papers/results |
 | `read_items` | Retrieve full content of repository items |
-| `write_items` | Create, update, or delete repository items |
+| `write_items` | Create, update, or delete repository items (lean items auto-verified) |
+| `read_theorem` | Re-read theorem statement(s) and any provided proof |
+| `submit_lean_proof` | Submit formal Lean proof for automatic verification |
 | `proof_found` | Declare the proof complete (terminates session) |
 | `give_up` | Abandon search (only allowed after 80% of steps used) |
 
@@ -94,8 +111,10 @@ Each run creates a directory under `runs/`:
 ```
 runs/<slug>-<timestamp>/
   THEOREM.md           - original theorem statement
+  THEOREM.lean         - formal Lean statement (if provided)
   WHITEBOARD.md        - current whiteboard state
   PROOF.md             - final proof (if found)
+  PROOF.lean           - formal Lean proof (if lean mode)
   DISCUSSION.md        - post-session analysis
   repo/                - repository items (lemmas, observations, etc.)
   steps/step_NNN/      - per-step planner decisions and worker results

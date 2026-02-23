@@ -1,6 +1,7 @@
 """LLM client wrappers — Claude CLI and OpenAI-compatible HTTP."""
 
 import json
+import logging
 import re
 import subprocess
 import threading
@@ -8,6 +9,8 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+logger = logging.getLogger("openprover.llm")
 
 
 class Interrupted(Exception):
@@ -50,7 +53,6 @@ class LLMClient:
     def __init__(self, model: str, archive_dir: Path):
         self.model = model
         self.archive_dir = archive_dir
-        self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.call_count = 0
         self.total_cost = 0.0
         self._interrupted = threading.Event()
@@ -93,6 +95,8 @@ class LLMClient:
         call_num = self.call_count
 
         use_streaming = bool(stream_callback)
+        logger.info("[%s] calling %s%s", label, self.model,
+                    " (streaming)" if use_streaming else "")
 
         cmd = [
             "claude", "-p",
@@ -155,14 +159,17 @@ class LLMClient:
         else:
             result_text = raw.get("result", "")
 
+        duration = raw.get("duration_ms", elapsed_ms)
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      raw, None, elapsed_ms, archive_path)
+                      raw, None, elapsed_ms, archive_path,
+                      result_text=result_text)
+        logger.info("[%s] done %dms $%.4f", label, duration, cost)
 
         return {
             "result": result_text,
             "thinking": "",
             "cost": cost,
-            "duration_ms": raw.get("duration_ms", elapsed_ms),
+            "duration_ms": duration,
             "raw": raw,
         }
 
@@ -239,19 +246,24 @@ class LLMClient:
         else:
             result_text = result_data.get("result", "")
 
+        thinking_text = "".join(thinking_parts)
+        duration = result_data.get("duration_ms", elapsed_ms)
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      result_data, None, elapsed_ms, archive_path)
+                      result_data, None, elapsed_ms, archive_path,
+                      thinking=thinking_text, result_text=result_text)
+        logger.info("[%s] done %dms $%.4f", label, duration, cost)
 
         return {
             "result": result_text,
-            "thinking": "".join(thinking_parts),
+            "thinking": thinking_text,
             "cost": cost,
-            "duration_ms": result_data.get("duration_ms", elapsed_ms),
+            "duration_ms": duration,
             "raw": result_data,
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,
-                 response, error, elapsed_ms, archive_path=None):
+                 response, error, elapsed_ms, archive_path=None,
+                 *, thinking="", result_text=""):
         record = {
             "call_num": call_num,
             "label": label,
@@ -259,6 +271,8 @@ class LLMClient:
             "system_prompt": system_prompt,
             "prompt": prompt,
             "json_schema": json_schema,
+            "result_text": result_text,
+            "thinking": thinking,
             "response": response,
             "error": error,
             "elapsed_ms": elapsed_ms,
@@ -267,6 +281,7 @@ class LLMClient:
             path = archive_path
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
+            self.archive_dir.mkdir(parents=True, exist_ok=True)
             path = self.archive_dir / f"call_{call_num:03d}.json"
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
 
@@ -289,7 +304,6 @@ class HFClient:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.archive_dir = archive_dir
-        self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.call_count = 0
         self.total_cost = 0.0
         self._interrupted = threading.Event()
@@ -337,6 +351,8 @@ class HFClient:
         """
         self.call_count += 1
         call_num = self.call_count
+        logger.info("[%s] calling %s%s", label, self.model,
+                    " (streaming)" if stream_callback else "")
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -426,7 +442,9 @@ class HFClient:
         result_text, thinking_text = _split_think_tags(full_text)
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      raw, None, elapsed_ms, archive_path)
+                      raw, None, elapsed_ms, archive_path,
+                      thinking=thinking_text, result_text=result_text)
+        logger.info("[%s] done %dms", label, elapsed_ms)
 
         return {
             "result": result_text,
@@ -534,7 +552,9 @@ class HFClient:
             thinking_text = ""
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
-                      {"result": result_text}, None, elapsed_ms, archive_path)
+                      {"result": result_text}, None, elapsed_ms, archive_path,
+                      thinking=thinking_text, result_text=result_text)
+        logger.info("[%s] done %dms", label, elapsed_ms)
 
         return {
             "result": result_text,
@@ -545,7 +565,8 @@ class HFClient:
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,
-                 response, error, elapsed_ms, archive_path=None):
+                 response, error, elapsed_ms, archive_path=None,
+                 *, thinking="", result_text=""):
         record = {
             "call_num": call_num,
             "label": label,
@@ -553,6 +574,8 @@ class HFClient:
             "system_prompt": system_prompt,
             "prompt": prompt,
             "json_schema": json_schema,
+            "result_text": result_text,
+            "thinking": thinking,
             "response": response,
             "error": error,
             "elapsed_ms": elapsed_ms,
@@ -561,5 +584,6 @@ class HFClient:
             path = archive_path
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
+            self.archive_dir.mkdir(parents=True, exist_ok=True)
             path = self.archive_dir / f"call_{call_num:03d}.json"
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))

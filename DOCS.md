@@ -9,6 +9,7 @@ cli.py          Parse args, setup TUI, run prover, print cost
 prover.py       Planner loop, step dispatch, action handlers, Repo
 llm.py          LLMClient (Claude CLI), HFClient (HuggingFace HTTP)
 prompts.py      All prompt templates, TOML parser, actions enum
+lean.py         Lean 4 integration: parsing, assembly, verification
 tui.py          Full-screen terminal UI with tabs, streaming, key handling
 ```
 
@@ -17,7 +18,7 @@ tui.py          Full-screen terminal UI with tabs, streaming, key handling
 **Planner** (runs every step):
 - Maintains a **whiteboard**: terse mathematical scratchpad (LaTeX, abbreviations)
 - Manages a **repository** of items: lemmas, observations, failed attempts, literature findings
-- Receives: whiteboard + repo index (one-line summaries) + previous workers' output
+- Receives: whiteboard + repo index (one-line summaries) + last 3 outputs (rolling window)
 - Outputs: TOML decision with action, summary, updated whiteboard, and action-specific fields
 
 **Workers** (spawned on demand, parallel):
@@ -59,11 +60,13 @@ The `Prover` class owns the proving loop and all state.
 
 | Handler | What it does |
 |---------|-------------|
-| `_handle_spawn` | Run worker tasks in parallel via `ThreadPoolExecutor` (up to `--parallelism`). Each worker gets its task description with wikilinks resolved. Results aggregated as `prev_output` for next step. |
+| `_handle_spawn` | Run worker tasks in parallel via `ThreadPoolExecutor` (up to `--parallelism`). Each worker gets its task description with wikilinks resolved. Results pushed to output window. |
 | `_handle_literature_search` | Spawn a web-enabled worker (Claude CLI with `WebSearch` + `WebFetch` tools). Results fed back to planner. |
-| `_handle_read_items` | Fetch full content of requested repo items, set as `prev_output`. |
-| `_handle_write_items` | Create/update/delete repo items. Content of `null` deletes. |
-| `_handle_proof_found` | Save proof to `PROOF.md`, terminate session. |
+| `_handle_read_items` | Fetch full content of requested repo items, push to output. |
+| `_handle_write_items` | Create/update/delete repo items. Items with `format="lean"` are auto-verified via `lake env lean`. |
+| `_handle_read_theorem` | Return THEOREM.md + THEOREM.lean + PROOF.md content to the planner. |
+| `_handle_submit_lean_proof` | Assemble proof (replace sorries in THEOREM.lean), verify via `lake env lean`. On success write PROOF.lean. |
+| `_handle_proof_found` | Save proof to `PROOF.md`. In prove_and_formalize mode, continues if PROOF.lean missing. |
 | `_handle_give_up` | Terminate. Only allowed after 80% of step budget used. |
 
 **`Repo` class** (also in `prover.py`):
@@ -72,9 +75,19 @@ The `Prover` class owns the proving loop and all state.
 - `write_item(slug, content)`: Create, update, or delete
 - `resolve_wikilinks(text)`: Find `[[slug]]` references, return resolved text + appended reference materials
 
+**Output window:** The planner sees the last 3 outputs in a rolling window (via `_push_output()`). Outputs persist across steps until pushed out by newer ones. This gives the planner more context about recent progress.
+
+**Operating modes** (determined by CLI args):
+
+| Mode | Inputs | Goal | Terminates when |
+|------|--------|------|-----------------|
+| `prove` | THEOREM.md | Informal proof | `proof_found` → PROOF.md |
+| `prove_and_formalize` | THEOREM.md + THEOREM.lean | Both proofs | PROOF.md + PROOF.lean both exist |
+| `formalize_only` | THEOREM.md + THEOREM.lean + PROOF.md | Formal proof | `submit_lean_proof` succeeds → PROOF.lean |
+
 **Other methods:**
 - `_write_discussion()`: Post-session analysis via LLM call
-- `is_finished`: Check if run completed (`PROOF.md` or `DISCUSSION.md` exists)
+- `is_finished`: Check if run completed (mode-aware: checks for required artifacts)
 - `inspect()`: Browse a historical run in read-only mode
 - `_load_history()`: Restore step history from disk for inspect mode
 
@@ -118,27 +131,40 @@ All prompt templates, the TOML parser, and the actions enum.
 
 **Actions:**
 ```python
-ACTIONS = ["proof_found", "give_up", "read_items", "write_items", "spawn", "literature_search"]
-ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
+ACTIONS = ["proof_found", "give_up", "read_items", "write_items", "spawn",
+           "literature_search", "submit_lean_proof", "read_theorem"]
 ```
 
 **System prompts:**
-- `PLANNER_SYSTEM_PROMPT`: Instructs the planner to coordinate proof search, maintain whiteboard, manage repo, delegate to workers. Includes 10 principles (keep simple, write clear tasks, catch doomed avenues early, etc.). Key rules: `proof_found` terminates the session (must have verified proof), `give_up` only after 80% of steps.
+- `planner_system_prompt(...)`: Built dynamically. Instructs the planner to coordinate proof search, maintain whiteboard, manage repo, delegate to workers. Accepts `lean_mode` and `num_sorries` to conditionally include Lean-specific actions and principles. Key rules: `proof_found` terminates the session (must have verified proof), `give_up` only after 80% of steps.
 - `WORKER_SYSTEM_PROMPT`: Instructs worker to complete its task rigorously. If verifying, be skeptical and end with `VERDICT: CORRECT` or `VERDICT: INCORRECT`.
 - `SEARCH_SYSTEM_PROMPT`: Instructs literature search worker.
 
 **Prompt formatters:**
-- `format_planner_prompt(whiteboard, repo_index, prev_output, ...)`: Planner input
+- `format_planner_prompt(whiteboard, repo_index, prev_outputs, ...)`: Planner input (prev_outputs is a list of up to 3)
 - `format_worker_prompt(task_description, resolved_refs)`: Worker input
 - `format_search_prompt(query, context)`: Literature search prompt
-- `format_initial_whiteboard(theorem)`: Template with Goal / Strategy / Status / Tried sections
+- `format_initial_whiteboard(theorem, mode)`: Template with Goal / Strategy / Status / Tried. Includes mode banner for lean modes.
 - `format_discussion_prompt(...)`: Post-session analysis
 
 **TOML parser** (`parse_planner_toml`):
 - Extracts TOML from `` ```toml...``` `` fenced block (or bare TOML at end of response)
 - Uses `tomllib` (Python 3.11+) or `tomli` (3.10 fallback)
 - Falls back to a minimal regex-based parser if neither available
-- Handles `[[tasks]]` and `[[items]]` array-of-tables syntax
+- Handles `[[tasks]]`, `[[items]]`, and `[[lean_blocks]]` array-of-tables syntax
+- Post-processes `lean_block_N` numbered keys into a `lean_blocks` list (both styles accepted from LLMs)
+
+### `lean.py`
+
+Lean 4 integration — all formal verification logic isolated here.
+
+**`LeanTheorem`**: Parses a THEOREM.lean file.
+- Extracts preamble (import/open lines at top), locates all `sorry` positions via `\bsorry\b` regex
+- `assemble_proof(replacements, context)`: replaces each sorry with its corresponding block (in reverse order to preserve offsets), injects optional context after preamble. Validates: correct count, no `import` in injected code.
+
+**`run_lean_check(lean_file, project_dir, timeout=300)`**: Runs `lake env lean <file>` from the project directory. Returns `(True, "")` if returncode 0 and empty stdout; otherwise `(False, feedback)` with combined stdout/stderr.
+
+**`LeanWorkDir`**: Manages an `OpenProver-{random_8hex}` subdirectory within the Lean project. Generated lean files go here with `{slug}-{random_6hex}.lean` naming. The final verified proof is written as `PROOF.lean`.
 
 ### `tui.py`
 
@@ -167,8 +193,10 @@ Full-screen terminal UI using ANSI escape codes and scroll regions.
 ```
 runs/<slug>-<timestamp>/
   THEOREM.md                   - immutable copy of input
+  THEOREM.lean                 - formal Lean statement (if --lean-theorem)
   WHITEBOARD.md                - latest whiteboard state (enables resume)
   PROOF.md                     - written only if proof found
+  PROOF.lean                   - formal Lean proof (if lean mode)
   DISCUSSION.md                - post-session analysis
   repo/
     *.md                       - repository items (lemmas, observations, etc.)
@@ -191,9 +219,15 @@ runs/<slug>-<timestamp>/
 
 ## Verification
 
-Workers can be tasked with verification by the planner. A verifier worker sees only the proof text (not the reasoning that produced it) and must end its response with `VERDICT: CORRECT` or `VERDICT: INCORRECT`.
+**Informal verification** (all modes): Workers can be tasked with verification by the planner. A verifier worker sees only the proof text (not the reasoning that produced it) and must end its response with `VERDICT: CORRECT` or `VERDICT: INCORRECT`. The planner is instructed to verify proofs before calling `proof_found`.
 
-The planner is instructed to verify proofs before calling `proof_found`. If verification fails, it can spawn repair workers or try a different approach.
+**Formal verification** (lean modes): When `--lean-theorem` is provided, the system supports automatic Lean 4 verification:
+
+- **`write_items` with `format="lean"`**: Lean items are written to the `OpenProver-{id}/` subdirectory within the Lean project and verified via `lake env lean`. The planner receives pass/fail feedback with compiler errors.
+- **`submit_lean_proof`**: The planner provides N replacement blocks (one per `sorry` in THEOREM.lean) plus optional context. The system assembles the complete file, verifies it, and writes PROOF.lean on success. On failure, compiler errors are fed back.
+- **`read_theorem`**: Returns THEOREM.md, THEOREM.lean, and PROOF.md (if provided) content so the planner can reference the formal statement.
+
+Generated Lean files are placed in `<lean-project-dir>/OpenProver-<random_id>/` with `{slug}-{random_suffix}.lean` names to avoid collisions. No `import` statements are allowed in injected code (enforced at assembly time).
 
 ## Wikilinks
 
@@ -202,6 +236,6 @@ Task descriptions can reference repository items via `[[slug]]` syntax. Before a
 ## Adding a new action
 
 1. Add the action name to `ACTIONS` in `prompts.py`
-2. Describe it in `PLANNER_SYSTEM_PROMPT` (format and when to use it)
+2. Describe it in `planner_system_prompt()` (format and when to use it)
 3. Handle it in `Prover._do_step()` (add a `_handle_<action>` method)
-4. Optionally add a color in `ACTION_STYLE` in `tui.py`
+4. Add a color in `ACTION_STYLE` in `tui.py`

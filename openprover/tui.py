@@ -32,7 +32,9 @@ ACTION_STYLE = {
     "literature_search": MAGENTA,
     "read_items": CYAN,
     "write_items": CYAN,
+    "read_theorem": CYAN,
     "proof_found": GREEN,
+    "submit_lean_proof": GREEN,
     "give_up": RED,
 }
 
@@ -142,7 +144,7 @@ class TUI:
         self._write_lock = threading.Lock()
         self._key_process_lock = threading.Lock()
         # Tabs
-        self.tabs: list[_Tab] = [_Tab("planner", "Planner")]
+        self.tabs: list[_Tab] = [_Tab("planner", "Planner"), _Tab("logs", "Logs")]
         self.active_tab_idx = 0
         # Saved worker tabs (when navigating history)
         self._saved_worker_tabs: list[_Tab] | None = None
@@ -328,7 +330,11 @@ class TUI:
 
     def add_worker_tab(self, tab_id: str, label: str, task_description: str = ""):
         tab = _Tab(tab_id, label, task_description)
-        self.tabs.append(tab)
+        # Insert before logs tab (always last)
+        if self.tabs and self.tabs[-1].id == "logs":
+            self.tabs.insert(len(self.tabs) - 1, tab)
+        else:
+            self.tabs.append(tab)
         self._redraw_header()
 
     def mark_worker_done(self, tab_id: str):
@@ -341,7 +347,7 @@ class TUI:
 
     def snapshot_worker_tabs(self, step_num: int):
         """Store current worker tabs in the corresponding step entry."""
-        worker_tabs = self.tabs[1:]
+        worker_tabs = [t for t in self.tabs[1:] if t.id != "logs"]
         for entry in self.step_entries:
             if entry["step_num"] == step_num:
                 entry["worker_tabs"] = worker_tabs
@@ -378,8 +384,9 @@ class TUI:
             self._redraw()
 
     def clear_worker_tabs(self):
-        """Remove all worker tabs, keeping only planner."""
-        self.tabs = [self.tabs[0]]
+        """Remove all worker tabs, keeping planner and logs."""
+        logs = [t for t in self.tabs if t.id == "logs"]
+        self.tabs = [self.tabs[0]] + logs
         self.active_tab_idx = 0
         self._redraw_header()
 
@@ -417,6 +424,12 @@ class TUI:
         """Log a line to a specific tab."""
         tab = self._find_tab(tab_id)
         self._tab_log(tab, self._style(text, color, dim=dim))
+
+    def log_trace(self, text: str):
+        """Log a trace message to the logs tab (dim style)."""
+        tab = self._find_tab("logs")
+        if tab.id == "logs":
+            self._tab_log(tab, f'{DIM}{text}{RESET}')
 
     def show_proposal(self, plan: dict):
         planner = self.tabs[0]
@@ -1078,8 +1091,8 @@ class TUI:
     def _nav_up(self):
         if self._nav_step == -1:
             if self.step_entries:
-                # Save current worker tabs before entering history
-                self._saved_worker_tabs = self.tabs[1:]
+                # Save current worker tabs before entering history (exclude logs)
+                self._saved_worker_tabs = [t for t in self.tabs[1:] if t.id != "logs"]
                 self._nav_step = len(self.step_entries) - 1
                 self._load_historical_workers()
         elif self._nav_step > 0:
@@ -1101,14 +1114,16 @@ class TUI:
             return
         entry = self.step_entries[self._nav_step]
         historical = entry.get("worker_tabs", [])
-        self.tabs = [self.tabs[0]] + list(historical)
+        logs = [t for t in self.tabs if t.id == "logs"]
+        self.tabs = [self.tabs[0]] + list(historical) + logs
         if self.active_tab_idx >= len(self.tabs):
             self.active_tab_idx = 0
 
     def _restore_worker_tabs(self):
         """Restore current worker tabs after leaving history."""
         if self._saved_worker_tabs is not None:
-            self.tabs = [self.tabs[0]] + self._saved_worker_tabs
+            logs = [t for t in self.tabs if t.id == "logs"]
+            self.tabs = [self.tabs[0]] + self._saved_worker_tabs + logs
             self._saved_worker_tabs = None
             if self.active_tab_idx >= len(self.tabs):
                 self.active_tab_idx = 0
