@@ -111,6 +111,8 @@ class _Tab:
 
 
 class TUI:
+    supports_streaming = True
+
     def __init__(self):
         self.rows = 0
         self.cols = 0
@@ -1304,3 +1306,113 @@ class TUI:
         if dim:
             prefix += DIM
         return f'{prefix}{text}{RESET}' if prefix else text
+
+
+class HeadlessTUI:
+    """Non-interactive TUI that prints logs to stdout and errors to stderr."""
+
+    supports_streaming = False
+
+    def __init__(self):
+        self._autonomous = True
+        self.whiteboard = ""
+        self.step_entries: list[dict] = []
+        self.pending_action: str | None = None
+        self.trace_visible = False
+
+    @property
+    def autonomous(self) -> bool:
+        return True
+
+    @autonomous.setter
+    def autonomous(self, value: bool):
+        pass
+
+    def setup(self, theorem_name: str, work_dir: str,
+              step_num: int = 0, max_steps: int = 50,
+              model_name: str = ""):
+        print(f"[openprover] {theorem_name}", flush=True)
+        print(f"[openprover] {work_dir} | {model_name}", flush=True)
+
+    def cleanup(self):
+        pass
+
+    def log(self, text: str, color: str = "", bold: bool = False,
+            dim: bool = False):
+        if color == "red":
+            print(f"[error] {text}", file=sys.stderr, flush=True)
+        else:
+            print(f"[log] {text}", flush=True)
+
+    def tab_log(self, tab_id: str, text: str, color: str = "",
+                dim: bool = False):
+        pass
+
+    def log_trace(self, text: str):
+        pass
+
+    def stream_start(self, label: str = "thinking", tab: str = "planner"):
+        pass
+
+    def stream_text(self, text: str, kind: str = "text",
+                    tab: str = "planner"):
+        pass
+
+    def stream_end(self, tab: str = "planner"):
+        pass
+
+    def step_complete(self, step_num: int, max_steps: int,
+                      action: str, summary: str, detail: str = ""):
+        print(f"[step {step_num}/{max_steps}] {action} — {summary}",
+              flush=True)
+        self.step_entries.append({
+            "action": action, "summary": summary,
+            "step_num": step_num, "detail": detail,
+        })
+
+    def update_step(self, step_num: int, max_steps: int):
+        pass
+
+    def update_step_detail(self, step_idx: int, detail: str):
+        if 0 <= step_idx < len(self.step_entries):
+            self.step_entries[step_idx]["detail"] = detail
+
+    def show_proposal(self, plan: dict):
+        pass
+
+    def get_confirmation(self) -> str:
+        return ""
+
+    def get_pending_action(self) -> str | None:
+        return None
+
+    def show_interrupt_options(self):
+        pass
+
+    def get_interrupt_response(self) -> str:
+        return ""
+
+    def add_worker_tab(self, tab_id: str, label: str,
+                       task_description: str = ""):
+        pass
+
+    def mark_worker_done(self, tab_id: str):
+        pass
+
+    def snapshot_worker_tabs(self, step_num: int):
+        pass
+
+    def set_waiting_status(self, text: str):
+        pass
+
+    def worker_output(self, tab_id: str, text: str):
+        pass
+
+    def clear_worker_tabs(self):
+        pass
+
+    def browse(self):
+        pass
+
+    def interrupt(self):
+        pass

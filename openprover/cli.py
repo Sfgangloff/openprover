@@ -7,7 +7,7 @@ from pathlib import Path
 from openprover import __version__
 from .llm import LLMClient, HFClient
 from .prover import Prover
-from .tui import TUI
+from .tui import TUI, HeadlessTUI
 
 
 def main():
@@ -25,6 +25,7 @@ def main():
     parser.add_argument("-P", "--parallelism", type=int, default=1, help="Max parallel workers per spawn step (default: 1)")
     parser.add_argument("--give-up-after", type=float, default=0.5, metavar="RATIO", help="Fraction of steps before give_up action is allowed (default: 0.5)")
     parser.add_argument("--answer-reserve", type=int, default=4096, metavar="TOKENS", help="Tokens reserved for answer after thinking (qed-nano, default: 4096)")
+    parser.add_argument("--headless", action="store_true", help="Non-interactive mode (logs to stdout, errors to stderr)")
     parser.add_argument("--verbose", action="store_true", help="Show full LLM responses")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -59,7 +60,11 @@ def main():
     if args.model == "qed-nano" and not args.isolation:
         args.isolation = True
 
-    tui = TUI()
+    if args.headless:
+        args.autonomous = True
+        tui = HeadlessTUI()
+    else:
+        tui = TUI()
 
     # Construct LLM client — Prover.setup_work_dir needs to run first to know
     # the archive dir, so we pass a factory that Prover calls after setup.
@@ -107,9 +112,13 @@ def main():
         calls = prover.llm.call_count
         tui.cleanup()
         # Print summary to regular stdout after TUI is gone
+        has_proof = ((prover.work_dir / "PROOF.md").exists()
+                     or (prover.work_dir / "PROOF.lean").exists())
         print(f"  {calls} calls · ${cost:.4f}")
         if (prover.work_dir / "PROOF.md").exists():
             print(f"  PROOF.md  → {prover.work_dir / 'PROOF.md'}")
         if (prover.work_dir / "PROOF.lean").exists():
             print(f"  PROOF.lean → {prover.work_dir / 'PROOF.lean'}")
         print(f"  {prover.work_dir}")
+        if args.headless:
+            print(f"[result] {'proved' if has_proof else 'not_proved'}")

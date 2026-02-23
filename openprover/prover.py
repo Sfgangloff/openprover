@@ -202,6 +202,11 @@ class Prover:
                 parts.append(stripped)
         self.theorem_name = " ".join(parts)
 
+    def _stream_cb(self, tab: str):
+        if not self.tui.supports_streaming:
+            return None
+        return lambda t, k="text": self.tui.stream_text(t, kind=k, tab=tab)
+
     def run(self):
         self.tui.setup(
             theorem_name=self.theorem_name,
@@ -305,7 +310,7 @@ class Prover:
                     num_sorries=self.lean_theorem.num_sorries if self.lean_theorem else 0,
                 ),
                 label=f"planner_step_{self.step_num}",
-                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
+                stream_callback=self._stream_cb("planner"),
                 archive_path=step_dir / "planner_call.json",
             )
         except Interrupted:
@@ -791,7 +796,7 @@ class Prover:
                 system_prompt=prompts.SEARCH_SYSTEM_PROMPT,
                 label=f"search_step_{self.step_num}",
                 web_search=True,
-                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab=wid),
+                stream_callback=self._stream_cb(wid),
                 archive_path=workers_dir / "search_call.json",
             )
             self.tui.stream_end(tab=wid)
@@ -845,7 +850,7 @@ class Prover:
                 prompt=prompt,
                 system_prompt=prompts.WORKER_SYSTEM_PROMPT,
                 label=worker_id,
-                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab=worker_id),
+                stream_callback=self._stream_cb(worker_id),
                 archive_path=archive_path,
             )
             self.tui.stream_end(tab=worker_id)
@@ -978,7 +983,7 @@ class Prover:
                     isolation=self.isolation, lean_mode=self.mode,
                 ),
                 label="discussion",
-                stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
+                stream_callback=self._stream_cb("planner"),
                 archive_path=self.work_dir / "discussion_call.json",
             )
             self.tui.stream_end(tab="planner")
