@@ -171,7 +171,7 @@ class Worker:
 
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=max_output_tokens,
+            max_new_tokens=max_output_tokens + (max_thinking_tokens or 0),
             do_sample=temperature > 0,
         )
         if temperature > 0:
