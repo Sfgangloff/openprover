@@ -47,7 +47,7 @@ class ThinkBudgetProcessor(LogitsProcessor):
 
         # Check if </think> was naturally generated
         n = len(self.end_ids)
-        if input_ids.shape[1] >= n:
+        if n > 0 and input_ids.shape[1] >= n:
             last_n = input_ids[0, -n:].tolist()
             if last_n == self.end_ids:
                 self.in_thinking = False
@@ -136,8 +136,9 @@ class Worker:
         self.gpu_id = gpu_id
         self.device = f"cuda:{gpu_id}"
         self.lock = threading.Lock()
+        self.state_lock = threading.Lock()
         self.tokenizer = tokenizer
-        self.busy = False  # Track if worker is processing a batch
+        self.active_requests = 0  # Track active requests for load balancing
 
         # Pre-compute </think> token IDs for thinking budget enforcement
         self.end_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
@@ -276,9 +277,10 @@ class Worker:
 
         # Decode per-sample and compute stats
         results = []
+        prompt_seq_len = inputs.input_ids.shape[1]
         for i in range(batch_size):
             input_len = input_lens[i]
-            new_tokens = output[i][input_len:]
+            new_tokens = output[i][prompt_seq_len:]
             text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             completion_tokens = len(new_tokens)
             results.append({
@@ -388,17 +390,27 @@ class BatchScheduler:
                     continue
 
                 # Find free workers
-                free_workers = [w for w in self.workers if not w.busy]
+                free_workers = []
+                for w in self.workers:
+                    with w.state_lock:
+                        if w.active_requests == 0:
+                            w.active_requests += 1
+                            free_workers.append(w)
+                
                 if not free_workers:
                     # No free workers, wait a bit before checking again
                     self.queue_lock.wait(timeout=0.05)
                     continue
+
+                dispatched_any = False
 
                 # Dispatch batches to free workers
                 for worker in free_workers:
                     # Keep queue clean while looping workers.
                     self.pending_queue = [req for req in self.pending_queue if not req.is_cancelled()]
                     if not self.pending_queue:
+                        with worker.state_lock:
+                            worker.active_requests -= 1
                         break
 
                     # Recompute groups each dispatch so we never use stale references.
@@ -428,6 +440,8 @@ class BatchScheduler:
                             batch_requests = group[:min(self.batch_size, len(group))]
 
                     if not batch_requests:
+                        with worker.state_lock:
+                            worker.active_requests -= 1
                         continue
 
                     # Remove from queue
@@ -439,7 +453,7 @@ class BatchScheduler:
                     batch_state = ActiveBatchState(batch_requests)
 
                     # Dispatch to worker in background thread
-                    worker.busy = True
+                    dispatched_any = True
                     if self.verbose:
                         print(f"[BATCH] Dispatching batch of size {len(batch_items)} to GPU {worker.gpu_id}")
                     threading.Thread(
@@ -447,6 +461,12 @@ class BatchScheduler:
                         args=(worker, batch_requests, batch_items, batch_state),
                         daemon=True
                     ).start()
+
+                if not dispatched_any and self.pending_queue:
+                    oldest_req = self.pending_queue[0]
+                    oldest_wait = time.time() - oldest_req.enqueue_time
+                    sleep_time = max(0.01, self.batch_timeout_s - oldest_wait)
+                    self.queue_lock.wait(timeout=sleep_time)
 
     def _process_batch(self, worker: Worker, requests: list[PendingRequest],
                        batch_items: list[BatchItem],
@@ -497,7 +517,8 @@ class BatchScheduler:
             if self.verbose:
                 print(f"[BATCH] ERROR: batch of size {batch_size} on GPU {gpu_id} failed: {e}")
         finally:
-            worker.busy = False
+            with worker.state_lock:
+                worker.active_requests -= 1
             # Wake scheduler to check for more work
             with self.queue_lock:
                 self.queue_lock.notify()
@@ -524,10 +545,14 @@ class LoadBalancer:
                 for offset in range(len(self.workers)):
                     idx = (self._counter + offset) % len(self.workers)
                     worker = self.workers[idx]
-                    if not worker.busy:
-                        self._counter = idx + 1
-                        return worker
+                    with worker.state_lock:
+                        if worker.active_requests == 0:
+                            worker.active_requests += 1
+                            self._counter = idx + 1
+                            return worker
             worker = self.workers[self._counter % len(self.workers)]
+            with worker.state_lock:
+                worker.active_requests += 1
             self._counter += 1
         return worker
 
@@ -727,7 +752,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_direct_request(self, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens):
         worker = lb.get_worker(prefer_free=True)
-        worker.busy = True
         try:
             with worker.lock:
                 try:
@@ -744,7 +768,11 @@ class Handler(BaseHTTPRequestHandler):
                     except BrokenPipeError:
                         pass
         finally:
-            worker.busy = False
+            with worker.state_lock:
+                worker.active_requests -= 1
+            if scheduler is not None:
+                with scheduler.queue_lock:
+                    scheduler.queue_lock.notify()
 
     def _handle_non_streaming(self, worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
         t0 = time.time()
@@ -887,6 +915,9 @@ def main():
 
     print(f"Loading {args.num_gpus} replica(s) of {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     # Load first replica with full output (shows warnings like MISSING weights)
     workers = [Worker(0, args.model, dtype, tokenizer)]
