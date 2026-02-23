@@ -2,7 +2,6 @@
 
 import argparse
 import signal
-import sys
 
 from openprover import __version__
 from .llm import LLMClient, HFClient
@@ -16,24 +15,16 @@ def main():
         description="Theorem prover powered by language models",
     )
     parser.add_argument("theorem", nargs="?", help="Path to theorem statement file (.md)")
-    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "qed-nano"],
-                        help="Model to use (default: sonnet)")
-    parser.add_argument("--hf-url", default="http://localhost:8000",
-                        help="HF server URL for qed-nano (default: http://localhost:8000)")
-    parser.add_argument("--max-steps", type=int, default=50,
-                        help="Maximum number of proving steps (default: 50)")
-    parser.add_argument("--autonomous", action="store_true",
-                        help="Start in autonomous mode (default: interactive)")
-    parser.add_argument("--run-dir",
-                        help="Working directory (resumes if it contains an existing run)")
-    parser.add_argument("--isolation", action="store_true",
-                        help="Disable web searches (no literature_search action)")
-    parser.add_argument("-P", "--parallelism", type=int, default=1,
-                        help="Max parallel workers per spawn step (default: 1)")
-    parser.add_argument("--give-up-after", type=float, default=0.5, metavar="RATIO",
-                        help="Fraction of steps before give_up action is offered (default: 0.5)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Show full LLM responses")
+    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "qed-nano"], help="Model to use (default: sonnet)")
+    parser.add_argument("--hf-url", default="http://localhost:8000", help="HF server URL for qed-nano (default: http://localhost:8000)")
+    parser.add_argument("--max-steps", type=int, default=50, help="Maximum number of proving steps (default: 50)")
+    parser.add_argument("--autonomous", action="store_true", help="Start in autonomous mode (default: interactive)")
+    parser.add_argument("--run-dir", help="Working directory (resumes if it contains an existing run)")
+    parser.add_argument("--isolation", action="store_true", help="Disable web searches (no literature_search action)")
+    parser.add_argument("-P", "--parallelism", type=int, default=1, help="Max parallel workers per spawn step (default: 1)")
+    parser.add_argument("--give-up-after", type=float, default=0.5, metavar="RATIO", help="Fraction of steps before give_up action is allowed (default: 0.5)")
+    parser.add_argument("--answer-reserve", type=int, default=4096, metavar="TOKENS", help="Tokens reserved for answer after thinking (qed-nano, default: 4096)")
+    parser.add_argument("--verbose", action="store_true", help="Show full LLM responses")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
@@ -50,7 +41,7 @@ def main():
     # the archive dir, so we pass a factory that Prover calls after setup.
     def make_llm(archive_dir):
         if args.model == "qed-nano":
-            return HFClient("lm-provers/QED-Nano", archive_dir, base_url=args.hf_url)
+            return HFClient("lm-provers/QED-Nano", archive_dir, base_url=args.hf_url, answer_reserve=args.answer_reserve)
         return LLMClient(args.model, archive_dir)
 
     prover = Prover(
@@ -76,13 +67,9 @@ def main():
             print(f"  {prover.work_dir}")
         return
 
-    # Signal handling: first ctrl+c → graceful shutdown, second → immediate exit
+    # Signal handling: ctrl+c interrupts the active LLM call
     def handle_sigint(signum, frame):
-        if prover.shutting_down:
-            tui.cleanup()
-            print("\nForce quit.")
-            sys.exit(1)
-        prover.request_shutdown()
+        prover.request_interrupt()
 
     signal.signal(signal.SIGINT, handle_sigint)
 
