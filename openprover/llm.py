@@ -1,11 +1,42 @@
 """LLM client wrappers — Claude CLI and OpenAI-compatible HTTP."""
 
 import json
+import re
 import subprocess
+import threading
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+
+class Interrupted(Exception):
+    """Raised when an LLM call is cancelled via interrupt()."""
+    pass
+
+
+def _split_think_tags(text: str) -> tuple[str, str]:
+    """Split thinking from model output at </think> boundary.
+
+    QED-Nano starts thinking immediately (no <think> tag) and ends with
+    </think> before the answer. Also handles <think>...</think> format.
+
+    Returns (result_text, thinking_text). If no </think> found,
+    returns (original_text, "").
+    """
+    # Strip optional opening <think> tag
+    stripped = text.lstrip()
+    if stripped.startswith("<think>"):
+        stripped = stripped[7:]
+    else:
+        stripped = text
+
+    idx = stripped.find("</think>")
+    if idx >= 0:
+        thinking = stripped[:idx].strip()
+        result = stripped[idx + 8:].strip()
+        return (result or thinking, thinking)
+    return (text, "")
 
 
 class LLMClient:
@@ -17,6 +48,21 @@ class LLMClient:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.call_count = 0
         self.total_cost = 0.0
+        self._interrupted = threading.Event()
+        self._active_procs: list[subprocess.Popen] = []
+        self._procs_lock = threading.Lock()
+
+    def interrupt(self):
+        """Signal all active LLM calls to stop."""
+        self._interrupted.set()
+        with self._procs_lock:
+            for proc in self._active_procs:
+                if proc.poll() is None:
+                    proc.kill()
+
+    def clear_interrupt(self):
+        """Reset the interrupt flag so new calls can proceed."""
+        self._interrupted.clear()
 
     def call(
         self,
@@ -109,6 +155,7 @@ class LLMClient:
 
         return {
             "result": result_text,
+            "thinking": "",
             "cost": cost,
             "duration_ms": raw.get("duration_ms", elapsed_ms),
             "raw": raw,
@@ -121,36 +168,58 @@ class LLMClient:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,
         )
+        with self._procs_lock:
+            self._active_procs.append(proc)
         proc.stdin.write(prompt)
         proc.stdin.close()
 
         result_data = None
+        thinking_parts = []
+        interrupted = False
         # Use readline() instead of iterator — the iterator uses an internal
         # read-ahead buffer that defeats real-time streaming.
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        try:
+            while True:
+                if self._interrupted.is_set():
+                    interrupted = True
+                    proc.kill()
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            if msg.get("type") == "stream_event":
-                event = msg.get("event", {})
-                if event.get("type") == "content_block_delta":
-                    delta = event.get("delta", {})
-                    text = delta.get("text", "") or delta.get("thinking", "")
-                    if text:
-                        callback(text)
-            elif msg.get("type") == "result":
-                result_data = msg
+                if msg.get("type") == "stream_event":
+                    event = msg.get("event", {})
+                    if event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        thinking = delta.get("thinking", "")
+                        text = delta.get("text", "")
+                        if thinking:
+                            thinking_parts.append(thinking)
+                            callback(thinking, "thinking")
+                        elif text:
+                            callback(text, "text")
+                elif msg.get("type") == "result":
+                    result_data = msg
+        finally:
+            with self._procs_lock:
+                if proc in self._active_procs:
+                    self._active_procs.remove(proc)
+            proc.wait()
 
-        proc.wait()
         elapsed_ms = int((time.time() - start) * 1000)
+
+        if interrupted:
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
 
         if result_data is None:
             stderr = proc.stderr.read()
@@ -170,6 +239,7 @@ class LLMClient:
 
         return {
             "result": result_text,
+            "thinking": "".join(thinking_parts),
             "cost": cost,
             "duration_ms": result_data.get("duration_ms", elapsed_ms),
             "raw": result_data,
@@ -196,17 +266,40 @@ class LLMClient:
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
 
 
+MODEL_CONTEXT_LENGTHS = {
+    "lm-provers/QED-Nano": 49152,
+}
+
+
 class HFClient:
     """Calls an OpenAI-compatible HTTP server (e.g. serve_hf.py) and archives interactions."""
 
-    def __init__(self, model: str, archive_dir: Path, base_url: str = "http://localhost:8000"):
+    def __init__(self, model: str, archive_dir: Path, base_url: str = "http://localhost:8000",
+                 answer_reserve: int = 4096):
+        if model not in MODEL_CONTEXT_LENGTHS:
+            raise ValueError(
+                f"Unknown model {model!r}. "
+                f"Known models: {', '.join(MODEL_CONTEXT_LENGTHS)}"
+            )
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.archive_dir = archive_dir
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.call_count = 0
         self.total_cost = 0.0
+        self._interrupted = threading.Event()
+        self.max_context_length = MODEL_CONTEXT_LENGTHS[model]
+        self.thinking_budget = max(self.max_context_length - answer_reserve,
+                                   self.max_context_length // 2)
         self._check_server()
+
+    def interrupt(self):
+        """Signal the current LLM call to stop."""
+        self._interrupted.set()
+
+    def clear_interrupt(self):
+        """Reset the interrupt flag so new calls can proceed."""
+        self._interrupted.clear()
 
     def _check_server(self):
         """Verify the HF server is reachable. Fail fast with a clear error."""
@@ -244,10 +337,11 @@ class HFClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 32768,
+            "max_tokens": self.max_context_length,
             "temperature": 0.6,
             "top_p": 0.95,
             "stream": bool(stream_callback),
+            "thinking_budget": self.thinking_budget,
         }
 
         start = time.time()
@@ -280,14 +374,15 @@ class HFClient:
         raw = json.loads(resp.read())
         elapsed_ms = int((time.time() - start) * 1000)
 
-        result_text = raw["choices"][0]["message"]["content"]
-        usage = raw.get("usage", {})
+        full_text = raw["choices"][0]["message"]["content"]
+        result_text, thinking_text = _split_think_tags(full_text)
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
                       raw, None, elapsed_ms, archive_path)
 
         return {
             "result": result_text,
+            "thinking": thinking_text,
             "cost": 0.0,
             "duration_ms": elapsed_ms,
             "raw": raw,
@@ -302,8 +397,17 @@ class HFClient:
         )
         resp = urllib.request.urlopen(req, timeout=600)
 
-        collected = []
+        thinking_parts: list[str] = []
+        output_parts: list[str] = []
+        in_thinking = True   # QED-Nano starts in thinking mode (no <think> tag)
+        pending = ""         # buffer for partial </think> detection
+        interrupted = False
+
         for raw_line in resp:
+            if self._interrupted.is_set():
+                interrupted = True
+                resp.close()
+                break
             line = raw_line.decode().strip()
             if not line or not line.startswith("data: "):
                 continue
@@ -315,18 +419,61 @@ class HFClient:
             except json.JSONDecodeError:
                 continue
             content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-            if content:
-                callback(content)
-                collected.append(content)
+            if not content:
+                continue
+
+            if in_thinking:
+                pending += content
+                # Look for </think> in pending buffer
+                end_idx = pending.find("</think>")
+                if end_idx >= 0:
+                    think_part = pending[:end_idx]
+                    if think_part:
+                        callback(think_part, "thinking")
+                        thinking_parts.append(think_part)
+                    in_thinking = False
+                    remainder = pending[end_idx + 8:]
+                    pending = ""
+                    if remainder.strip():
+                        callback(remainder, "text")
+                        output_parts.append(remainder)
+                else:
+                    # Emit all but last 8 chars (could be partial </think>)
+                    safe = len(pending) - 8
+                    if safe > 0:
+                        callback(pending[:safe], "thinking")
+                        thinking_parts.append(pending[:safe])
+                        pending = pending[safe:]
+            else:
+                callback(content, "text")
+                output_parts.append(content)
+
+        # Flush any remaining pending buffer
+        if pending:
+            kind = "thinking" if in_thinking else "text"
+            callback(pending, kind)
+            (thinking_parts if in_thinking else output_parts).append(pending)
 
         elapsed_ms = int((time.time() - start) * 1000)
-        result_text = "".join(collected)
+
+        if interrupted:
+            self._archive(call_num, label, prompt, system_prompt, json_schema,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
+
+        thinking_text = "".join(thinking_parts)
+        result_text = "".join(output_parts)
+        if not result_text and thinking_text:
+            # No </think> found — treat everything as output
+            result_text = thinking_text
+            thinking_text = ""
 
         self._archive(call_num, label, prompt, system_prompt, json_schema,
                       {"result": result_text}, None, elapsed_ms, archive_path)
 
         return {
             "result": result_text,
+            "thinking": thinking_text,
             "cost": 0.0,
             "duration_ms": elapsed_ms,
             "raw": {"result": result_text},

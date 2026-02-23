@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts
+from .llm import Interrupted
 from .tui import TUI
 
 
@@ -163,21 +164,16 @@ class Prover:
                 color="cyan",
             )
 
-        paused = False
-        try:
-            while self.step_num < self.max_steps and not self.shutting_down:
-                self.step_num += 1
-                result = self._do_step()
-                if result == "stop":
-                    break
-                if result == "pause":
-                    paused = True
-                    self.tui.log("Paused.", color="yellow")
-                    break
-        except KeyboardInterrupt:
-            self.shutting_down = True
+        while self.step_num < self.max_steps and not self.shutting_down:
+            self.step_num += 1
+            result = self._do_step()
+            if result == "stop":
+                break
+            if result == "pause":
+                self.tui.log("Paused.", color="yellow")
+                break
 
-        if not paused and self.tui.step_entries:
+        if not self.shutting_down and self.tui.step_entries:
             self._write_discussion()
 
     def _do_step(self) -> str:
@@ -227,6 +223,9 @@ class Prover:
                 stream_callback=lambda t, k="text": self.tui.stream_text(t, kind=k, tab="planner"),
                 archive_path=step_dir / "planner_call.json",
             )
+        except Interrupted:
+            self.tui.stream_end(tab="planner")
+            return self._handle_interrupt(step_dir)
         except RuntimeError as e:
             self.tui.stream_end(tab="planner")
             self.tui.log(f"Error: {e}", color="red")
@@ -245,11 +244,15 @@ class Prover:
         action = plan.get("action", "")
         summary = plan.get("summary", "")
 
-        # Update whiteboard (always)
-        if plan.get("whiteboard"):
-            self.whiteboard = plan["whiteboard"]
-            (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
-            self.tui.whiteboard = self.whiteboard
+        # Update whiteboard (required every step)
+        if not plan.get("whiteboard"):
+            self.tui.log("Planner output missing whiteboard — retrying...", color="red")
+            self._save_step_meta(step_dir, status="parse_error", resp=resp,
+                                 error="Missing whiteboard in planner output")
+            return "continue"
+        self.whiteboard = plan["whiteboard"]
+        (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
+        self.tui.whiteboard = self.whiteboard
 
         # Log step in planner tab
         self.tui.step_complete(
@@ -283,6 +286,37 @@ class Prover:
         return "continue"
 
     # ── Action handlers ──────────────────────────────────────
+
+    def _handle_interrupt(self, step_dir: Path) -> str:
+        """Handle CTRL+C during planner/worker call.
+
+        Shows continue/feedback options (feedback selected by default).
+        If autonomous, switches to manual mode.
+        """
+        self._save_step_meta(step_dir, status="interrupted")
+        self.step_num -= 1  # don't count interrupted step
+        self.llm.clear_interrupt()
+
+        if self.autonomous:
+            self.autonomous = False
+            self.tui.autonomous = False
+            self.tui.log("Interrupted — switching to manual mode", color="yellow")
+        else:
+            self.tui.log("Interrupted", color="yellow")
+
+        # Show continue / give feedback (feedback selected by default)
+        self.tui.show_interrupt_options()
+        while True:
+            user_resp = self.tui.get_interrupt_response()
+            if user_resp == "":
+                return "continue"  # continue
+            if user_resp == "q":
+                self.shutting_down = True
+                return "stop"
+            # Feedback
+            self.prev_output = f"Human feedback: {user_resp}"
+            self.tui.log("Feedback noted — will replan next step", color="yellow")
+            return "continue"
 
     def _handle_proof_found(self, plan: dict) -> str:
         proof = plan.get("proof", "")
@@ -401,11 +435,6 @@ class Prover:
 
             pending = set(futures.keys())
             while pending:
-                if self.shutting_down:
-                    self.tui.log("Shutting down — cancelling workers", color="yellow")
-                    for f in pending:
-                        f.cancel()
-                    break
                 done_set, pending = wait(pending, timeout=0.5,
                                          return_when=FIRST_COMPLETED)
                 for future in done_set:
@@ -425,6 +454,17 @@ class Prover:
                         )
 
         self.tui.set_waiting_status("")
+
+        # Check if any workers were interrupted
+        any_interrupted = any(
+            w and w.get("error") == "interrupted" for w in worker_resps
+        )
+        if any_interrupted:
+            self.llm.clear_interrupt()
+            if self.autonomous:
+                self.autonomous = False
+                self.tui.autonomous = False
+                self.tui.log("Interrupted — switching to manual mode", color="yellow")
 
         # Save results and build prev_output
         parts = []
@@ -517,6 +557,17 @@ class Prover:
             search_resp["error"] = ""
             self.prev_output = result
             (workers_dir / "result_0.md").write_text(result)
+        except Interrupted:
+            self.tui.stream_end(tab=wid)
+            self.llm.clear_interrupt()
+            if self.autonomous:
+                self.autonomous = False
+                self.tui.autonomous = False
+                self.tui.log("Interrupted — switching to manual mode", color="yellow")
+            result = "(terminated by user)"
+            self.prev_output = result
+            search_resp = {"result": result, "cost": 0.0, "duration_ms": 0,
+                           "raw": {}, "error": "interrupted"}
         except RuntimeError as e:
             self.tui.stream_end(tab=wid)
             result = f"Literature search failed: {e}"
@@ -557,6 +608,10 @@ class Prover:
             )
             self.tui.stream_end(tab=worker_id)
             resp["error"] = ""
+        except Interrupted:
+            self.tui.stream_end(tab=worker_id)
+            resp = {"result": "(terminated by user)", "cost": 0.0,
+                    "duration_ms": 0, "raw": {}, "error": "interrupted"}
         except RuntimeError as e:
             self.tui.stream_end(tab=worker_id)
             resp = {"result": f"Worker error: {e}", "cost": 0.0,
@@ -660,11 +715,6 @@ class Prover:
         (step_dir / "step_meta.toml").write_text("\n".join(lines) + "\n")
 
     def _write_discussion(self):
-        if self.shutting_down:
-            self.tui.log(
-                "Interrupted — writing discussion... (ctrl+c again to exit immediately)",
-                color="yellow",
-            )
         repo_index = self.repo.list_summaries()
         prompt = prompts.format_discussion_prompt(
             theorem=self.theorem_text,
@@ -686,9 +736,10 @@ class Prover:
             self.tui.stream_end(tab="planner")
             (self.work_dir / "DISCUSSION.md").write_text(resp["result"])
             self.tui.log(f"  {self.work_dir / 'DISCUSSION.md'}", dim=True)
-        except RuntimeError as e:
+        except (Interrupted, RuntimeError) as e:
             self.tui.stream_end(tab="planner")
-            self.tui.log(f"Error generating discussion: {e}", color="red")
+            if not isinstance(e, Interrupted):
+                self.tui.log(f"Error generating discussion: {e}", color="red")
             (self.work_dir / "DISCUSSION.md").write_text(
                 f"# Discussion\n\nSession ended after {self.step_num} steps.\n\n"
                 f"## Final Whiteboard\n\n{self.whiteboard}\n"
@@ -782,6 +833,7 @@ class Prover:
             if idx < len(step_dirs) - 1:
                 self.tui.clear_worker_tabs()
 
-    def request_shutdown(self):
-        self.shutting_down = True
-        self.tui.interrupt()
+    def request_interrupt(self):
+        """Called by SIGINT handler. Kills active LLM call or nudges TUI."""
+        self.llm.interrupt()
+        self.tui.interrupt()  # in case we're in a confirmation prompt

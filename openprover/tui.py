@@ -72,25 +72,30 @@ HEADER_ROWS = 4
 
 class _LogEntry:
     """A line in the log. step_idx >= 0 marks completed-step lines."""
-    __slots__ = ("text", "step_idx", "is_trace")
+    __slots__ = ("text", "step_idx", "is_trace", "is_output")
 
-    def __init__(self, text: str, step_idx: int = -1, is_trace: bool = False):
+    def __init__(self, text: str, step_idx: int = -1, is_trace: bool = False,
+                 is_output: bool = False):
         self.text = text
         self.step_idx = step_idx
         self.is_trace = is_trace
+        self.is_output = is_output
 
 
 class _Tab:
     """A tab with its own log buffer and streaming state."""
-    __slots__ = ("id", "label", "log_lines", "trace_buf", "scroll_offset",
+    __slots__ = ("id", "label", "log_lines", "trace_buf", "output_buf",
+                 "scroll_offset",
                  "streaming", "spinner_label", "spinner_tick", "spinner_time",
-                 "spinner_start", "last_trace", "done", "task_description")
+                 "spinner_start", "last_trace", "last_output", "done",
+                 "task_description")
 
     def __init__(self, tab_id: str, label: str, task_description: str = ""):
         self.id = tab_id
         self.label = label
         self.log_lines: list[_LogEntry] = []
         self.trace_buf: list[str] = []
+        self.output_buf: list[str] = []
         self.scroll_offset = 0
         self.streaming = False
         self.spinner_label = ""
@@ -98,6 +103,7 @@ class _Tab:
         self.spinner_time = 0.0
         self.spinner_start = 0.0
         self.last_trace = ""
+        self.last_output = ""
         self.done = False
         self.task_description = task_description
 
@@ -129,6 +135,7 @@ class TUI:
         # Confirmation state
         self._confirming = False
         self._browsing = False
+        self._confirm_accept_label = "accept"
         self._confirm_selected = 0
         self._confirm_buf: list[str] = []
         # Thread safety for stdout
@@ -452,13 +459,15 @@ class TUI:
         color = ACTION_STYLE.get(action, "")
         line = f'{color}■{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}'
         trace = planner.last_trace
+        output = planner.last_output
         planner.last_trace = ""
+        planner.last_output = ""
         idx = len(self.step_entries)
         self._tab_log(planner, line, step_idx=idx)
         self.step_entries.append({
             "action": action, "summary": summary,
             "step_num": step_num, "detail": detail,
-            "trace": trace,
+            "trace": trace, "output": output,
         })
         self.update_step(step_num, max_steps)
         if self.view == "main":
@@ -481,7 +490,8 @@ class TUI:
             ch = SPINNER[tab.spinner_tick]
             elapsed = int(now - tab.spinner_start)
             with self._write_lock:
-                if not tab.spinner_label or (tab.trace_buf and self.trace_visible):
+                if (not tab.spinner_label or tab.output_buf
+                        or (tab.trace_buf and self.trace_visible)):
                     return
                 self._write_raw(f'\r\033[2K  {DIM}{ch} {tab.spinner_label} {elapsed}s{RESET}')
                 sys.stdout.flush()
@@ -491,6 +501,7 @@ class TUI:
     def stream_start(self, label: str = "thinking", tab: str = "planner"):
         target = self._find_tab(tab)
         target.trace_buf = []
+        target.output_buf = []
         target.streaming = True
         target.spinner_label = label
         target.spinner_tick = 0
@@ -499,37 +510,70 @@ class TUI:
         if target is self._active_tab and self.view == "main":
             self._write(f'  {DIM}{SPINNER[0]} {label} 0s{RESET}')
 
-    def stream_text(self, text: str, tab: str = "planner"):
+    def stream_text(self, text: str, kind: str = "text", tab: str = "planner"):
         self._check_keys()
         target = self._find_tab(tab)
         is_active = target is self._active_tab
         at_bottom = target.scroll_offset == 0
-        if not target.trace_buf and self.trace_visible and self.view == "main" and is_active and at_bottom:
+        is_thinking = kind == "thinking"
+
+        # Was there visible content before this chunk?
+        had_visible = (target.output_buf
+                       or (target.trace_buf and self.trace_visible))
+
+        if is_thinking:
+            target.trace_buf.append(text)
+        else:
+            target.output_buf.append(text)
+
+        has_visible = (target.output_buf
+                       or (target.trace_buf and self.trace_visible))
+
+        # Clear spinner on first visible content
+        if (not had_visible and has_visible
+                and self.view == "main" and is_active and at_bottom):
             with self._write_lock:
                 self._write_raw('\r\033[2K')
                 sys.stdout.flush()
-        target.trace_buf.append(text)
-        if self.trace_visible and self.view == "main" and is_active and at_bottom:
-            self._write(f'{DIM}{text}{RESET}')
+
+        should_display = not is_thinking or self.trace_visible
+        if should_display and self.view == "main" and is_active and at_bottom:
+            if is_thinking:
+                self._write(f'{DIM}{text}{RESET}')
+            else:
+                self._write(text)
 
     def stream_end(self, tab: str = "planner"):
         target = self._find_tab(tab)
         target.streaming = False
         target.spinner_label = ""
+
         if target.trace_buf:
             target.last_trace = "".join(target.trace_buf)
             target.log_lines.append(_LogEntry(target.last_trace, is_trace=True))
-            if len(target.log_lines) > 500:
-                target.log_lines = target.log_lines[-500:]
-            target.trace_buf = []
         else:
             target.last_trace = ""
 
+        if target.output_buf:
+            target.last_output = "".join(target.output_buf)
+            target.log_lines.append(
+                _LogEntry(target.last_output, is_output=True))
+        else:
+            target.last_output = ""
+
+        if len(target.log_lines) > 500:
+            target.log_lines = target.log_lines[-500:]
+
+        target.trace_buf = []
+        target.output_buf = []
+
         is_active = target is self._active_tab
+        had_visible = ((target.last_trace and self.trace_visible)
+                       or target.last_output)
         if is_active and self.view == "main":
             if target.scroll_offset > 0:
                 self._redraw()
-            elif target.last_trace and self.trace_visible:
+            elif had_visible:
                 self._write('\n')
             else:
                 self._write('\r\033[2K')
@@ -703,6 +747,7 @@ class TUI:
 
     def get_confirmation(self) -> str:
         self._confirming = True
+        self._confirm_accept_label = "accept"
         self._confirm_selected = 0
         self._confirm_buf = []
         self._nav_step = -1
@@ -767,6 +812,10 @@ class TUI:
                         if trace and self.trace_visible:
                             parts.append(trace.rstrip())
                             parts.append("")
+                        output = entry.get("output", "")
+                        if output:
+                            parts.append(output.rstrip())
+                            parts.append("")
                         detail = entry.get("detail", "")
                         if detail:
                             parts.append(detail)
@@ -784,10 +833,8 @@ class TUI:
                         self._redraw()
                     continue
 
-                if ch == '\x03':
-                    raise KeyboardInterrupt
-                if ch == '\x04':
-                    raise EOFError
+                if ch in ('\x03', '\x04'):
+                    return "q"
 
                 if ch == '\t':
                     if self._nav_step >= 0:
@@ -837,6 +884,104 @@ class TUI:
         planner = self.tabs[0]
         planner.log_lines = planner.log_lines[:self._proposal_log_start]
         self._proposal_log_start = -1
+
+    def show_interrupt_options(self):
+        """Show continue / give feedback after CTRL+C interruption."""
+        # Drain any stale keys from the queue (including the ctrl+c itself)
+        while not self._key_queue.empty():
+            try:
+                self._key_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def get_interrupt_response(self) -> str:
+        """Block for user input: '' = continue, 'q' = quit, else = feedback text.
+
+        Feedback is selected by default (unlike get_confirmation where accept is default).
+        """
+        self._confirming = True
+        self._confirm_accept_label = "continue"
+        self._confirm_selected = 1  # feedback selected by default
+        self._confirm_buf = []
+        self._nav_step = -1
+        self._redraw()
+        self._write('\033[?25h')
+
+        try:
+            while True:
+                try:
+                    ch = self._key_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if ch == '\x1b':
+                    if self.view != "main":
+                        self.view = "main"
+                    else:
+                        self._confirm_buf.clear()
+                    self._redraw()
+                    continue
+
+                if ch in ('scroll_up', 'scroll_down'):
+                    if ch == 'scroll_up':
+                        self._scroll_lines_up()
+                    else:
+                        self._scroll_lines_down()
+                    continue
+
+                if len(ch) >= 3 and ch[:2] == '\x1b[':
+                    if ch == '\x1b[C':
+                        self._switch_tab(1)
+                    elif ch == '\x1b[D':
+                        self._switch_tab(-1)
+                    elif ch == '\x1b[5~':
+                        self._scroll_up()
+                    elif ch == '\x1b[6~':
+                        self._scroll_down()
+                    continue
+
+                if ch in ('\n', '\r'):
+                    if self.view != "main":
+                        self.view = "main"
+                        self._redraw()
+                        continue
+                    if self._confirm_selected == 0:
+                        return ""  # continue
+                    return "".join(self._confirm_buf)
+
+                if ch in ('\x7f', '\x08'):
+                    if self._confirm_selected == 1 and self._confirm_buf:
+                        self._confirm_buf.pop()
+                        self._redraw()
+                    continue
+
+                if ch == '\x03':
+                    # Second ctrl+c during interrupt prompt → quit
+                    return "q"
+
+                if ch == '\t':
+                    self._confirm_selected = 1 - self._confirm_selected
+                    self._redraw()
+                    continue
+
+                can_toggle = (self._confirm_selected == 0 or not self._confirm_buf)
+                if can_toggle and ch in ('t', 'w', '?'):
+                    self._process_key(ch)
+                    continue
+
+                if self._confirm_selected == 0 and ch == 'q':
+                    return "q"
+
+                if ch.isprintable():
+                    if self._confirm_selected == 0:
+                        self._confirm_selected = 1
+                    self._confirm_buf.append(ch)
+                    self._redraw()
+
+        finally:
+            self._confirming = False
+            self._redraw()
+            self._write('\033[?25l')
 
     def browse(self):
         """Interactive browse mode for inspect. Blocks until user presses q."""
@@ -899,8 +1044,20 @@ class TUI:
                             f"Step {entry['step_num']}: {entry['action']}"
                             f" — {entry['summary']}"
                         )
+                        parts = []
+                        trace = entry.get("trace", "")
+                        if trace and self.trace_visible:
+                            parts.append(trace.rstrip())
+                            parts.append("")
+                        output = entry.get("output", "")
+                        if output:
+                            parts.append(output.rstrip())
+                            parts.append("")
                         detail = entry.get("detail", "")
-                        self._step_detail_text = detail or "(no detail)"
+                        if detail:
+                            parts.append(detail)
+                        self._step_detail_text = (
+                            "\n".join(parts) if parts else "(no detail)")
                         self.view = "step_detail"
                         self._redraw()
                     elif self._active_tab.scroll_offset > 0:
@@ -958,15 +1115,16 @@ class TUI:
 
     def _draw_confirmation(self):
         fb = "".join(self._confirm_buf)
+        lbl = self._confirm_accept_label
         self._write_raw('\n')
         if self._nav_step >= 0:
-            self._write_raw(f' {DIM}○ accept{RESET}\n')
+            self._write_raw(f' {DIM}○ {lbl}{RESET}\n')
             self._write_raw(f' {DIM}○ give feedback{RESET}')
         elif self._confirm_selected == 0:
-            self._write_raw(f' {GREEN}●{RESET} {BOLD}accept{RESET}\n')
+            self._write_raw(f' {GREEN}●{RESET} {BOLD}{lbl}{RESET}\n')
             self._write_raw(f' {DIM}○ give feedback{RESET}')
         else:
-            self._write_raw(f' {DIM}○ accept{RESET}\n')
+            self._write_raw(f' {DIM}○ {lbl}{RESET}\n')
             self._write_raw(f' {GREEN}●{RESET} {fb}')
 
     # ── View toggles ────────────────────────────────────────────
@@ -1018,6 +1176,14 @@ class TUI:
                         lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
                         tline = tline[max_w:]
                     lines.append(f'  {DIM}{tline}{RESET}')
+            elif entry.is_output:
+                if not self.trace_visible:
+                    continue
+                for tline in entry.text.splitlines():
+                    while len(tline) > max_w:
+                        lines.append(f'  {tline[:max_w]}')
+                        tline = tline[max_w:]
+                    lines.append(f'  {tline}')
             else:
                 is_step = entry.step_idx >= 0
                 if is_step and self._confirming and entry.step_idx == self._nav_step:
@@ -1025,13 +1191,21 @@ class TUI:
                 else:
                     lines.append(f' {entry.text}')
         # Active streaming content (not yet baked)
-        if tab.streaming and tab.trace_buf and self.trace_visible:
-            joined = "".join(tab.trace_buf)
-            for tline in joined.splitlines():
-                while len(tline) > max_w:
-                    lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
-                    tline = tline[max_w:]
-                lines.append(f'  {DIM}{tline}{RESET}')
+        if tab.streaming:
+            if tab.trace_buf and self.trace_visible:
+                joined = "".join(tab.trace_buf)
+                for tline in joined.splitlines():
+                    while len(tline) > max_w:
+                        lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
+                        tline = tline[max_w:]
+                    lines.append(f'  {DIM}{tline}{RESET}')
+            if tab.output_buf:
+                joined = "".join(tab.output_buf)
+                for tline in joined.splitlines():
+                    while len(tline) > max_w:
+                        lines.append(f'  {tline[:max_w]}')
+                        tline = tline[max_w:]
+                    lines.append(f'  {tline}')
         return lines
 
     # ── Redraw ──────────────────────────────────────────────────
