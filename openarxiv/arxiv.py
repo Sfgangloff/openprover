@@ -17,6 +17,24 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
+
+class _C:
+    """ANSI color codes, disabled when not a TTY."""
+    BOLD = RESET = DIM = RED = GREEN = YELLOW = CYAN = ""
+
+if os.isatty(1):
+    _C.BOLD = "\033[1m"
+    _C.RESET = "\033[0m"
+    _C.DIM = "\033[2m"
+    _C.RED = "\033[31m"
+    _C.GREEN = "\033[32m"
+    _C.YELLOW = "\033[33m"
+    _C.CYAN = "\033[36m"
+
+
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_EPRINT = "https://arxiv.org/e-print"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
@@ -253,15 +271,15 @@ def cmd_download(args):
 
     print(f"Fetching up to {args.max} papers from math.CO...")
     papers = fetch_arxiv_listing("math.CO", args.max)
-    print(f"Got {len(papers)} entries from ArXiv API.")
+    print(f"Got {len(papers)} entries from ArXiv API.\n")
 
     for paper in papers:
         paper_dir = data_dir / paper["id"].replace("/", "_")
         if paper_dir.exists():
-            print(f"  skip {paper['id']} (already exists)")
+            print(f"  {_C.DIM}skip {paper['id']} (exists){_C.RESET}")
             continue
 
-        print(f"  downloading {paper['id']}: {paper['title'][:80]}")
+        print(f"  {_C.BOLD}{paper['id']}{_C.RESET}  {paper['title'][:72]}")
         paper_dir.mkdir(parents=True)
         write_metadata_toml(paper, paper_dir / "paper.toml")
 
@@ -269,9 +287,10 @@ def cmd_download(args):
         try:
             download_source(paper["id"], source_dir)
             n_files = sum(1 for _ in source_dir.rglob("*") if _.is_file())
-            print(f"    extracted {n_files} files")
+            print(f"    {_C.GREEN}downloaded{_C.RESET}  "
+                  f"{_C.DIM}{n_files} files{_C.RESET}")
         except Exception as e:
-            print(f"    WARNING: failed to download source: {e}")
+            print(f"    {_C.RED}download failed: {e}{_C.RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +386,7 @@ def get_model_context_length(model: str) -> int | None:
     return None
 
 
-def call_llm(prompt: str, model: str) -> dict:
+def call_llm(messages: list[dict], model: str) -> dict:
     """Call OpenRouter and return dict with content, reasoning, and usage.
 
     Returns {"content": str, "reasoning": str|None,
@@ -387,13 +406,7 @@ def call_llm(prompt: str, model: str) -> dict:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        },
+        json={"model": model, "messages": messages},
         timeout=300,
     )
     resp.raise_for_status()
@@ -592,70 +605,21 @@ def _write_extract_toml(paper_dir: Path, usage: dict | None = None,
     (paper_dir / "extraction.toml").write_text("\n".join(lines) + "\n")
 
 
-def extract_paper(paper_dir: Path, model: str, force: bool = False):
-    """Extract open problems from a single paper directory."""
-    extraction_toml = paper_dir / "extraction.toml"
-    if extraction_toml.exists() and not force:
-        print(f"  WARNING: {paper_dir.name} already extracted "
-              f"(use --force to overwrite)")
-        return
+def _save_llm_call(call_dir: Path, result: dict, prompt: str | None = None):
+    """Save an LLM call's artifacts to a numbered subdirectory."""
+    call_dir.mkdir(parents=True, exist_ok=True)
+    if prompt is not None:
+        (call_dir / "prompt.txt").write_text(prompt)
+    (call_dir / "response.txt").write_text(result["content"])
+    if result["reasoning"]:
+        (call_dir / "reasoning.txt").write_text(result["reasoning"])
 
-    source_dir = paper_dir / "source"
-    if not source_dir.exists():
-        print(f"  no source/ directory in {paper_dir.name}, skipping")
-        return
 
-    llm_dir = paper_dir / "llm_call"
-    llm_dir.mkdir(exist_ok=True)
-
-    print(f"  building prompt for {paper_dir.name}...")
-    prompt = build_prompt(source_dir)
-    (llm_dir / "prompt.txt").write_text(prompt)
-    print(f"    prompt saved ({len(prompt)} chars)")
-
-    # Rough token estimate (~4 chars/token) and check against model context
-    est_tokens = len(prompt) // 4 + len(EXTRACT_SYSTEM_PROMPT) // 4
-    ctx_len = get_model_context_length(model)
-    if ctx_len is not None:
-        print(f"    ~{est_tokens} tokens (model context: {ctx_len})")
-        if est_tokens > ctx_len:
-            msg = (f"prompt too large for {model} "
-                   f"(~{est_tokens} > {ctx_len})")
-            print(f"    ERROR: {msg}")
-            _write_extract_toml(paper_dir, error=msg)
-            raise RuntimeError(msg)
-    else:
-        print(f"    ~{est_tokens} tokens (context limit unknown)")
-
-    print(f"  calling LLM ({model})...")
-    result = call_llm(prompt, model)
-    response_text = result["content"]
-    reasoning = result["reasoning"]
-    usage = result["usage"]
-
-    # Save raw response and reasoning trace
-    (llm_dir / "response.txt").write_text(response_text)
-    if reasoning:
-        (llm_dir / "reasoning.txt").write_text(reasoning)
-        print(f"    reasoning trace saved ({len(reasoning)} chars)")
-
-    problems = parse_toml_response(response_text)
-    print(f"    found {len(problems)} open problem(s)")
-
-    # Write extraction.toml with cost/usage info
-    _write_extract_toml(paper_dir, usage=usage, num_problems=len(problems))
-    cost_str = _fmt_cost(usage.get("cost"))
-    print(f"    tokens: {usage['total_tokens']} (cost: {cost_str})")
-
-    problems_dir = paper_dir / "problems"
-    problems_dir.mkdir(exist_ok=True)
-
-    if not problems:
-        (problems_dir / "none.txt").write_text(
-            "No open problems found in this paper.\n"
-        )
-        return
-
+def _validate_problems(problems: list[dict], problems_dir: Path
+                       ) -> tuple[list[dict], list[dict]]:
+    """Validate LaTeX for each problem. Returns (ok_problems, failed_problems).
+    Each failed problem gets an 'error' key with the error text."""
+    ok, failed = [], []
     used_slugs: set[str] = set()
     for prob in problems:
         slug = _make_slug(prob.get("name", "problem"), used_slugs)
@@ -663,20 +627,163 @@ def extract_paper(paper_dir: Path, model: str, force: bool = False):
         prob["id"] = slug
         toml_path = problems_dir / f"{slug}.toml"
         write_problem_toml(prob, toml_path)
-        print(f"    wrote {toml_path.name}")
 
-        # Validate LaTeX by compiling to PDF
         pdf_path = problems_dir / f"{slug}.pdf"
         try:
-            ok = validate_latex(prob, pdf_path)
-            if ok:
-                print(f"    compiled {slug}.pdf OK")
+            if validate_latex(prob, pdf_path):
+                print(f"  {_C.GREEN}OK{_C.RESET}   {slug}")
+                ok.append(prob)
             else:
-                print(f"    LaTeX error for {slug} (see {slug}.pdf.error)")
+                error_path = problems_dir / f"{slug}.pdf.error"
+                err = error_path.read_text() if error_path.exists() else ""
+                prob["_error"] = err
+                failed.append(prob)
+                print(f"  {_C.RED}ERR{_C.RESET}  {slug}")
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
             error_path = problems_dir / f"{slug}.pdf.error"
             error_path.write_text(f"LaTeX compilation failed: {e}\n")
-            print(f"    LaTeX compilation failed for {slug}: {e}")
+            prob["_error"] = str(e)
+            failed.append(prob)
+            print(f"  {_C.RED}ERR{_C.RESET}  {slug}")
+    return ok, failed
+
+
+def extract_paper(paper_dir: Path, model: str, force: bool = False,
+                  max_retries: int = 2):
+    """Extract open problems from a single paper directory."""
+    # Read paper title for display
+    paper_toml = paper_dir / "paper.toml"
+    title = ""
+    if paper_toml.exists():
+        try:
+            meta = tomllib.loads(paper_toml.read_text())
+            title = meta.get("title", "")
+        except Exception:
+            pass
+    header = paper_dir.name
+    if title:
+        header += f"  {_C.DIM}{title[:60]}{_C.RESET}"
+    print(f"\n{_C.BOLD}{_C.CYAN}{header}{_C.RESET}")
+
+    extraction_toml = paper_dir / "extraction.toml"
+    if extraction_toml.exists() and not force:
+        print(f"  {_C.YELLOW}already extracted (use --force){_C.RESET}")
+        return
+
+    source_dir = paper_dir / "source"
+    if not source_dir.exists():
+        print(f"  {_C.YELLOW}no source/, skipping{_C.RESET}")
+        return
+
+    llm_calls_dir = paper_dir / "llm_calls"
+    llm_calls_dir.mkdir(exist_ok=True)
+
+    prompt = build_prompt(source_dir)
+
+    # Rough token estimate (~4 chars/token) and check against model context
+    est_tokens = len(prompt) // 4 + len(EXTRACT_SYSTEM_PROMPT) // 4
+    ctx_len = get_model_context_length(model)
+    ctx_info = f"{_C.DIM}ctx: {ctx_len:,}{_C.RESET}" if ctx_len else ""
+    print(f"  prompt ~{est_tokens:,} tokens  {ctx_info}")
+
+    if ctx_len is not None and est_tokens > ctx_len:
+        msg = f"prompt too large (~{est_tokens:,} > {ctx_len:,})"
+        print(f"  {_C.RED}{msg}{_C.RESET}")
+        _write_extract_toml(paper_dir, error=msg)
+        raise RuntimeError(msg)
+
+    # Initial LLM call
+    messages = [
+        {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    call_num = 0
+    result = call_llm(messages, model)
+    _save_llm_call(llm_calls_dir / f"{call_num:03d}", result, prompt)
+    total_usage = dict(result["usage"])
+
+    problems = parse_toml_response(result["content"])
+    initial_problems = problems  # keep for fallback
+
+    n_prob = len(problems)
+    cost_str = _fmt_cost(total_usage.get("cost"))
+    prob_color = _C.GREEN if n_prob > 0 else _C.DIM
+    print(f"  {prob_color}{n_prob} problem(s){_C.RESET}  "
+          f"{total_usage['total_tokens']:,} tokens  {cost_str}")
+
+    problems_dir = paper_dir / "problems"
+    problems_dir.mkdir(exist_ok=True)
+
+    if problems:
+        _, failed = _validate_problems(problems, problems_dir)
+
+        # Retry loop: ask LLM to fix LaTeX errors
+        messages.append({"role": "assistant", "content": result["content"]})
+        retry = 0
+        while failed and retry < max_retries:
+            retry += 1
+            call_num += 1
+            error_summary = "\n\n".join(
+                f"Problem \"{p.get('name', '?')}\":\n{p['_error'][:2000]}"
+                for p in failed
+            )
+            fix_msg = (
+                f"The following {len(failed)} problem(s) had LaTeX "
+                f"compilation errors:\n\n{error_summary}\n\n"
+                f"Please output a corrected COMPLETE TOML (all problems, "
+                f"not just the broken ones) inside a ```toml code fence."
+            )
+            messages.append({"role": "user", "content": fix_msg})
+            print(f"  {_C.YELLOW}retry {retry}/{max_retries}{_C.RESET}  "
+                  f"fixing {len(failed)} LaTeX error(s)...")
+            result = call_llm(messages, model)
+            _save_llm_call(llm_calls_dir / f"{call_num:03d}", result, fix_msg)
+            messages.append({"role": "assistant", "content": result["content"]})
+
+            # Accumulate usage
+            ru = result["usage"]
+            total_usage["prompt_tokens"] += ru["prompt_tokens"]
+            total_usage["completion_tokens"] += ru["completion_tokens"]
+            total_usage["total_tokens"] += ru["total_tokens"]
+            if ru.get("cost") is not None:
+                prev = total_usage.get("cost")
+                total_usage["cost"] = (prev or 0) + float(ru["cost"])
+
+            new_problems = parse_toml_response(result["content"])
+            if not new_problems:
+                print(f"    {_C.RED}no problems parsed, stopping{_C.RESET}")
+                break
+
+            # Clean problems dir and re-validate
+            for f in problems_dir.iterdir():
+                f.unlink()
+            _, failed = _validate_problems(new_problems, problems_dir)
+            if not failed:
+                problems = new_problems
+                print(f"    {_C.GREEN}all fixed{_C.RESET}")
+            else:
+                problems = new_problems
+
+        # If retries didn't fix all errors, restore initial output
+        if failed and problems is not initial_problems:
+            print(f"  {_C.YELLOW}reverting to initial extraction{_C.RESET}")
+            for f in problems_dir.iterdir():
+                f.unlink()
+            _validate_problems(initial_problems, problems_dir)
+
+        # Print totals if retries happened
+        if call_num > 0:
+            cost_str = _fmt_cost(total_usage.get("cost"))
+            print(f"  {_C.DIM}total: {total_usage['total_tokens']:,} "
+                  f"tokens  {cost_str}{_C.RESET}")
+
+    _write_extract_toml(paper_dir, usage=total_usage,
+                        num_problems=len(problems))
+
+    if not problems:
+        (problems_dir / "none.txt").write_text(
+            "No open problems found in this paper.\n"
+        )
 
 
 def cmd_extract(args):
@@ -687,7 +794,8 @@ def cmd_extract(args):
     if not paper_dir.exists():
         print(f"Error: paper directory not found: {paper_dir}")
         return 1
-    extract_paper(paper_dir, args.model, force=args.force)
+    extract_paper(paper_dir, args.model, force=args.force,
+                  max_retries=args.retries)
 
 
 def cmd_extract_all(args):
@@ -703,13 +811,15 @@ def cmd_extract_all(args):
     )
     if args.max is not None:
         paper_dirs = paper_dirs[:args.max]
-    print(f"Processing {len(paper_dirs)} paper(s) from {data_dir}")
+    print(f"{_C.BOLD}Extracting from {len(paper_dirs)} paper(s){_C.RESET}  "
+          f"{_C.DIM}model: {args.model}{_C.RESET}")
 
     for paper_dir in paper_dirs:
         try:
-            extract_paper(paper_dir, args.model, force=args.force)
+            extract_paper(paper_dir, args.model, force=args.force,
+                          max_retries=args.retries)
         except Exception as e:
-            print(f"  ERROR on {paper_dir.name}: {e}")
+            print(f"  {_C.RED}ERROR: {e}{_C.RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +857,10 @@ def main():
         "--force", action="store_true",
         help="Overwrite existing extraction results",
     )
+    ex.add_argument(
+        "--retries", type=int, default=2,
+        help="Max LLM retries to fix LaTeX errors (default: 2)",
+    )
 
     # extract-all
     ea = sub.add_parser(
@@ -764,6 +878,10 @@ def main():
     ea.add_argument(
         "--max", type=int, default=None,
         help="Max papers to extract (default: all)",
+    )
+    ea.add_argument(
+        "--retries", type=int, default=2,
+        help="Max LLM retries to fix LaTeX errors (default: 2)",
     )
 
     args = parser.parse_args()
