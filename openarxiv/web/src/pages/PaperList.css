@@ -1,15 +1,7 @@
-.paper-list-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
-  margin-bottom: var(--space-md);
-  flex-wrap: wrap;
-}
-
 .paper-list-stats {
   font-size: 13px;
   color: var(--color-text-muted);
+  margin-bottom: var(--space-sm);
 }
 
 .paper-list-cost {
@@ -17,24 +9,76 @@
   font-weight: 500;
 }
 
-.paper-list-toggle {
-  font-size: 13px;
-  color: var(--color-text-secondary);
+.paper-list-toolbar {
   display: flex;
   align-items: center;
-  gap: var(--space-xs);
-  cursor: pointer;
-  user-select: none;
-}
-
-.paper-list-toggle input {
-  accent-color: var(--color-accent);
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-bottom: var(--space-lg);
 }
 
 .paper-list-count {
   font-size: 13px;
   color: var(--color-text-muted);
-  margin-bottom: var(--space-lg);
+}
+
+.paper-list-toggle {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+}
+
+.paper-list-toggle:hover {
+  color: var(--color-text-secondary);
+}
+
+.toggle-track {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  background: var(--color-border);
+  border-radius: 9px;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.paper-list-toggle--active .toggle-track {
+  background: var(--color-accent);
+}
+
+.paper-list-toggle--active .toggle-knob {
+  transform: translateX(14px);
+}
+
+/* Card list with loading state */
+
+.paper-list-cards {
+  transition: opacity 0.15s;
+}
+
+.paper-list-cards--loading {
+  opacity: 0.4;
+  pointer-events: none;
 }
 
 /* Paper card */

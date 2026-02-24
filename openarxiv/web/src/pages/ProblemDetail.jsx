@@ -51,7 +51,7 @@ export default function ProblemDetail() {
       <section className="problem-detail-section">
         <h2>Statement</h2>
         <div className="problem-detail-content">
-          <MathMarkdown>{problem.statement}</MathMarkdown>
+          <MathMarkdown references={problem.references}>{problem.statement}</MathMarkdown>
         </div>
       </section>
 
@@ -59,7 +59,7 @@ export default function ProblemDetail() {
         <section className="problem-detail-section">
           <h2>Context</h2>
           <div className="problem-detail-content">
-            <MathMarkdown>{problem.context}</MathMarkdown>
+            <MathMarkdown references={problem.references}>{problem.context}</MathMarkdown>
           </div>
         </section>
       )}
@@ -69,7 +69,7 @@ export default function ProblemDetail() {
           <h2>References</h2>
           <ol className="problem-detail-refs">
             {problem.references.map((ref, i) => (
-              <li key={i}>
+              <li key={i} id={`ref-${ref.tag}`}>
                 <span className="problem-detail-ref-tag">[{ref.tag}]</span>{' '}
                 <MathMarkdown className="problem-detail-ref-text">{ref.text}</MathMarkdown>
               </li>

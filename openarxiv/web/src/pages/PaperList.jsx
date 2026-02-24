@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useTransition } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useData } from '../hooks/useData'
 import ProblemSummary from '../components/ProblemSummary'
@@ -63,38 +63,44 @@ export default function PaperList() {
     return papers.filter(p => p.problems.length > 0)
   }, [papers, filterProblems])
 
+  const [isPending, startTransition] = useTransition()
+
   const toggle = () => {
-    if (filterProblems) {
-      searchParams.delete('filter')
-    } else {
-      searchParams.set('filter', 'problems')
-    }
-    setSearchParams(searchParams)
+    startTransition(() => {
+      if (filterProblems) {
+        searchParams.delete('filter')
+      } else {
+        searchParams.set('filter', 'problems')
+      }
+      setSearchParams(searchParams)
+    })
   }
 
   return (
     <div className="paper-list">
+      <div className="paper-list-stats">
+        {stats.total_papers} papers &middot; {stats.papers_with_problems} with problems &middot; {stats.total_problems} problems &middot; <span className="paper-list-cost">{stats.total_cost} total</span>
+      </div>
+
       <div className="paper-list-toolbar">
-        <div className="paper-list-stats">
-          {stats.total_papers} papers &middot; {stats.papers_with_problems} with problems &middot; {stats.total_problems} problems &middot; <span className="paper-list-cost">{stats.total_cost} total</span>
+        <div className="paper-list-count">
+          Showing {filtered.length} paper{filtered.length !== 1 ? 's' : ''}
         </div>
-        <label className="paper-list-toggle">
-          <input
-            type="checkbox"
-            checked={filterProblems}
-            onChange={toggle}
-          />
+        <button
+          className={`paper-list-toggle${filterProblems ? ' paper-list-toggle--active' : ''}`}
+          onClick={toggle}
+          type="button"
+        >
+          <span className="toggle-track"><span className="toggle-knob" /></span>
           Only with problems
-        </label>
+        </button>
       </div>
 
-      <div className="paper-list-count">
-        Showing {filtered.length} paper{filtered.length !== 1 ? 's' : ''}
+      <div className={`paper-list-cards${isPending ? ' paper-list-cards--loading' : ''}`}>
+        {filtered.map(paper => (
+          <PaperCard key={paper.id} paper={paper} />
+        ))}
       </div>
-
-      {filtered.map(paper => (
-        <PaperCard key={paper.id} paper={paper} />
-      ))}
     </div>
   )
 }

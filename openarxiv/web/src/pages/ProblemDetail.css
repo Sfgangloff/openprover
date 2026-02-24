@@ -104,6 +104,27 @@
   margin: 0;
 }
 
+/* Reference links */
+
+.ref-link {
+  color: var(--color-accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.ref-link:hover {
+  text-decoration: underline;
+}
+
+.problem-detail-refs li.ref-highlight {
+  animation: ref-flash 1.5s ease-out;
+}
+
+@keyframes ref-flash {
+  0% { background: var(--color-accent-light); }
+  100% { background: transparent; }
+}
+
 /* Navigation */
 
 .problem-nav {

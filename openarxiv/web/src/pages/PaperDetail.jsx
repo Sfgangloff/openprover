@@ -1,6 +1,7 @@
 import { useParams, Link } from 'react-router-dom'
 import { usePaper } from '../hooks/useData'
 import ProblemSummary from '../components/ProblemSummary'
+import MathMarkdown from '../components/MathMarkdown'
 import CostBadge from '../components/CostBadge'
 import './PaperDetail.css'
 
@@ -38,7 +39,7 @@ export default function PaperDetail() {
 
       <section className="paper-detail-abstract">
         <h2>Abstract</h2>
-        <p>{paper.abstract}</p>
+        <MathMarkdown>{paper.abstract}</MathMarkdown>
       </section>
 
       {ext && (
