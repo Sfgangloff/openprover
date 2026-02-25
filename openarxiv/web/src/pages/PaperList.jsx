@@ -36,7 +36,7 @@ function PaperCard({ paper, query }) {
       </div>
 
       <div className="paper-card-meta">
-        <span className="paper-card-authors">{paper.authors.join(', ')}</span>
+        <span className="paper-card-authors"><Highlight text={paper.authors.join(', ')} query={query} /></span>
         <span className="paper-card-sep">&middot;</span>
         <span className="paper-card-date">{formatDate(paper.published)}</span>
         {paper.categories.map(cat => (
@@ -86,6 +86,7 @@ export default function PaperList() {
     if (deferredQuery) {
       const q = deferredQuery.toLowerCase()
       result = result.filter(p =>
+        p.id.toLowerCase().includes(q) ||
         p.title.toLowerCase().includes(q) ||
         p.authors.some(a => a.toLowerCase().includes(q)) ||
         p.problems.some(prob => prob.name.toLowerCase().includes(q))
