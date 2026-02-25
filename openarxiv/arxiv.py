@@ -388,8 +388,20 @@ def call_llm(messages: list[dict], model: str) -> dict:
     resp.raise_for_status()
     data = resp.json()
 
+    if "error" in data:
+        raise RuntimeError(f"OpenRouter API error: {data['error']}")
+
+    if not data.get("choices"):
+        raise RuntimeError(f"No choices in API response: {data}")
+
     message = data["choices"][0]["message"]
-    content = message["content"]
+    content = message.get("content") or ""
+
+    if not content.strip():
+        raise RuntimeError(
+            f"Empty response from model (finish_reason="
+            f"{data['choices'][0].get('finish_reason', 'unknown')})"
+        )
     reasoning = message.get("reasoning")
     usage_raw = data.get("usage", {})
     usage = {
@@ -733,10 +745,26 @@ def extract_paper(paper_dir: Path, model: str, force: bool = False,
     max_attempts = 1 + retries
     last_error = None
     attempt = 0
+    _empty_usage = {"model": model, "prompt_tokens": 0,
+                    "completion_tokens": 0, "total_tokens": 0, "cost": None}
+    result = {"content": "", "reasoning": None, "usage": _empty_usage}
 
     for attempt in range(max_attempts):
         call_dir = llm_calls_dir / f"{attempt:03d}"
-        result = call_llm(messages, model)
+        try:
+            result = call_llm(messages, model)
+        except RuntimeError as e:
+            last_error = str(e)
+            remaining = max_attempts - attempt - 1
+            if remaining > 0:
+                print(f"    {_C.YELLOW}LLM error (retrying, "
+                      f"{remaining} attempt{'s' if remaining != 1 else ''} "
+                      f"left): {e}{_C.RESET}")
+                continue
+            else:
+                print(f"    {_C.RED}LLM error (no retries left): {e}{_C.RESET}")
+                problems = []
+                break
         _save_llm_call(call_dir, result, prompt if attempt == 0 else None)
 
         try:
@@ -835,7 +863,14 @@ def extract_paper(paper_dir: Path, model: str, force: bool = False,
 
             attempt += 1
             call_dir = llm_calls_dir / f"{attempt:03d}"
-            result = call_llm(messages, model)
+            try:
+                result = call_llm(messages, model)
+            except RuntimeError as e:
+                last_error = str(e)
+                print(f"    {_C.RED}LLM error during "
+                      f"refinement: {e}{_C.RESET}")
+                problems = []
+                break
             _save_llm_call(call_dir, result)
 
             try:
