@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 runs/
 *.pyc
+openarxiv/data/
+openarxiv/data.bak/
+openarxiv/node_modules/
