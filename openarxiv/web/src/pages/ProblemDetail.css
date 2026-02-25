@@ -40,8 +40,14 @@
   margin-bottom: var(--space-md);
 }
 
-.problem-detail-section-header h2 {
+.problem-detail-section-header:has(+ .problem-detail-loc) {
   margin-bottom: 0;
+}
+
+.problem-detail-section-header + .problem-detail-loc {
+  display: inline-block;
+  margin-top: var(--space-xs);
+  margin-bottom: var(--space-md);
 }
 
 .problem-detail-actions {
@@ -149,6 +155,10 @@
   letter-spacing: 0.5px;
   color: var(--color-text-muted);
   margin-bottom: var(--space-md);
+}
+
+.problem-detail-section-header h2 {
+  margin-bottom: 0;
 }
 
 .problem-detail-content {

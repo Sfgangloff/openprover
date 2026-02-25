@@ -65,7 +65,6 @@ export default function ProblemDetail() {
       <h1 className="problem-detail-title">{problem.name}</h1>
 
       <div className="problem-detail-meta">
-        {problem.location && <span className="problem-detail-loc">{problem.location}</span>}
         {ext && <CostBadge cost={ext.cost} />}
         <span className="problem-detail-counter">{index + 1} / {total}</span>
       </div>
@@ -88,6 +87,7 @@ export default function ProblemDetail() {
             </label>
           </div>
         </div>
+        {problem.location && <span className="problem-detail-loc">{problem.location}</span>}
         <div className="problem-detail-content">
           {raw
             ? <pre className="problem-detail-raw">{problem.statement}</pre>
