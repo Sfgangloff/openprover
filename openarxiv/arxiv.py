@@ -6,6 +6,7 @@ import gzip
 import io
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 import tomllib
@@ -570,6 +571,8 @@ def extract_paper(paper_dir: Path, model: str, force: bool = False,
         return
 
     llm_calls_dir = paper_dir / "llm_calls"
+    if force and llm_calls_dir.exists():
+        shutil.rmtree(llm_calls_dir)
     llm_calls_dir.mkdir(exist_ok=True)
 
     prompt = build_prompt(source_dir)
@@ -642,15 +645,19 @@ def extract_paper(paper_dir: Path, model: str, force: bool = False,
 
 
 def cmd_extract(args):
-    """Extract open problems from a single paper."""
+    """Extract open problems from one or more papers."""
     data_dir = Path(args.data_dir)
-    paper_id = args.arxiv_id.replace("/", "_")
-    paper_dir = data_dir / paper_id
-    if not paper_dir.exists():
-        print(f"Error: paper directory not found: {paper_dir}")
-        return 1
-    extract_paper(paper_dir, args.model, force=args.force,
-                  retries=args.retries)
+    for arxiv_id in args.arxiv_id:
+        paper_id = arxiv_id.replace("/", "_")
+        paper_dir = data_dir / paper_id
+        if not paper_dir.exists():
+            print(f"Error: paper directory not found: {paper_dir}")
+            continue
+        try:
+            extract_paper(paper_dir, args.model, force=args.force,
+                          retries=args.retries)
+        except Exception as e:
+            print(f"  {_C.RED}ERROR: {e}{_C.RESET}")
 
 
 def cmd_extract_all(args):
@@ -703,7 +710,7 @@ def main():
     ex = sub.add_parser(
         "extract", help="Extract open problems from a single paper",
     )
-    ex.add_argument("arxiv_id", help="ArXiv paper ID (e.g. 2506.12345)")
+    ex.add_argument("arxiv_id", nargs="+", help="ArXiv paper ID(s) (e.g. 2506.12345)")
     ex.add_argument(
         "--model", default="z-ai/glm-5",
         help="OpenRouter model (default: z-ai/glm-5)",
