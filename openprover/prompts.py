@@ -202,6 +202,9 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "# Action-specific fields below (include only what's relevant)\n"
         "```\n"
         "\n"
+        "Whiteboard rule: include a complete `whiteboard` field on every step except for step 1, "
+        "including terminal actions like `proof_found` and `submit_lean_proof`.\n"
+        "\n"
         "### Action-specific TOML fields:\n"
         "\n"
         f"{toml_fields}"
@@ -269,25 +272,73 @@ def format_search_prompt(query: str, context: str) -> str:
 
 
 def format_initial_whiteboard(theorem: str, mode: str = "prove") -> str:
-    goal = theorem.strip()
+    theorem_text = theorem.strip()
     if mode == "prove_and_formalize":
-        goal += (
-            "\n\n**Mode: Prove and Formalize**\n"
-            "Produce both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean).\n"
-            "Formal statement available - use read_theorem to view THEOREM.lean."
-        )
-    elif mode == "formalize_only":
-        goal += (
-            "\n\n**Mode: Formalize Only**\n"
-            "An informal proof is provided. Formalize it in Lean 4 (produce PROOF.lean).\n"
-            "Use read_theorem to view PROOF.md and THEOREM.lean."
-        )
-    return (
-        f"## Goal\n\n{goal}\n\n"
-        "## Strategy\n\nTBD — spawn workers to analyze.\n\n"
-        "## Status\n\nStarting.\n\n"
-        "## Tried\n\n(none)\n"
-    )
+        return f"""## Goal
+
+{theorem_text}
+
+**Mode: Prove and Formalize**
+Produce both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean).
+Formal statement available - use read_theorem to view THEOREM.lean.
+
+## Strategy
+
+TBD — spawn workers to analyze.
+
+## Status
+
+Starting.
+
+- [ ] Find a proof in English (PROOF.md).
+- [ ] Formalize the proof in Lean (PROOF.lean).
+
+## Tried
+
+(none)
+"""
+    if mode == "formalize_only":
+        return f"""## Goal
+
+{theorem_text}
+
+**Mode: Formalize Only**
+An informal proof is provided. Formalize it in Lean 4 (produce PROOF.lean).
+Use read_theorem to view PROOF.md and THEOREM.lean.
+
+## Strategy
+
+TBD — spawn workers to analyze.
+
+## Status
+
+Starting.
+
+## Tried
+
+(none)
+"""
+    return f"""## Goal
+
+{theorem_text}
+
+**Mode: Prove Only**
+Produce an informal proof (PROOF.md).
+
+## Strategy
+
+TBD — spawn workers to analyze.
+
+## Status
+
+Starting.
+
+- [ ] Find a proof in English (PROOF.md).
+
+## Tried
+
+(none)
+"""
 
 
 def format_discussion_prompt(
