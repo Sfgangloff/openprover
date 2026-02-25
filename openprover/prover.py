@@ -312,56 +312,103 @@ class Prover:
             parallelism=self.parallelism,
         )
 
-        # Planner LLM call
-        self.tui.stream_start("planning", tab="planner")
-        try:
-            resp = self.planner_llm.call(
-                prompt=prompt,
-                system_prompt=prompts.planner_system_prompt(
-                    isolation=self.isolation,
-                    allow_give_up=self.step_num >= self.max_steps * self.give_up_ratio,
-                    lean_mode=self.mode,
-                    num_sorries=self.lean_theorem.num_sorries if self.lean_theorem else 0,
-                ),
-                label=f"planner_step_{self.step_num}",
-                stream_callback=self._stream_cb("planner"),
-                archive_path=step_dir / "planner_call.json",
-            )
-        except Interrupted:
-            self.tui.stream_end(tab="planner")
-            logger.info("Planner interrupted")
-            return self._handle_interrupt(step_dir)
-        except RuntimeError as e:
-            self.tui.stream_end(tab="planner")
-            logger.error("Planner error: %s", e)
-            self.tui.log(f"Error: {e}", color="red")
-            self._save_step_meta(step_dir, status="llm_error", error=str(e))
-            return "continue"
-        self.tui.stream_end(tab="planner")
-        logger.info("Planner: %dms $%.4f",
-                     resp.get("duration_ms", 0), resp.get("cost", 0))
+        # Planner LLM call (with up to 2 retries on parse failure)
+        MAX_PARSE_RETRIES = 2
+        system_prompt = prompts.planner_system_prompt(
+            isolation=self.isolation,
+            allow_give_up=self.step_num >= self.max_steps * self.give_up_ratio,
+            lean_mode=self.mode,
+            num_sorries=self.lean_theorem.num_sorries if self.lean_theorem else 0,
+            step_num=self.step_num,
+        )
+        plan = None
+        parse_error = ""
+        last_resp = None
 
-        # Parse TOML decision
-        plan = prompts.parse_planner_toml(resp["result"])
+        for attempt in range(MAX_PARSE_RETRIES + 1):
+            if attempt > 0:
+                call_prompt = prompts.format_planner_retry(
+                    original_prompt=prompt,
+                    raw_output=last_resp["result"],
+                    error=parse_error,
+                    attempt=attempt,
+                )
+            else:
+                call_prompt = prompt
+
+            retry_suffix = "" if attempt == 0 else f"_retry_{attempt}"
+            label = "planning" if attempt == 0 else f"retrying ({attempt}/{MAX_PARSE_RETRIES})"
+            self.tui.stream_start(label, tab="planner")
+            try:
+                resp = self.planner_llm.call(
+                    prompt=call_prompt,
+                    system_prompt=system_prompt,
+                    label=f"planner_step_{self.step_num}{retry_suffix}",
+                    stream_callback=self._stream_cb("planner"),
+                    archive_path=step_dir / f"planner_call{retry_suffix}.json",
+                )
+            except Interrupted:
+                self.tui.stream_end(tab="planner")
+                logger.info("Planner interrupted")
+                return self._handle_interrupt(step_dir)
+            except RuntimeError as e:
+                self.tui.stream_end(tab="planner")
+                logger.error("Planner error: %s", e)
+                self.tui.log(f"Error: {e}", color="red")
+                self._save_step_meta(step_dir, status="llm_error", error=str(e))
+                return "continue"
+            self.tui.stream_end(tab="planner")
+            last_resp = resp
+            logger.info("Planner: %dms $%.4f",
+                         resp.get("duration_ms", 0), resp.get("cost", 0))
+
+            # Parse TOML decision
+            plan = prompts.parse_planner_toml(resp["result"])
+            if plan is None:
+                parse_error = (
+                    "Failed to parse TOML output. Your response must end with "
+                    "a ```toml code block containing action = \"...\" and other required fields."
+                )
+                remaining = MAX_PARSE_RETRIES - attempt
+                self.tui.log(
+                    f"Failed to parse planner output — "
+                    f"{'retrying' if remaining else 'giving up'}...",
+                    color="red",
+                )
+                logger.info("Parse error (attempt %d/%d)", attempt + 1, MAX_PARSE_RETRIES + 1)
+                continue
+
+            # Whiteboard: required on step 2+, optional on step 1
+            if not plan.get("whiteboard") and self.step_num > 1:
+                parse_error = (
+                    "TOML block parsed but missing required 'whiteboard' field. "
+                    'You must include whiteboard = """...""" with the full updated whiteboard.'
+                )
+                remaining = MAX_PARSE_RETRIES - attempt
+                self.tui.log(
+                    f"Planner output missing whiteboard — "
+                    f"{'retrying' if remaining else 'giving up'}...",
+                    color="red",
+                )
+                plan = None
+                continue
+
+            break  # success
+
         if plan is None:
-            self.tui.log("Failed to parse planner output — retrying...", color="red")
-            self._save_step_meta(step_dir, status="parse_error", resp=resp,
-                                 error="Failed to parse planner TOML output")
+            self._save_step_meta(step_dir, status="parse_error", resp=last_resp,
+                                 error=parse_error)
             return "continue"
 
         action = plan.get("action", "")
         summary = plan.get("summary", "")
         logger.info("Action: %s — %s", action, summary)
 
-        # Update whiteboard (required every step)
-        if not plan.get("whiteboard"):
-            self.tui.log("Planner output missing whiteboard — retrying...", color="red")
-            self._save_step_meta(step_dir, status="parse_error", resp=resp,
-                                 error="Missing whiteboard in planner output")
-            return "continue"
-        self.whiteboard = plan["whiteboard"]
-        (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
-        self.tui.whiteboard = self.whiteboard
+        # Update whiteboard (use if provided, keep current otherwise)
+        if plan.get("whiteboard"):
+            self.whiteboard = plan["whiteboard"]
+            (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
+            self.tui.whiteboard = self.whiteboard
 
         # Log step in planner tab
         self.tui.step_complete(

@@ -26,7 +26,8 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 _TQ = '"""'  # triple-quote for embedding in prompts
 
 def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True,
-                          lean_mode: str = "prove", num_sorries: int = 0) -> str:
+                          lean_mode: str = "prove", num_sorries: int = 0,
+                          step_num: int = 1) -> str:
     """Build the planner system prompt, conditionally omitting actions."""
     has_lean = lean_mode in ("prove_and_formalize", "formalize_only")
 
@@ -74,6 +75,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         principles += (
             "- A formal Lean 4 proof (PROOF.lean) is also required. The session ends only when BOTH proof_found AND submit_lean_proof succeed.\n"
             "- Use write_items with format=\"lean\" to test Lean snippets (they get auto-verified by `lake env lean`).\n"
+            "- After you found a proof in English, use the read_theorem action to see the formal theorem statement in Lean."
             "- Use submit_lean_proof for the final formal proof submission.\n"
         )
     elif lean_mode == "formalize_only":
@@ -139,7 +141,8 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
 
 
     return (
-        "You are a senior research mathematician coordinating a proof effort. Don't do any low-level math yourself - delegate that to workers."
+        "You are a senior research mathematician coordinating a proof effort."
+        "Important: Don't do any math yourself - delegate that to workers."
         "You manage a whiteboard and a repository of useful items, and you delegate mathematical work to workers.\n"
         "\n"
         "## Your Role\n"
@@ -186,7 +189,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         'action = "spawn"\n'
         'summary = "One-line description for the log"\n'
         f"whiteboard = {_TQ}\n"
-        f"Updated whiteboard (COMPLETE, replaces previous)\n"
+        f"Updated whiteboard {'(optional on first step)' if step_num == 1 else '(REQUIRED — COMPLETE, replaces previous)'}\n"
         f"{_TQ}\n"
         "\n"
         "# Action-specific fields below (include only what's relevant)\n"
@@ -264,7 +267,7 @@ def format_initial_whiteboard(theorem: str, mode: str = "prove") -> str:
         goal += (
             "\n\n**Mode: Prove and Formalize**\n"
             "Produce both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean).\n"
-            "Formal statement available — use read_theorem to view THEOREM.lean."
+            "Formal statement available - use read_theorem to view THEOREM.lean."
         )
     elif mode == "formalize_only":
         goal += (
@@ -302,6 +305,29 @@ def format_discussion_prompt(
         "open gaps, recommendations. Use $ and $$ for math."
     )
     return "".join(parts)
+
+
+# ── Planner retry ──────────────────────────────────────────
+
+def format_planner_retry(
+    original_prompt: str,
+    raw_output: str,
+    error: str,
+    attempt: int,
+) -> str:
+    """Build a retry prompt with error feedback appended to the original."""
+    excerpt = raw_output[-500:] if len(raw_output) > 500 else raw_output
+    if len(raw_output) > 500:
+        excerpt = "..." + excerpt
+    return (
+        f"{original_prompt}\n\n"
+        f"---\n\n"
+        f"**RETRY ({attempt}/2)** — Your previous response could not be parsed.\n\n"
+        f"Error: {error}\n\n"
+        f"Your previous output ended with:\n"
+        f"```\n{excerpt}\n```\n\n"
+        f"Please respond again with a valid ```toml decision block."
+    )
 
 
 # ── TOML parser ─────────────────────────────────────────────
