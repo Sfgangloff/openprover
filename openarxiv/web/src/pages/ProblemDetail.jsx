@@ -1,29 +1,55 @@
-import { useEffect } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useProblem, useAdjacentProblems } from '../hooks/useData'
 import MathMarkdown from '../components/MathMarkdown'
 import CostBadge from '../components/CostBadge'
 import '../components/MathMarkdown.css'
 import './ProblemDetail.css'
 
+function DownloadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 2v8m0 0l-3-3m3 3l3-3M3 12h10" />
+    </svg>
+  )
+}
+
 export default function ProblemDetail() {
   const { paperId, problemId } = useParams()
+  const navigate = useNavigate()
   const { paper, problem } = useProblem(paperId, problemId)
   const { prev, next, index, total } = useAdjacentProblems(paperId, problemId)
+  const [raw, setRaw] = useState(false)
+
+  const downloadPrompt = useCallback(() => {
+    const parts = [`Prove the following conjecture.\n`]
+    parts.push(`## ${problem.name}\n`)
+    parts.push(problem.statement)
+    if (problem.context) {
+      parts.push(`\n\n### Context\n\n${problem.context}`)
+    }
+    const blob = new Blob([parts.join('\n')], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${problem.name.replace(/[^a-zA-Z0-9]+/g, '_')}.txt`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [problem])
 
   // Keyboard navigation
   useEffect(() => {
     function onKey(e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
       if (e.key === 'ArrowLeft' && prev) {
-        window.location.href = `/paper/${prev.paper.id}/problem/${prev.problem.id}`
+        navigate(`/paper/${prev.paper.id}/problem/${prev.problem.id}`)
       } else if (e.key === 'ArrowRight' && next) {
-        window.location.href = `/paper/${next.paper.id}/problem/${next.problem.id}`
+        navigate(`/paper/${next.paper.id}/problem/${next.problem.id}`)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [prev, next])
+  }, [prev, next, navigate])
 
   // Scroll to top on navigation
   useEffect(() => { window.scrollTo(0, 0) }, [problemId])
@@ -49,9 +75,23 @@ export default function ProblemDetail() {
       )}
 
       <section className="problem-detail-section">
-        <h2>Statement</h2>
+        <div className="problem-detail-section-header">
+          <h2>Statement</h2>
+          <div className="problem-detail-actions">
+            <button className="problem-detail-download" onClick={downloadPrompt} title="Download as prompt">
+              <DownloadIcon /> Prompt
+            </button>
+            <label className="problem-detail-toggle">
+              <span className="problem-detail-toggle-label">Raw</span>
+              <input type="checkbox" checked={raw} onChange={() => setRaw(r => !r)} />
+              <span className="problem-detail-toggle-track" />
+            </label>
+          </div>
+        </div>
         <div className="problem-detail-content">
-          <MathMarkdown references={problem.references}>{problem.statement}</MathMarkdown>
+          {raw
+            ? <pre className="problem-detail-raw">{problem.statement}</pre>
+            : <MathMarkdown key={problemId} references={problem.references}>{problem.statement}</MathMarkdown>}
         </div>
       </section>
 
@@ -59,7 +99,9 @@ export default function ProblemDetail() {
         <section className="problem-detail-section">
           <h2>Context</h2>
           <div className="problem-detail-content">
-            <MathMarkdown references={problem.references}>{problem.context}</MathMarkdown>
+            {raw
+              ? <pre className="problem-detail-raw">{problem.context}</pre>
+              : <MathMarkdown key={`ctx-${problemId}`} references={problem.references}>{problem.context}</MathMarkdown>}
           </div>
         </section>
       )}
@@ -71,7 +113,7 @@ export default function ProblemDetail() {
             {problem.references.map((ref, i) => (
               <li key={i} id={`ref-${ref.tag}`}>
                 <span className="problem-detail-ref-tag">[{ref.tag}]</span>{' '}
-                <MathMarkdown className="problem-detail-ref-text">{ref.text}</MathMarkdown>
+                <MathMarkdown key={`ref-${problemId}-${i}`} className="problem-detail-ref-text">{ref.text}</MathMarkdown>
               </li>
             ))}
           </ol>
