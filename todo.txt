@@ -236,3 +236,41 @@ Look at the sorries and messages.
 When the REPL terminates, print a warning and restart it (for up to 3 times - then terminate the proof search).
 
 ------
+
+
+In openarxiv/, implement a script for obtaining open research theorems from
+combinatorics from ArXiv.
+
+- download papers from combinatorics section, starting from the newest
+
+- when downloading a paper, create a subdir for it, and to it: the source code
+(from https://arxiv.org/e-print/<arxiv_id>, then extracted with the original
+archive removed), metadata (a TOML file)
+
+- create an LLM prompt by concatenating all the files, also specifying the paths
+(take inspiration from https://pypi.org/project/repo-to-prompt/, but do it
+yourself - it's easy). And ask the LLM to parse out and output all open problems
+introduced (and not solved) in the paper.
+
+- for each open problem, we need: name, id (generated automatically as a slug of
+the name), summary (short TLDR - max 1-2 sentences, very compact brief
+language), statement (full LaTex statement from the paper), context (all
+relevant context from the paper needed to understand the statement - only from
+the paper, not from other papers), references (list of references, each one has
+a tag and the string), images (just list of names).  Both the statement and the
+context can contain the references and images (with \cite(p|t) or
+\includegraphics) (but only include truly relevant references and images). Each
+reference/image mentioned in the context or statement has to be included in the
+list. Clean up all latex code to be standalone. It's OK for a paper to not
+contain any open problem, or to contain more than one.
+
+- if possible, use some simple format like TOML on the LLM output
+
+- store the prompt in the paper directory so that I can inspect it
+
+- use openrouter to call the LLM to extract the open problems
+
+- store the open problems in the paper subdir, in problems/ subdir, one per file
+
+- it should be a single script using argparse. It should have actions for
+starting papers download, for extracting problems from a single paper, and for running the extraction for all downloaded papers
