@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Serve lm-provers/QED-Nano on multiple GPUs with simple load balancing.
+"""Serve HuggingFace models on multiple GPUs with simple load balancing.
 
-Loads one model replica per GPU and exposes an OpenAI-compatible API
-at /v1/chat/completions (streaming and non-streaming) and /v1/models.
+Loads model replicas across GPUs (potentially different models on different
+GPU subsets) and exposes an OpenAI-compatible API at /v1/chat/completions
+(streaming and non-streaming) and /v1/models.
+
+Usage:
+    # Single model on 8 GPUs (backward compatible):
+    python serve_hf.py --model lm-provers/QED-Nano:8
+
+    # Two models on different GPU subsets:
+    python serve_hf.py --model lm-provers/QED-Nano:4 --model Qwen/Qwen3-4B-Thinking-2507:4
 """
 
 import argparse
@@ -170,7 +178,7 @@ class CancelBatchCriteria(StoppingCriteria):
 # Request batch item for generation scheduling.
 BatchItem = namedtuple(
     "BatchItem",
-    ["messages", "max_output_tokens", "temperature", "top_p", "max_thinking_tokens"],
+    ["model", "messages", "max_output_tokens", "temperature", "top_p", "max_thinking_tokens"],
 )
 
 
@@ -181,6 +189,7 @@ class Worker:
 
     def __init__(self, gpu_id: int, model_name: str, dtype: torch.dtype, tokenizer):
         self.gpu_id = gpu_id
+        self.model_name = model_name
         self.device = f"cuda:{gpu_id}"
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
@@ -415,8 +424,8 @@ class ActiveBatchState:
 class BatchScheduler:
     """Dynamic batching scheduler with timeout and batch-size triggers."""
 
-    def __init__(self, workers: list[Worker], batch_size: int, batch_timeout_s: float, verbose: bool = False):
-        self.workers = workers
+    def __init__(self, workers_by_model: dict[str, list[Worker]], batch_size: int, batch_timeout_s: float, verbose: bool = False):
+        self.workers_by_model = workers_by_model
         self.batch_size = batch_size
         self.batch_timeout_s = batch_timeout_s
         self.verbose = verbose
@@ -428,8 +437,8 @@ class BatchScheduler:
 
     @staticmethod
     def _config_key(batch_item: BatchItem) -> tuple:
-        """Get generation config key for grouping requests."""
-        return (batch_item.max_output_tokens, batch_item.temperature,
+        """Get generation config key for grouping requests (model + gen params)."""
+        return (batch_item.model, batch_item.max_output_tokens, batch_item.temperature,
                 batch_item.top_p, batch_item.max_thinking_tokens)
 
     def enqueue(self, batch_item: BatchItem) -> PendingRequest:
@@ -460,83 +469,97 @@ class BatchScheduler:
                 if not self.pending_queue:
                     continue
 
-                # Find free workers
-                free_workers = []
-                for w in self.workers:
-                    with w.state_lock:
-                        if w.active_requests == 0:
-                            free_workers.append(w)
-                
-                if not free_workers:
+                # Find free workers grouped by model
+                free_workers_by_model = {}
+                for model_name, workers in self.workers_by_model.items():
+                    for w in workers:
+                        with w.state_lock:
+                            if w.active_requests == 0:
+                                free_workers_by_model.setdefault(model_name, []).append(w)
+
+                if not free_workers_by_model:
                     # No free workers, wait a bit before checking again
                     self.queue_lock.wait(timeout=0.05)
                     continue
 
                 dispatched_any = False
 
-                # Dispatch batches to free workers
-                for worker in free_workers:
-                    # Reserve this worker. It may have been claimed since we built free_workers.
-                    with worker.state_lock:
-                        if worker.active_requests != 0:
-                            continue
-                        worker.active_requests += 1
+                # Group pending requests by config key (includes model)
+                config_groups = {}
+                for req in self.pending_queue:
+                    key = self._config_key(req.batch_item)
+                    config_groups.setdefault(key, []).append(req)
 
-                    # Keep queue clean while looping workers.
-                    self.pending_queue = [req for req in self.pending_queue if not req.is_cancelled()]
-                    if not self.pending_queue:
+                # Try to dispatch batches to free workers
+                for model_name, free_workers in free_workers_by_model.items():
+                    for worker in free_workers:
+                        # Reserve this worker
                         with worker.state_lock:
-                            worker.active_requests -= 1
-                        break
+                            if worker.active_requests != 0:
+                                continue
+                            worker.active_requests += 1
 
-                    # Recompute groups each dispatch so we never use stale references.
-                    config_groups = {}
-                    for req in self.pending_queue:
-                        key = self._config_key(req.batch_item)
-                        if key not in config_groups:
-                            config_groups[key] = []
-                        config_groups[key].append(req)
-
-                    oldest_req = self.pending_queue[0]
-                    oldest_wait = time.time() - oldest_req.enqueue_time
-
-                    batch_requests = None
-
-                    # Priority 1: Full batch available for any config
-                    for key, group in config_groups.items():
-                        if len(group) >= self.batch_size:
-                            batch_requests = group[:self.batch_size]
+                        # Clean queue
+                        self.pending_queue = [req for req in self.pending_queue if not req.is_cancelled()]
+                        if not self.pending_queue:
+                            with worker.state_lock:
+                                worker.active_requests -= 1
                             break
 
-                    # Priority 2: Timeout trigger - batch oldest request's config group
-                    if not batch_requests and oldest_wait and oldest_wait >= self.batch_timeout_s:
-                        oldest_key = self._config_key(oldest_req.batch_item)
-                        if oldest_key in config_groups:
-                            group = config_groups[oldest_key]
-                            batch_requests = group[:min(self.batch_size, len(group))]
+                        # Recompute groups for this model only
+                        model_groups = {}
+                        for req in self.pending_queue:
+                            if req.batch_item.model == model_name:
+                                key = self._config_key(req.batch_item)
+                                model_groups.setdefault(key, []).append(req)
 
-                    if not batch_requests:
-                        with worker.state_lock:
-                            worker.active_requests -= 1
-                        continue
+                        if not model_groups:
+                            with worker.state_lock:
+                                worker.active_requests -= 1
+                            continue
 
-                    # Remove from queue
-                    batch_items = [req.batch_item for req in batch_requests]
-                    for req in batch_requests:
-                        self.pending_queue.remove(req)
+                        # Find oldest request for this model
+                        model_reqs = [req for req in self.pending_queue if req.batch_item.model == model_name]
+                        oldest_req = model_reqs[0] if model_reqs else None
+                        oldest_wait = (time.time() - oldest_req.enqueue_time) if oldest_req else 0
 
-                    # Create batch state to track live requests
-                    batch_state = ActiveBatchState(batch_requests)
+                        batch_requests = None
 
-                    # Dispatch to worker in background thread
-                    dispatched_any = True
-                    if self.verbose:
-                        print(f"[BATCH] Dispatching batch of size {len(batch_items)} to GPU {worker.gpu_id}")
-                    threading.Thread(
-                        target=self._process_batch,
-                        args=(worker, batch_requests, batch_items, batch_state),
-                        daemon=True
-                    ).start()
+                        # Priority 1: Full batch available for any config
+                        for key, group in model_groups.items():
+                            if len(group) >= self.batch_size:
+                                batch_requests = group[:self.batch_size]
+                                break
+
+                        # Priority 2: Timeout trigger
+                        if not batch_requests and oldest_req and oldest_wait >= self.batch_timeout_s:
+                            oldest_key = self._config_key(oldest_req.batch_item)
+                            if oldest_key in model_groups:
+                                group = model_groups[oldest_key]
+                                batch_requests = group[:min(self.batch_size, len(group))]
+
+                        if not batch_requests:
+                            with worker.state_lock:
+                                worker.active_requests -= 1
+                            continue
+
+                        # Remove from queue
+                        batch_items = [req.batch_item for req in batch_requests]
+                        for req in batch_requests:
+                            self.pending_queue.remove(req)
+
+                        # Create batch state to track live requests
+                        batch_state = ActiveBatchState(batch_requests)
+
+                        # Dispatch to worker in background thread
+                        dispatched_any = True
+                        if self.verbose:
+                            print(f"[BATCH] Dispatching batch of size {len(batch_items)} to GPU {worker.gpu_id} ({model_name})")
+                        threading.Thread(
+                            target=self._process_batch,
+                            args=(worker, batch_requests, batch_items, batch_state),
+                            daemon=True
+                        ).start()
 
                 if not dispatched_any and self.pending_queue:
                     oldest_req = self.pending_queue[0]
@@ -608,35 +631,37 @@ class BatchScheduler:
 
 
 class LoadBalancer:
-    """Round-robin worker picker for direct mode."""
+    """Round-robin worker picker for direct mode, model-aware."""
 
-    def __init__(self, workers: list[Worker]):
-        self.workers = workers
-        self._counter = 0
+    def __init__(self, workers_by_model: dict[str, list[Worker]]):
+        self.workers_by_model = workers_by_model
+        self._counters: dict[str, int] = {m: 0 for m in workers_by_model}
         self._lock = threading.Lock()
 
-    def get_worker(self, prefer_free: bool = False) -> Worker:
+    def get_worker(self, model: str, prefer_free: bool = False) -> Worker:
+        workers = self.workers_by_model[model]
         with self._lock:
+            counter = self._counters[model]
             if prefer_free:
-                for offset in range(len(self.workers)):
-                    idx = (self._counter + offset) % len(self.workers)
-                    worker = self.workers[idx]
+                for offset in range(len(workers)):
+                    idx = (counter + offset) % len(workers)
+                    worker = workers[idx]
                     with worker.state_lock:
                         if worker.active_requests == 0:
                             worker.active_requests += 1
-                            self._counter = idx + 1
+                            self._counters[model] = idx + 1
                             return worker
-            worker = self.workers[self._counter % len(self.workers)]
+            worker = workers[counter % len(workers)]
             with worker.state_lock:
                 worker.active_requests += 1
-            self._counter += 1
+            self._counters[model] = counter + 1
         return worker
 
 
 # Globals set in main
 scheduler: BatchScheduler = None
 lb: LoadBalancer = None
-model_name_global: str = ""
+available_models: list[str] = []
 batching_enabled: bool = True
 
 
@@ -649,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             self._json_response(200, {
                 "object": "list",
-                "data": [{"id": model_name_global, "object": "model"}],
+                "data": [{"id": m, "object": "model"} for m in available_models],
             })
         elif self.path == "/health":
             self._json_response(200, {"status": "ok"})
@@ -665,11 +690,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = self._parse_generation_params(body)
         if parsed is None:
             return
-        messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens = parsed
+        model, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens = parsed
 
         if not batching_enabled:
             self._handle_direct_request(
-                messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
+                model, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
             )
             return
 
@@ -677,12 +702,13 @@ class Handler(BaseHTTPRequestHandler):
         # the direct single-request path (effectively batch size 1).
         if stream:
             self._handle_direct_request(
-                messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
+                model, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens,
             )
             return
 
         # Enqueue for batched processing
         batch_item = BatchItem(
+            model=model,
             messages=messages,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
@@ -695,20 +721,20 @@ class Handler(BaseHTTPRequestHandler):
         # Poll in short intervals to check for client disconnect
         timeout_remaining = 600.0  # 10 min total timeout
         poll_interval = 0.1  # 100ms polling
-        
+
         while timeout_remaining > 0:
             wait_time = min(poll_interval, timeout_remaining)
             if req.completion_event.wait(timeout=wait_time):
                 # Request completed
                 break
-            
+
             timeout_remaining -= wait_time
-            
+
             # Check if client disconnected
             if self._is_client_disconnected():
                 req.mark_cancelled()
                 return  # Client disconnected, don't send response
-        
+
         if timeout_remaining <= 0:
             req.mark_cancelled()
             self._json_response(504, {"error": "request timeout"})
@@ -732,13 +758,13 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 # Shouldn't happen, but handle gracefully
                 return
-            
+
             t0 = int(time.time())
             self._json_response(200, {
                 "id": f"chatcmpl-{t0}",
                 "object": "chat.completion",
                 "created": t0,
-                "model": model_name_global,
+                "model": model,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": result["text"]},
@@ -788,6 +814,15 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _parse_generation_params(self, body):
+        model = body.get("model")
+        if not model or not isinstance(model, str):
+            self._json_response(400, {"error": "missing required field: model"})
+            return None
+        model = _resolve_alias(model)
+        if model not in available_models:
+            self._json_response(400, {"error": f"unknown model: {model!r}. Available: {available_models}"})
+            return None
+
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             self._json_response(400, {"error": "field 'messages' must be a non-empty list"})
@@ -824,17 +859,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "field 'stream' must be a boolean"})
             return None
 
-        return messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens
+        return model, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens
 
-    def _handle_direct_request(self, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens):
-        worker = lb.get_worker(prefer_free=True)
+    def _handle_direct_request(self, model, messages, max_output_tokens, temperature, top_p, stream, max_thinking_tokens):
+        worker = lb.get_worker(model, prefer_free=True)
         try:
             with worker.lock:
                 try:
                     if stream:
-                        self._handle_streaming(worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
+                        self._handle_streaming(worker, model, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
                     else:
-                        self._handle_non_streaming(worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
+                        self._handle_non_streaming(worker, model, messages, max_output_tokens, temperature, top_p, max_thinking_tokens)
                 except BrokenPipeError:
                     pass
                 except Exception as e:
@@ -850,7 +885,7 @@ class Handler(BaseHTTPRequestHandler):
                 with scheduler.queue_lock:
                     scheduler.queue_lock.notify()
 
-    def _handle_non_streaming(self, worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
+    def _handle_non_streaming(self, worker, model, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
         t0 = time.time()
         text, completion_tokens, prompt_tokens = worker.generate(
             messages,
@@ -864,7 +899,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": f"chatcmpl-{int(t0)}",
             "object": "chat.completion",
             "created": int(t0),
-            "model": model_name_global,
+            "model": model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
@@ -877,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
             },
         })
 
-    def _handle_streaming(self, worker, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
+    def _handle_streaming(self, worker, model, messages, max_output_tokens, temperature, top_p, max_thinking_tokens=None):
         cancel_event = threading.Event()
         streamer, input_len, gen_thread, result = worker.generate(
             messages,
@@ -904,7 +939,7 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
-                    "model": model_name_global,
+                    "model": model,
                     "choices": [{
                         "index": 0,
                         "delta": {"content": token_text},
@@ -925,7 +960,7 @@ class Handler(BaseHTTPRequestHandler):
         final = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
-            "model": model_name_global,
+            "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             "usage": {
                 "prompt_tokens": input_len,
@@ -956,16 +991,41 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     request_queue_size = 1024
 
 
+# Short aliases for common models.
+MODEL_ALIASES = {
+    "qed-nano": "lm-provers/QED-Nano",
+    "qwen3-4b": "Qwen/Qwen3-4B-Thinking-2507",
+}
+
+
+def _resolve_alias(name: str) -> str:
+    """Resolve a short alias to the full HuggingFace model name."""
+    return MODEL_ALIASES.get(name, name)
+
+
+def _parse_model_spec(spec: str) -> tuple[str, int]:
+    """Parse 'ModelName:NumGPUs' spec. Returns (model_name, num_gpus).
+
+    Accepts short aliases (e.g. 'qed-nano:4') or full names.
+    """
+    if ":" in spec:
+        parts = spec.rsplit(":", 1)
+        try:
+            return _resolve_alias(parts[0]), int(parts[1])
+        except ValueError:
+            pass
+    # No colon or invalid number — treat whole string as model name, default 1 GPU
+    return _resolve_alias(spec), 1
+
+
 def main():
-    global scheduler, lb, model_name_global, batching_enabled
+    global scheduler, lb, available_models, batching_enabled
 
     parser = argparse.ArgumentParser(
-        description="Serve a HuggingFace model on multiple GPUs with dynamic batching",
+        description="Serve HuggingFace models on multiple GPUs with dynamic batching",
     )
-    parser.add_argument("--model", default="lm-provers/QED-Nano",
-                        help="HuggingFace model name (default: lm-provers/QED-Nano)")
-    parser.add_argument("--num-gpus", type=int, default=8,
-                        help="Number of GPUs / model replicas (default: 8)")
+    parser.add_argument("--model", action="append", dest="models", metavar="MODEL:GPUS",
+                        help="Model spec as MODEL_NAME:NUM_GPUS (repeatable, GPUs assigned sequentially)")
     parser.add_argument("--port", type=int, default=8000,
                         help="Server port (default: 8000)")
     parser.add_argument("--host", default="0.0.0.0",
@@ -980,47 +1040,63 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print batch processing information")
     args = parser.parse_args()
-    batching_enabled = args.batch_size > 1
+
+    # Parse model specs
+    model_specs = [_parse_model_spec(s) for s in args.models]
+    total_gpus = sum(n for _, n in model_specs)
 
     n_available = torch.cuda.device_count()
-    if n_available < args.num_gpus:
-        print(f"WARNING: requested {args.num_gpus} GPUs but only {n_available} available, using {n_available}")
-        args.num_gpus = n_available
-    if args.num_gpus == 0:
-        print("ERROR: no GPUs available")
+    if n_available < total_gpus:
+        print(f"ERROR: requested {total_gpus} GPUs but only {n_available} available")
+        return
+    if total_gpus == 0:
+        print("ERROR: no GPUs requested")
         return
 
-    model_name_global = args.model
+    batching_enabled = args.batch_size > 1
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
 
-    print(f"Loading {args.num_gpus} replica(s) of {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+    # Load models onto GPU subsets
+    workers_by_model: dict[str, list[Worker]] = {}
+    gpu_offset = 0
 
-    # Load first replica with full output (shows warnings like MISSING weights)
-    workers = [Worker(0, args.model, dtype, tokenizer)]
+    for model_name, num_gpus in model_specs:
+        gpu_ids = list(range(gpu_offset, gpu_offset + num_gpus))
+        gpu_offset += num_gpus
 
-    if args.num_gpus > 1:
-        # Suppress noisy progress bars / load reports for remaining replicas
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
-        with ThreadPoolExecutor(max_workers=args.num_gpus - 1) as pool:
-            workers += list(pool.map(
-                lambda i: Worker(i, args.model, dtype, tokenizer),
-                range(1, args.num_gpus),
-            ))
+        print(f"Loading {num_gpus} replica(s) of {model_name} on GPUs {gpu_ids}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        # Load first replica with full output (shows warnings like MISSING weights)
+        model_workers = [Worker(gpu_ids[0], model_name, dtype, tokenizer)]
+
+        if num_gpus > 1:
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+            with ThreadPoolExecutor(max_workers=num_gpus - 1) as pool:
+                model_workers += list(pool.map(
+                    lambda i: Worker(i, model_name, dtype, tokenizer),
+                    gpu_ids[1:],
+                ))
+
+        workers_by_model[model_name] = model_workers
+
+    available_models = list(workers_by_model.keys())
+
     # Direct lane is always available for streaming (and all requests when batch_size == 1).
-    lb = LoadBalancer(workers)
+    lb = LoadBalancer(workers_by_model)
     if batching_enabled:
-        scheduler = BatchScheduler(workers, args.batch_size, args.batch_timeout, args.verbose)
+        scheduler = BatchScheduler(workers_by_model, args.batch_size, args.batch_timeout, args.verbose)
 
     server = ThreadedHTTPServer((args.host, args.port), Handler)
     print(f"\nServing on http://{args.host}:{args.port}")
-    print(f"  Model: {args.model}")
-    print(f"  Mode:  {'batched' if batching_enabled else 'direct'} (derived from batch_size)")
-    print(f"  GPUs:  {args.num_gpus}")
+    for model_name, num_gpus in model_specs:
+        gpu_start = sum(n for m, n in model_specs[:model_specs.index((model_name, num_gpus))])
+        print(f"  {model_name}: {num_gpus} GPU(s) [{gpu_start}-{gpu_start + num_gpus - 1}]")
+    print(f"  Mode:  {'batched' if batching_enabled else 'direct'}")
     print(f"  dtype: {args.dtype}")
     if batching_enabled:
         print(f"  Batch size: {args.batch_size}")

@@ -39,13 +39,25 @@ def main():
         resp = urllib.request.urlopen(f"{base}/v1/models", timeout=5)
         models_data = json.loads(resp.read())
         available = [m["id"] for m in models_data.get("data", [])]
-        print(f"Available models: {available}")
+        # Build reverse alias map for display
+        ALIASES = {"lm-provers/QED-Nano": "qed-nano", "Qwen/Qwen3-4B-Thinking-2507": "qwen3-4b"}
+        for m in available:
+            alias = ALIASES.get(m, "")
+            print(f"  [{available.index(m)}] {m}" + (f"  (alias: {alias})" if alias else ""))
     except urllib.error.URLError as e:
         print(f"ERROR: Cannot list models: {e}", file=sys.stderr)
         sys.exit(1)
 
-    model = args.model or available[0] if available else None
-    if not model:
+    if args.model is not None:
+        # Accept index, alias, or full name
+        ALIAS_MAP = {"qed-nano": "lm-provers/QED-Nano", "qwen3-4b": "Qwen/Qwen3-4B-Thinking-2507"}
+        if args.model.isdigit() and int(args.model) < len(available):
+            model = available[int(args.model)]
+        else:
+            model = ALIAS_MAP.get(args.model, args.model)
+    elif available:
+        model = available[0]
+    else:
         print("ERROR: No model found and none specified with --model", file=sys.stderr)
         sys.exit(1)
     print(f"Using model: {model}\n")

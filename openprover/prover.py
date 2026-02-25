@@ -102,9 +102,11 @@ class Prover:
                  parallelism: int = 1, give_up_ratio: float = 0.5,
                  lean_project_dir: Path | None = None,
                  lean_theorem_path: Path | None = None,
-                 proof_path: Path | None = None):
+                 proof_path: Path | None = None,
+                 make_worker_llm=None):
         self.model = model_name
         self._make_llm = make_llm
+        self._make_worker_llm = make_worker_llm or make_llm
         self.max_steps = max_steps
         self.autonomous = autonomous
         self.verbose = verbose
@@ -190,8 +192,12 @@ class Prover:
         if self.resumed:
             logger.info("Resuming from step %d/%d", self.step_num, self.max_steps)
 
-        # LLM client (archive_dir is fallback; per-call paths used for step calls)
-        self.llm = self._make_llm(self.work_dir / "archive")
+        # LLM clients (archive_dir is fallback; per-call paths used for step calls)
+        archive_dir = self.work_dir / "archive"
+        self.planner_llm = self._make_llm(archive_dir)
+        self.worker_llm = self._make_worker_llm(archive_dir)
+        # Unified view for cost/call tracking
+        self.llm = self.planner_llm
 
         # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()
@@ -309,7 +315,7 @@ class Prover:
         # Planner LLM call
         self.tui.stream_start("planning", tab="planner")
         try:
-            resp = self.llm.call(
+            resp = self.planner_llm.call(
                 prompt=prompt,
                 system_prompt=prompts.planner_system_prompt(
                     isolation=self.isolation,
@@ -404,7 +410,8 @@ class Prover:
         """
         self._save_step_meta(step_dir, status="interrupted")
         self.step_num -= 1  # don't count interrupted step
-        self.llm.clear_interrupt()
+        self.planner_llm.clear_interrupt()
+        self.worker_llm.clear_interrupt()
 
         if self.autonomous:
             self.autonomous = False
@@ -714,7 +721,8 @@ class Prover:
             w and w.get("error") == "interrupted" for w in worker_resps
         )
         if any_interrupted:
-            self.llm.clear_interrupt()
+            self.planner_llm.clear_interrupt()
+            self.worker_llm.clear_interrupt()
             if self.autonomous:
                 self.autonomous = False
                 self.tui.autonomous = False
@@ -799,7 +807,7 @@ class Prover:
         self.tui.stream_start("searching", tab=wid)
         search_resp = None
         try:
-            search_resp = self.llm.call(
+            search_resp = self.worker_llm.call(
                 prompt=prompt,
                 system_prompt=prompts.SEARCH_SYSTEM_PROMPT,
                 label=f"search_step_{self.step_num}",
@@ -814,7 +822,7 @@ class Prover:
             (workers_dir / "result_0.md").write_text(result)
         except Interrupted:
             self.tui.stream_end(tab=wid)
-            self.llm.clear_interrupt()
+            self.worker_llm.clear_interrupt()
             if self.autonomous:
                 self.autonomous = False
                 self.tui.autonomous = False
@@ -854,7 +862,7 @@ class Prover:
 
         self.tui.stream_start("working", tab=worker_id)
         try:
-            resp = self.llm.call(
+            resp = self.worker_llm.call(
                 prompt=prompt,
                 system_prompt=prompts.WORKER_SYSTEM_PROMPT,
                 label=worker_id,
@@ -951,7 +959,7 @@ class Prover:
             lines.append(f'cache_creation_tokens = {tokens["cache_creation_tokens"]}')
             lines.append(f'cache_read_tokens = {tokens["cache_read_tokens"]}')
             raw = resp.get("raw") or {}
-            lines.append(f'model = "{raw.get("model", self.llm.model)}"')
+            lines.append(f'model = "{raw.get("model", self.planner_llm.model)}"')
             lines.append(f'stop_reason = "{raw.get("stop_reason", "")}"')
 
         # Worker metadata
@@ -985,7 +993,7 @@ class Prover:
         )
         self.tui.stream_start("writing discussion", tab="planner")
         try:
-            resp = self.llm.call(
+            resp = self.planner_llm.call(
                 prompt=prompt,
                 system_prompt=prompts.planner_system_prompt(
                     isolation=self.isolation, lean_mode=self.mode,
@@ -1112,5 +1120,6 @@ class Prover:
 
     def request_interrupt(self):
         """Called by SIGINT handler. Kills active LLM call or nudges TUI."""
-        self.llm.interrupt()
+        self.planner_llm.interrupt()
+        self.worker_llm.interrupt()
         self.tui.interrupt()  # in case we're in a confirmation prompt

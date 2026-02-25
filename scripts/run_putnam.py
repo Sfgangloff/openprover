@@ -43,11 +43,18 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
            "--max-steps", str(args.max_steps), "--headless",
            "-P", str(args.parallelism)]
 
+    if args.planner_model:
+        cmd.extend(["--planner-model", args.planner_model])
+    if args.worker_model:
+        cmd.extend(["--worker-model", args.worker_model])
+
     if lean_theorem_path.is_file():
         cmd.extend(["--lean-project-dir", str(lean_dir)])
         cmd.extend(["--lean-theorem", str(lean_theorem_path)])
 
-    if args.model == "qed-nano":
+    hf_models = {"qed-nano", "qwen3-4b"}
+    used_models = {args.model, args.planner_model, args.worker_model} - {None}
+    if used_models & hf_models:
         cmd.extend(["--hf-url", args.hf_url])
     if args.isolation:
         cmd.append("--isolation")
@@ -79,8 +86,11 @@ def _run_parallel(problems: dict[str, str], lean_dir: Path,
     pad = len(str(total))
     name_width = max(len(n) for n in problems) if problems else 20
 
+    planner = args.planner_model or args.model
+    worker = args.worker_model or args.model
+    model_label = planner if planner == worker else f"{planner}/{worker}"
     print(f"  Putnam Bench: {total} problems, problem_parallelism={args.problem_parallelism},"
-          f" model={args.model}\n")
+          f" model={model_label}\n")
 
     with ThreadPoolExecutor(max_workers=args.problem_parallelism) as pool:
         futures = {
@@ -130,9 +140,14 @@ def main():
                         help="Number of concurrent openprover instances (default: 1)")
     parser.add_argument("-P", "--parallelism", type=int, default=1,
                         help="Max parallel workers per spawn step inside openprover (default: 1)")
-    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "qed-nano"])
+    model_choices = ["sonnet", "opus", "qed-nano", "qwen3-4b"]
+    parser.add_argument("--model", default="sonnet", choices=model_choices)
+    parser.add_argument("--planner-model", choices=model_choices, default=None,
+                        help="Override model for planner (defaults to --model)")
+    parser.add_argument("--worker-model", choices=model_choices, default=None,
+                        help="Override model for worker (defaults to --model)")
     parser.add_argument("--hf-url", default="http://localhost:8000",
-                        help="HF server URL for qed-nano (default: http://localhost:8000)")
+                        help="HF server URL for local models (default: http://localhost:8000)")
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--autonomous", action="store_true")
     parser.add_argument("--isolation", action="store_true")
@@ -165,7 +180,8 @@ def main():
         print("Error: Could not parse problems from putnam.json.", file=sys.stderr)
         sys.exit(1)
 
-    if args.model in ("sonnet", "opus"):
+    all_models = {args.model, args.planner_model, args.worker_model} - {None}
+    if all_models & {"sonnet", "opus"}:
         _check_tool("claude")
 
     if args.problem:
@@ -194,6 +210,11 @@ def main():
                "--max-steps", str(args.max_steps),
                "-P", str(args.parallelism)]
 
+        if args.planner_model:
+            cmd.extend(["--planner-model", args.planner_model])
+        if args.worker_model:
+            cmd.extend(["--worker-model", args.worker_model])
+
         if lean_theorem_path.is_file():
             cmd.extend(["--lean-project-dir", str(lean_dir)])
             cmd.extend(["--lean-theorem", str(lean_theorem_path)])
@@ -201,7 +222,9 @@ def main():
             print(f"Warning: Lean theorem not found at {lean_theorem_path}."
                   " Running without formal verification.", file=sys.stderr)
 
-        if args.model == "qed-nano":
+        hf_models = {"qed-nano", "qwen3-4b"}
+        used_models = {args.model, args.planner_model, args.worker_model} - {None}
+        if used_models & hf_models:
             cmd.extend(["--hf-url", args.hf_url])
         if args.autonomous:
             cmd.append("--autonomous")

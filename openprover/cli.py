@@ -15,9 +15,12 @@ def main():
         prog="openprover",
         description="Theorem prover powered by language models",
     )
+    model_choices = ["sonnet", "opus", "qed-nano", "qwen3-4b"]
     parser.add_argument("theorem", nargs="?", help="Path to theorem statement file (.md)")
-    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "qed-nano"], help="Model to use (default: sonnet)")
-    parser.add_argument("--hf-url", default="http://localhost:8000", help="HF server URL for qed-nano (default: http://localhost:8000)")
+    parser.add_argument("--model", default="sonnet", choices=model_choices, help="Model to use for both planner and worker (default: sonnet)")
+    parser.add_argument("--planner-model", choices=model_choices, default=None, help="Override model for planner (defaults to --model)")
+    parser.add_argument("--worker-model", choices=model_choices, default=None, help="Override model for worker (defaults to --model)")
+    parser.add_argument("--hf-url", default="http://localhost:8000", help="HF server URL for local models (default: http://localhost:8000)")
     parser.add_argument("--max-steps", type=int, default=50, help="Maximum number of proving steps (default: 50)")
     parser.add_argument("--autonomous", action="store_true", help="Start in autonomous mode (default: interactive)")
     parser.add_argument("--run-dir", help="Working directory (resumes if it contains an existing run)")
@@ -56,8 +59,13 @@ def main():
     if args.proof and not args.proof.is_file():
         parser.error(f"--proof not found: {args.proof}")
 
-    # QED-Nano has no web search capability — force isolation
-    if args.model == "qed-nano" and not args.isolation:
+    # Resolve effective planner/worker models
+    planner_model = args.planner_model or args.model
+    worker_model = args.worker_model or args.model
+
+    # HF-backed models have no web search capability — force isolation
+    hf_models = {"qed-nano", "qwen3-4b"}
+    if planner_model in hf_models and not args.isolation:
         args.isolation = True
 
     if args.headless:
@@ -66,17 +74,31 @@ def main():
     else:
         tui = TUI()
 
-    # Construct LLM client — Prover.setup_work_dir needs to run first to know
-    # the archive dir, so we pass a factory that Prover calls after setup.
-    def make_llm(archive_dir):
-        if args.model == "qed-nano":
-            return HFClient("lm-provers/QED-Nano", archive_dir, base_url=args.hf_url, answer_reserve=args.answer_reserve)
-        return LLMClient(args.model, archive_dir)
+    # Map short model names to HuggingFace model IDs
+    HF_MODEL_MAP = {
+        "qed-nano": "lm-provers/QED-Nano",
+        "qwen3-4b": "Qwen/Qwen3-4B-Thinking-2507",
+    }
+
+    # Construct LLM client factories — Prover calls these after work_dir setup.
+    def _make_client(model_alias, archive_dir):
+        if model_alias in HF_MODEL_MAP:
+            return HFClient(HF_MODEL_MAP[model_alias], archive_dir,
+                            base_url=args.hf_url, answer_reserve=args.answer_reserve)
+        return LLMClient(model_alias, archive_dir)
+
+    def make_planner_llm(archive_dir):
+        return _make_client(planner_model, archive_dir)
+
+    def make_worker_llm(archive_dir):
+        return _make_client(worker_model, archive_dir)
+
+    model_label = planner_model if planner_model == worker_model else f"{planner_model}/{worker_model}"
 
     prover = Prover(
         theorem_path=args.theorem,
-        make_llm=make_llm,
-        model_name=args.model,
+        make_llm=make_planner_llm,
+        model_name=model_label,
         max_steps=args.max_steps,
         autonomous=args.autonomous,
         verbose=args.verbose,
@@ -88,6 +110,7 @@ def main():
         lean_project_dir=args.lean_project_dir,
         lean_theorem_path=args.lean_theorem,
         proof_path=args.proof,
+        make_worker_llm=make_worker_llm,
     )
 
     # Check if this is a finished run → inspect mode
@@ -108,8 +131,8 @@ def main():
     try:
         prover.run()
     finally:
-        cost = prover.llm.total_cost
-        calls = prover.llm.call_count
+        cost = prover.planner_llm.total_cost + prover.worker_llm.total_cost
+        calls = prover.planner_llm.call_count + prover.worker_llm.call_count
         tui.cleanup()
         # Print summary to regular stdout after TUI is gone
         has_proof = ((prover.work_dir / "PROOF.md").exists()

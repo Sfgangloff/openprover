@@ -288,6 +288,7 @@ class LLMClient:
 
 MODEL_CONTEXT_LENGTHS = {
     "lm-provers/QED-Nano": 49152,
+    "Qwen/Qwen3-4B-Thinking-2507": 32768,
 }
 
 
