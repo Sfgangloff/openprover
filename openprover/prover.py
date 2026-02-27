@@ -295,6 +295,48 @@ class Prover:
             if len(self.prev_outputs) > 3:
                 self.prev_outputs = self.prev_outputs[-3:]
 
+    def _record_human_feedback(
+        self,
+        feedback: str,
+        step_num: int | None = None,
+        rejected_action: str = "",
+        rejected_summary: str = "",
+    ):
+        text = feedback.strip()
+        if not text:
+            return
+        first_line = text.splitlines()[0]
+        feedback_short = first_line if len(first_line) <= 60 else f"{first_line[:57]}..."
+        proposed = ""
+        if rejected_action or rejected_summary:
+            proposed = f"{rejected_action} — {rejected_summary}".strip(" —")
+            if len(proposed) > 80:
+                proposed = f"{proposed[:77]}..."
+        if proposed:
+            summary = f"rejected with feedback: {proposed}"
+            detail = (
+                f"Proposed step:\n{proposed}\n\n"
+                f"Feedback:\n{text}"
+            )
+        else:
+            summary = f"feedback: {feedback_short}"
+            detail = text
+        num = self.step_num if step_num is None else step_num
+        self.tui.step_complete(
+            num,
+            self.max_steps,
+            "human_feedback",
+            summary,
+            detail=detail,
+        )
+
+    def _apply_whiteboard_from_plan(self, plan: dict):
+        """Apply planner whiteboard update if provided."""
+        if plan.get("whiteboard"):
+            self.whiteboard = plan["whiteboard"]
+            (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
+            self.tui.whiteboard = self.whiteboard
+
     def _setup_logging(self):
         """Configure file logging to trace.log in the run directory."""
         root = logging.getLogger("openprover")
@@ -445,11 +487,13 @@ class Prover:
         summary = plan.get("summary", "")
         logger.info("Action: %s — %s", action, summary)
 
-        # Update whiteboard (use if provided, keep current otherwise)
-        if plan.get("whiteboard"):
-            self.whiteboard = plan["whiteboard"]
-            (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
-            self.tui.whiteboard = self.whiteboard
+        # Apply whiteboard immediately only when there is no interactive
+        # accept/reject decision gate for this action.
+        deferred_whiteboard = (
+            action in ("spawn", "literature_search") and not self.autonomous
+        )
+        if not deferred_whiteboard:
+            self._apply_whiteboard_from_plan(plan)
 
         # Log non-interactive steps immediately. For actions that require
         # confirmation, record history only after the user accepts the proposal.
@@ -520,6 +564,7 @@ class Prover:
                 self.shutting_down = True
                 return "stop"
             # Feedback
+            self._record_human_feedback(user_resp, step_num=self.step_num + 1)
             self._push_output(f"Human feedback: {user_resp}")
             self.tui.log("Feedback noted — will replan next step", color="yellow")
             return "continue"
@@ -764,10 +809,16 @@ class Prover:
                     self.tui.log("  autonomous mode", dim=True)
                     break
                 # Feedback — set as prev_output and retry next step
+                self._record_human_feedback(
+                    user_resp,
+                    rejected_action=plan.get("action", ""),
+                    rejected_summary=plan.get("summary", ""),
+                )
                 self._push_output(f"Human feedback: {user_resp}")
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
 
+        self._apply_whiteboard_from_plan(plan)
         self.tui.step_complete(
             self.step_num,
             self.max_steps,
@@ -896,10 +947,16 @@ class Prover:
                     self.tui.log("  autonomous mode", dim=True)
                     break
                 # Feedback — set as prev_output and retry next step
+                self._record_human_feedback(
+                    user_resp,
+                    rejected_action=plan.get("action", ""),
+                    rejected_summary=plan.get("summary", ""),
+                )
                 self._push_output(f"Human feedback: {user_resp}")
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
 
+        self._apply_whiteboard_from_plan(plan)
         self.tui.step_complete(
             self.step_num,
             self.max_steps,

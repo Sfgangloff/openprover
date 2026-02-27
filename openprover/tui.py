@@ -31,6 +31,7 @@ SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 ACTION_STYLE = {
     "spawn": BLUE,
     "literature_search": MAGENTA,
+    "human_feedback": YELLOW,
     "read_items": CYAN,
     "write_items": CYAN,
     "read_theorem": CYAN,
@@ -1200,8 +1201,6 @@ class TUI:
         return max(self.rows - cs + 1 - confirm_rows - spinner_rows, 1)
 
     def _entry_render_lines(self, tab: _Tab, entry: _LogEntry, max_w: int) -> int:
-        if tab.id == "planner" and (entry.is_trace or entry.is_output):
-            return 0
         if entry.is_trace:
             if not self.trace_visible:
                 return 0
@@ -1217,6 +1216,16 @@ class TUI:
                 for line in src
             )
         return len(self._wrap_visual_text(f' {entry.text}', max_w))
+
+    @staticmethod
+    def _planner_live_start(tab: _Tab) -> int:
+        if tab.id != "planner":
+            return 0
+        last_step = -1
+        for idx, entry in enumerate(tab.log_lines):
+            if entry.step_idx >= 0:
+                last_step = idx
+        return last_step + 1
 
     @staticmethod
     def _wrap_visual_text(text: str, max_w: int) -> list[str]:
@@ -1249,9 +1258,14 @@ class TUI:
 
     def _selection_render_range(self, tab: _Tab) -> tuple[int, int] | None:
         max_w = max(self.cols - 4, 20)
+        planner_live_start = self._planner_live_start(tab)
         line_idx = 0
         if self._nav_step >= 0:
-            for entry in tab.log_lines:
+            for idx, entry in enumerate(tab.log_lines):
+                if (tab.id == "planner"
+                        and (entry.is_trace or entry.is_output)
+                        and idx < planner_live_start):
+                    continue
                 rendered = self._entry_render_lines(tab, entry, max_w)
                 if rendered <= 0:
                     continue
@@ -1263,6 +1277,10 @@ class TUI:
             return None
         start = None
         for idx, entry in enumerate(tab.log_lines):
+            if (tab.id == "planner"
+                    and (entry.is_trace or entry.is_output)
+                    and idx < planner_live_start):
+                continue
             rendered = self._entry_render_lines(tab, entry, max_w)
             if rendered <= 0:
                 continue
@@ -1373,57 +1391,37 @@ class TUI:
             tab = self._active_tab
         lines: list[str] = []
         max_w = max(self.cols - 4, 20)
-        proposal_selected = (
-            self._confirming
-            and tab.id == "planner"
-            and self._nav_step == -1
-            and self._proposal_log_start >= 0
-        )
+        planner_live_start = self._planner_live_start(tab)
         for idx, entry in enumerate(tab.log_lines):
             if entry.is_trace:
-                if tab.id == "planner":
+                if tab.id == "planner" and idx < planner_live_start:
                     continue
                 if not self.trace_visible:
                     continue
                 for tline in entry.text.splitlines():
                     text = f'  {DIM}{tline}{RESET}'
                     for wrapped in self._wrap_visual_text(text, max_w):
-                        if proposal_selected and idx >= self._proposal_log_start:
-                            lines.append(f' {GREEN}▎{RESET}{wrapped}')
-                        else:
-                            lines.append(wrapped)
+                        lines.append(wrapped)
                 if not entry.text.splitlines():
                     text = f'  {DIM}{RESET}'
                     for wrapped in self._wrap_visual_text(text, max_w):
-                        if proposal_selected and idx >= self._proposal_log_start:
-                            lines.append(f' {GREEN}▎{RESET}{wrapped}')
-                        else:
-                            lines.append(wrapped)
+                        lines.append(wrapped)
             elif entry.is_output:
-                if tab.id == "planner":
+                if tab.id == "planner" and idx < planner_live_start:
                     continue
                 for tline in entry.text.splitlines():
                     text = f'  {tline}'
                     for wrapped in self._wrap_visual_text(text, max_w):
-                        if proposal_selected and idx >= self._proposal_log_start:
-                            lines.append(f' {GREEN}▎{RESET}{wrapped}')
-                        else:
-                            lines.append(wrapped)
+                        lines.append(wrapped)
                 if not entry.text.splitlines():
                     text = '  '
                     for wrapped in self._wrap_visual_text(text, max_w):
-                        if proposal_selected and idx >= self._proposal_log_start:
-                            lines.append(f' {GREEN}▎{RESET}{wrapped}')
-                        else:
-                            lines.append(wrapped)
+                        lines.append(wrapped)
             else:
                 is_step = entry.step_idx >= 0
                 base = f' {entry.text}'
                 wrapped_lines = self._wrap_visual_text(base, max_w)
                 if is_step and entry.step_idx == self._nav_step:
-                    for wrapped in wrapped_lines:
-                        lines.append(f' {GREEN}▎{RESET}{wrapped}')
-                elif proposal_selected and idx >= self._proposal_log_start:
                     for wrapped in wrapped_lines:
                         lines.append(f' {GREEN}▎{RESET}{wrapped}')
                 else:
