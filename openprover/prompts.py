@@ -33,7 +33,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
 
     actions = (
         "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning - they only see the context you provide to them.\n"
-        "- **read_items**: Request full content of repo items (you only see one-line summaries by default).\n"
+        "- **read_items**: Read the full content of repo items (you only see one-line summaries by default).\n"
         "- **write_items**: Create, update, or delete one or more repo items.\n"
         "- **read_theorem**: Re-read the original theorem statement(s) and any provided proof.\n"
     )
@@ -55,8 +55,8 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
     if has_lean:
         actions += (
             f"- **submit_lean_proof**: Submit a formal Lean 4 proof. Provide {num_sorries} replacement block(s) "
-            f"(one per `sorry` in THEOREM.lean), plus optional context. No `import` statements allowed in injected code. "
-            f"The completed file is automatically verified via `lake env lean`. **If verification succeeds, PROOF.lean is written.**\n"
+            f"(one per `sorry` in THEOREM.lean), plus optional context. No `import` statements allowed (all imports are already present in the theorem statement). "
+            f"The completed file is automatically verified with Lean. **If verification succeeds, PROOF.lean is written.**\n"
         )
 
     principles = (
@@ -148,10 +148,10 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "## Your Role\n"
         "\n"
         "You are the PLANNER. You decide WHAT to do and workers do the DOING. "
-        "**You must NEVER do mathematical reasoning, analysis, or problem-solving yourself** — not even "
-        "\"just to understand the problem\" or \"just to get started.\" "
+        "Never do mathematical reasoning, analysis, or problem-solving yourself - not even "
+        "\"just to understand the problem\" or \"just to get started\". "
         "If you need to understand the problem structure, explore special cases, identify useful lemmas, "
-        "or brainstorm proof strategies — spawn workers for that. "
+        "or brainstorm proof strategies - spawn workers for that. "
         "Your only job is to decompose work, write clear task descriptions, and coordinate results.\n"
         "\n"
         "Each step you choose one action:\n"
@@ -271,74 +271,66 @@ def format_search_prompt(query: str, context: str) -> str:
     return "\n".join(parts)
 
 
-def format_initial_whiteboard(theorem: str, mode: str = "prove") -> str:
+def format_initial_whiteboard(theorem: str, mode: str) -> str:
     theorem_text = theorem.strip()
     if mode == "prove_and_formalize":
         return f"""## Goal
 
+**Prove and Formalize**
+Produce both an informal proof and a formal Lean 4 proof of this theorem:
+
+<theorem>
 {theorem_text}
+</theorem>
 
-**Mode: Prove and Formalize**
-Produce both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean).
-Formal statement available - use read_theorem to view THEOREM.lean.
+To see the formal theorem statement in Lean, use read_theorem. Only do that after you figured out the informal proof in English.
 
-## Strategy
+## Plan
 
-TBD — spawn workers to analyze.
+- [ ] Find a proof in natural language.
+- [ ] Formalize the proof in Lean 4.
 
-## Status
-
-Starting.
-
-- [ ] Find a proof in English (PROOF.md).
-- [ ] Formalize the proof in Lean (PROOF.lean).
-
-## Tried
+## Notes
 
 (none)
 """
+    # TODO: also inject the proof!
     if mode == "formalize_only":
         return f"""## Goal
 
+**Formalize**
+Formalize the proof of the following theorem in Lean 4:
+
+<theorem>
 {theorem_text}
+</theorem>
 
-**Mode: Formalize Only**
-An informal proof is provided. Formalize it in Lean 4 (produce PROOF.lean).
-Use read_theorem to view PROOF.md and THEOREM.lean.
+## Plan
 
-## Strategy
+- [ ] Formalize the proof in Lean 4.
 
-TBD — spawn workers to analyze.
-
-## Status
-
-Starting.
-
-## Tried
+## Notes
 
 (none)
 """
-    return f"""## Goal
+    if mode == "prove":
+        return f"""## Goal
 
+Produce a proof of this theorem:
+
+<theorem>
 {theorem_text}
+</theorem>
 
-**Mode: Prove Only**
-Produce an informal proof (PROOF.md).
+## Plan
 
-## Strategy
+- [ ] Find a proof of the theorem.
 
-TBD — spawn workers to analyze.
-
-## Status
-
-Starting.
-
-- [ ] Find a proof in English (PROOF.md).
-
-## Tried
+## Notes
 
 (none)
 """
+    raise ValueError(f"Invalid mode: {mode}")
 
 
 def format_discussion_prompt(
