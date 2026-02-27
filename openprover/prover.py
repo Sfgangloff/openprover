@@ -451,10 +451,12 @@ class Prover:
             (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
             self.tui.whiteboard = self.whiteboard
 
-        # Log step in planner tab
-        self.tui.step_complete(
-            self.step_num, self.max_steps, action, summary,
-        )
+        # Log non-interactive steps immediately. For actions that require
+        # confirmation, record history only after the user accepts the proposal.
+        if action not in ("spawn", "literature_search"):
+            self.tui.step_complete(
+                self.step_num, self.max_steps, action, summary,
+            )
 
         # Save planner output
         self._save_step(step_dir, plan)
@@ -766,6 +768,13 @@ class Prover:
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
 
+        self.tui.step_complete(
+            self.step_num,
+            self.max_steps,
+            plan.get("action", ""),
+            plan.get("summary", ""),
+        )
+
         logger.info("Spawning %d worker(s)", len(tasks))
 
         # Create worker tabs
@@ -890,6 +899,13 @@ class Prover:
                 self._push_output(f"Human feedback: {user_resp}")
                 self.tui.log("Feedback noted — will replan next step", color="yellow")
                 return "continue"
+
+        self.tui.step_complete(
+            self.step_num,
+            self.max_steps,
+            plan.get("action", ""),
+            plan.get("summary", ""),
+        )
 
         logger.info("Literature search: %s", query)
         wid = f"search_{self.step_num}"

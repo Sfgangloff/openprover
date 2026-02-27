@@ -759,20 +759,39 @@ class TUI:
             self._scroll_up()
         elif ch == '\x1b[6~':
             self._scroll_down()
-        elif ch == '\x1b[A':  # up arrow — scroll up
-            self._scroll_lines_up()
-        elif ch == '\x1b[B':  # down arrow — scroll down
-            self._scroll_lines_down()
+        elif ch == '\x1b[A':  # up arrow — step history or scroll up
+            if self.view == "main" and self.active_tab_idx == 0 and self.step_entries:
+                self._nav_up()
+                self._redraw()
+            else:
+                self._scroll_lines_up()
+        elif ch == '\x1b[B':  # down arrow — step history or scroll down
+            if self.view == "main" and self.active_tab_idx == 0 and self.step_entries:
+                if self._nav_step >= 0:
+                    self._nav_down()
+                    self._redraw()
+                else:
+                    self._scroll_lines_down()
+            else:
+                self._scroll_lines_down()
         elif ch == 'scroll_up':
             self._scroll_lines_up()
         elif ch == 'scroll_down':
             self._scroll_lines_down()
-        elif ch == '\x1b' and self.view != "main":
-            self.view = "main"
-            self._redraw()
+        elif ch == '\x1b':
+            if self.view != "main":
+                self.view = "main"
+                self._redraw()
+            elif self._nav_step >= 0:
+                self._nav_step = -1
+                self._restore_worker_tabs()
+                self._redraw()
         elif ch in ('\n', '\r'):
             if self.view != "main":
                 self.view = "main"
+                self._redraw()
+            elif self._nav_step >= 0:
+                self._open_selected_step_detail()
                 self._redraw()
             elif self._active_tab.scroll_offset > 0:
                 self._active_tab.scroll_offset = 0
@@ -782,6 +801,29 @@ class TUI:
                 'q': 'quit', 'p': 'pause',
                 's': 'summarize',
             }[ch]
+
+    def _open_selected_step_detail(self):
+        if self._nav_step < 0:
+            return
+        entry = self.step_entries[self._nav_step]
+        self._step_detail_title = (
+            f"Step {entry['step_num']}: {entry['action']}"
+            f" — {entry['summary']}"
+        )
+        parts = []
+        trace = entry.get("trace", "")
+        if trace and self.trace_visible:
+            parts.append(trace.rstrip())
+            parts.append("")
+        output = entry.get("output", "")
+        if output:
+            parts.append(output.rstrip())
+            parts.append("")
+        detail = entry.get("detail", "")
+        if detail:
+            parts.append(detail)
+        self._step_detail_text = "\n".join(parts) if parts else "(no detail)"
+        self.view = "step_detail"
 
     def get_pending_action(self) -> str | None:
         self._check_keys()
@@ -801,6 +843,7 @@ class TUI:
         self._confirm_selected = 0
         self._confirm_buf = []
         self._nav_step = -1
+        self._scroll_selection_into_view()
         self._redraw()
         self._write('\033[?25h')
 
@@ -817,6 +860,7 @@ class TUI:
                     elif self._nav_step >= 0:
                         self._nav_step = -1
                         self._restore_worker_tabs()
+                        self._scroll_selection_into_view()
                     else:
                         self._confirm_buf.clear()
                     self._redraw()
@@ -831,10 +875,21 @@ class TUI:
 
                 if len(ch) >= 3 and ch[:2] == '\x1b[':
                     if ch == '\x1b[A':
-                        self._nav_up()
+                        if self._nav_step == -1:
+                            if self._confirm_selected == 0 and self.step_entries:
+                                self._nav_up()
+                            else:
+                                self._confirm_selected = 0
+                                self._scroll_selection_into_view()
+                        else:
+                            self._nav_up()
                         self._redraw()
                     elif ch == '\x1b[B':
-                        self._nav_down()
+                        if self._nav_step == -1:
+                            self._confirm_selected = 1 - self._confirm_selected
+                            self._scroll_selection_into_view()
+                        else:
+                            self._nav_down()
                         self._redraw()
                     elif ch == '\x1b[C':
                         self._switch_tab(1)
@@ -852,25 +907,7 @@ class TUI:
                         self._redraw()
                         continue
                     if self._nav_step >= 0:
-                        entry = self.step_entries[self._nav_step]
-                        self._step_detail_title = (
-                            f"Step {entry['step_num']}: {entry['action']}"
-                            f" — {entry['summary']}"
-                        )
-                        parts = []
-                        trace = entry.get("trace", "")
-                        if trace and self.trace_visible:
-                            parts.append(trace.rstrip())
-                            parts.append("")
-                        output = entry.get("output", "")
-                        if output:
-                            parts.append(output.rstrip())
-                            parts.append("")
-                        detail = entry.get("detail", "")
-                        if detail:
-                            parts.append(detail)
-                        self._step_detail_text = "\n".join(parts) if parts else "(no detail)"
-                        self.view = "step_detail"
+                        self._open_selected_step_detail()
                         self._redraw()
                         continue
                     if self._confirm_selected == 0:
@@ -890,6 +927,7 @@ class TUI:
                     if self._nav_step >= 0:
                         self._nav_step = -1
                         self._restore_worker_tabs()
+                        self._scroll_selection_into_view()
                     else:
                         self._confirm_selected = 1 - self._confirm_selected
                     self._redraw()
@@ -1089,26 +1127,7 @@ class TUI:
                         self.view = "main"
                         self._redraw()
                     elif self._nav_step >= 0:
-                        entry = self.step_entries[self._nav_step]
-                        self._step_detail_title = (
-                            f"Step {entry['step_num']}: {entry['action']}"
-                            f" — {entry['summary']}"
-                        )
-                        parts = []
-                        trace = entry.get("trace", "")
-                        if trace and self.trace_visible:
-                            parts.append(trace.rstrip())
-                            parts.append("")
-                        output = entry.get("output", "")
-                        if output:
-                            parts.append(output.rstrip())
-                            parts.append("")
-                        detail = entry.get("detail", "")
-                        if detail:
-                            parts.append(detail)
-                        self._step_detail_text = (
-                            "\n".join(parts) if parts else "(no detail)")
-                        self.view = "step_detail"
+                        self._open_selected_step_detail()
                         self._redraw()
                     elif self._active_tab.scroll_offset > 0:
                         self._active_tab.scroll_offset = 0
@@ -1132,18 +1151,22 @@ class TUI:
                 self._saved_worker_tabs = [t for t in self.tabs[1:] if t.id != "logs"]
                 self._nav_step = len(self.step_entries) - 1
                 self._load_historical_workers()
+                self._scroll_selection_into_view()
         elif self._nav_step > 0:
             self._nav_step -= 1
             self._load_historical_workers()
+            self._scroll_selection_into_view()
 
     def _nav_down(self):
         if self._nav_step >= 0:
             if self._nav_step < len(self.step_entries) - 1:
                 self._nav_step += 1
                 self._load_historical_workers()
+                self._scroll_selection_into_view()
             else:
                 self._nav_step = -1
                 self._restore_worker_tabs()
+                self._scroll_selection_into_view()
 
     def _load_historical_workers(self):
         """Load worker tabs from the selected historical step."""
@@ -1165,6 +1188,85 @@ class TUI:
             if self.active_tab_idx >= len(self.tabs):
                 self.active_tab_idx = 0
 
+    def _main_avail_rows(self, tab: _Tab | None = None) -> int:
+        if tab is None:
+            tab = self._active_tab
+        cs = self._content_start
+        confirm_rows = 3 if (self._confirming and not self._browsing and self.active_tab_idx == 0) else 0
+        spinner_active = (tab.streaming and tab.spinner_label
+                          and not (tab.trace_buf and self.trace_visible))
+        spinner_rows = 1 if spinner_active else 0
+        return max(self.rows - cs + 1 - confirm_rows - spinner_rows, 1)
+
+    def _entry_render_lines(self, tab: _Tab, entry: _LogEntry, max_w: int) -> int:
+        if tab.id == "planner" and (entry.is_trace or entry.is_output):
+            return 0
+        if entry.is_trace:
+            if not self.trace_visible:
+                return 0
+            src = entry.text.splitlines() or [""]
+            return sum(max((len(line) + max_w - 1) // max_w, 1) for line in src)
+        if entry.is_output:
+            src = entry.text.splitlines() or [""]
+            return sum(max((len(line) + max_w - 1) // max_w, 1) for line in src)
+        return 1
+
+    def _selection_render_range(self, tab: _Tab) -> tuple[int, int] | None:
+        max_w = max(self.cols - 4, 20)
+        line_idx = 0
+        if self._nav_step >= 0:
+            for entry in tab.log_lines:
+                rendered = self._entry_render_lines(tab, entry, max_w)
+                if rendered <= 0:
+                    continue
+                if entry.step_idx == self._nav_step:
+                    return (line_idx, line_idx + rendered - 1)
+                line_idx += rendered
+            return None
+        if not (self._confirming and tab.id == "planner" and self._proposal_log_start >= 0):
+            return None
+        start = None
+        for idx, entry in enumerate(tab.log_lines):
+            rendered = self._entry_render_lines(tab, entry, max_w)
+            if rendered <= 0:
+                continue
+            if idx >= self._proposal_log_start and start is None:
+                start = line_idx
+            line_idx += rendered
+        if start is None:
+            return None
+        return (start, max(line_idx - 1, start))
+
+    def _scroll_selection_into_view(self):
+        if self.view != "main":
+            return
+        tab = self._active_tab
+        lines = self._build_main_lines(tab)
+        if not lines:
+            tab.scroll_offset = 0
+            return
+        sel = self._selection_render_range(tab)
+        if sel is None:
+            return
+
+        avail = self._main_avail_rows(tab)
+        total = len(lines)
+        max_off = max(total - avail, 0)
+        if tab.scroll_offset > max_off:
+            tab.scroll_offset = max_off
+        end = total - tab.scroll_offset
+        start = max(end - avail, 0)
+        target_start, target_end = sel
+
+        if target_start < start:
+            new_end = min(total, target_start + avail)
+            tab.scroll_offset = max(total - new_end, 0)
+        elif target_end >= end:
+            tab.scroll_offset = max(total - (target_end + 1), 0)
+
+        if tab.scroll_offset > max_off:
+            tab.scroll_offset = max_off
+
     def _draw_confirmation(self):
         fb = "".join(self._confirm_buf)
         lbl = self._confirm_accept_label
@@ -1182,7 +1284,18 @@ class TUI:
     # ── View toggles ────────────────────────────────────────────
 
     def _toggle_trace(self):
+        tab = self._active_tab
+        old_total = len(self._build_main_lines(tab))
+        old_max_off = max(old_total - self._main_avail_rows(tab), 0)
+        old_ratio = (tab.scroll_offset / old_max_off) if old_max_off > 0 else 0.0
         self.trace_visible = not self.trace_visible
+        new_total = len(self._build_main_lines(tab))
+        new_max_off = max(new_total - self._main_avail_rows(tab), 0)
+        if old_max_off > 0 and new_max_off > 0:
+            tab.scroll_offset = int(round(old_ratio * new_max_off))
+        else:
+            tab.scroll_offset = min(tab.scroll_offset, new_max_off)
+        self._scroll_selection_into_view()
         if self.view == "main":
             self._redraw()
 
@@ -1194,18 +1307,23 @@ class TUI:
 
     def _scroll_up(self):
         tab = self._active_tab
-        page = max(self.rows - self._content_start - 2, 1)
-        tab.scroll_offset += page
+        page = max(self._main_avail_rows(tab) - 1, 1)
+        lines = self._build_main_lines(tab)
+        max_off = max(len(lines) - self._main_avail_rows(tab), 0)
+        tab.scroll_offset = min(tab.scroll_offset + page, max_off)
         self._redraw()
 
     def _scroll_down(self):
         tab = self._active_tab
-        page = max(self.rows - self._content_start - 2, 1)
+        page = max(self._main_avail_rows(tab) - 1, 1)
         tab.scroll_offset = max(tab.scroll_offset - page, 0)
         self._redraw()
 
     def _scroll_lines_up(self, n: int = 3):
-        self._active_tab.scroll_offset += n
+        tab = self._active_tab
+        lines = self._build_main_lines(tab)
+        max_off = max(len(lines) - self._main_avail_rows(tab), 0)
+        tab.scroll_offset = min(tab.scroll_offset + n, max_off)
         self._redraw()
 
     def _scroll_lines_down(self, n: int = 3):
@@ -1219,27 +1337,53 @@ class TUI:
             tab = self._active_tab
         lines: list[str] = []
         max_w = max(self.cols - 4, 20)
-        for entry in tab.log_lines:
+        proposal_selected = (
+            self._confirming
+            and tab.id == "planner"
+            and self._nav_step == -1
+            and self._proposal_log_start >= 0
+        )
+        for idx, entry in enumerate(tab.log_lines):
             if entry.is_trace:
+                if tab.id == "planner":
+                    continue
                 if not self.trace_visible:
                     continue
                 for tline in entry.text.splitlines():
                     while len(tline) > max_w:
-                        lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
+                        text = f'  {DIM}{tline[:max_w]}{RESET}'
+                        if proposal_selected and idx >= self._proposal_log_start:
+                            lines.append(f' {GREEN}▎{RESET}{text}')
+                        else:
+                            lines.append(text)
                         tline = tline[max_w:]
-                    lines.append(f'  {DIM}{tline}{RESET}')
+                    text = f'  {DIM}{tline}{RESET}'
+                    if proposal_selected and idx >= self._proposal_log_start:
+                        lines.append(f' {GREEN}▎{RESET}{text}')
+                    else:
+                        lines.append(text)
             elif entry.is_output:
-                if not self.trace_visible:
+                if tab.id == "planner":
                     continue
                 for tline in entry.text.splitlines():
                     while len(tline) > max_w:
-                        lines.append(f'  {tline[:max_w]}')
+                        text = f'  {tline[:max_w]}'
+                        if proposal_selected and idx >= self._proposal_log_start:
+                            lines.append(f' {GREEN}▎{RESET}{text}')
+                        else:
+                            lines.append(text)
                         tline = tline[max_w:]
-                    lines.append(f'  {tline}')
+                    text = f'  {tline}'
+                    if proposal_selected and idx >= self._proposal_log_start:
+                        lines.append(f' {GREEN}▎{RESET}{text}')
+                    else:
+                        lines.append(text)
             else:
                 is_step = entry.step_idx >= 0
-                if is_step and self._confirming and entry.step_idx == self._nav_step:
-                    lines.append(f' {GREEN}▎{RESET}{entry.text}')
+                if is_step and entry.step_idx == self._nav_step:
+                    lines.append(f' {GREEN}▎{RESET} {entry.text}')
+                elif proposal_selected and idx >= self._proposal_log_start:
+                    lines.append(f' {GREEN}▎{RESET} {entry.text}')
                 else:
                     lines.append(f' {entry.text}')
         # Active streaming content (not yet baked)
@@ -1274,11 +1418,9 @@ class TUI:
             if self.view == "main":
                 tab = self._active_tab
                 lines = self._build_main_lines(tab)
-                confirm_rows = 3 if (self._confirming and not self._browsing and self.active_tab_idx == 0) else 0
                 spinner_active = (tab.streaming and tab.spinner_label
                                   and not (tab.trace_buf and self.trace_visible))
-                spinner_rows = 1 if spinner_active else 0
-                avail = self.rows - cs + 1 - confirm_rows - spinner_rows
+                avail = self._main_avail_rows(tab)
 
                 # Clamp scroll offset
                 max_off = max(len(lines) - avail, 0)
@@ -1288,6 +1430,9 @@ class TUI:
                 # Viewport window
                 end = len(lines) - tab.scroll_offset
                 start = max(end - avail, 0)
+                if tab.scroll_offset >= max_off and max_off > 0:
+                    start = 0
+                    end = min(avail, len(lines))
                 for line in lines[start:end]:
                     self._write_raw(f'{line}\n')
 
