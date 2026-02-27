@@ -34,7 +34,7 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
     Status is one of: "proved", "not_proved", "error".
     """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-        f.write(f"# {problem_name}\n\n{statement}\n")
+        f.write(f"{statement}\n")
         theorem_path = f.name
 
     cmd = ["openprover", theorem_path, "--model", args.model,
@@ -205,7 +205,7 @@ def main():
         print(f"=== Running openprover on {problem_name} ===")
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(f"# {problem_name}\n\n{statement}\n")
+            f.write(f"{statement}\n")
             theorem_path = f.name
 
         cmd = ["openprover", theorem_path, "--model", args.model,
