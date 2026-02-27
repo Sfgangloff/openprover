@@ -2,6 +2,7 @@
 
 import argparse
 import signal
+import sys
 from pathlib import Path
 
 from openprover import __version__
@@ -9,8 +10,31 @@ from .llm import LLMClient, HFClient
 from .prover import Prover
 from .tui import TUI, HeadlessTUI
 
+SUBCOMMANDS = {"inspect"}
+
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
+        cmd = sys.argv[1]
+        if cmd == "inspect":
+            return _cmd_inspect()
+
+    return _cmd_prove()
+
+
+def _cmd_inspect():
+    parser = argparse.ArgumentParser(
+        prog="openprover inspect",
+        description="Browse LLM prompts and outputs from an OpenProver run",
+    )
+    parser.add_argument("run_dir", nargs="?", help="Run directory (default: most recent in runs/)")
+    args = parser.parse_args(sys.argv[2:])
+
+    from .inspect import inspect_main
+    inspect_main(args.run_dir)
+
+
+def _cmd_prove():
     parser = argparse.ArgumentParser(
         prog="openprover",
         description="Theorem prover powered by language models",
@@ -90,7 +114,6 @@ def main():
     }
     VLLM_MODELS = {"minimax-m2.5"}  # served via vLLM (standard OpenAI API)
 
-    # Construct LLM client factories — Prover calls these after work_dir setup.
     def _make_client(model_alias, archive_dir):
         if model_alias in HF_MODEL_MAP:
             return HFClient(HF_MODEL_MAP[model_alias], archive_dir,
@@ -146,7 +169,6 @@ def main():
         cost = prover.planner_llm.total_cost + prover.worker_llm.total_cost
         calls = prover.planner_llm.call_count + prover.worker_llm.call_count
         tui.cleanup()
-        # Print summary to regular stdout after TUI is gone
         has_proof = ((prover.work_dir / "PROOF.md").exists()
                      or (prover.work_dir / "PROOF.lean").exists())
         print(f"  {calls} calls · ${cost:.4f}")

@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 """Browse LLM prompts and outputs from an OpenProver run directory."""
 
-import argparse
 import json
 import os
 import signal
@@ -12,7 +10,6 @@ import textwrap
 import tty
 from pathlib import Path
 
-# ANSI codes
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
@@ -23,13 +20,7 @@ BLUE = "\033[38;5;75m"
 CYAN = "\033[38;5;116m"
 GRAY = "\033[38;5;245m"
 
-HEADER_ROWS = 3  # header + controls + separator
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Browse prompts/outputs from an OpenProver run")
-    p.add_argument("run_dir", nargs="?", help="Run directory (default: most recent in runs/)")
-    return p.parse_args()
+HEADER_ROWS = 3
 
 
 def find_latest_run() -> Path:
@@ -45,15 +36,14 @@ def find_latest_run() -> Path:
     return max(dirs, key=lambda d: d.stat().st_mtime)
 
 
-def load_json(path: Path) -> dict | None:
+def _load_json(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, FileNotFoundError, OSError):
         return None
 
 
-def format_tokens(data: dict) -> str:
-    """Extract token info from archive JSON for the header."""
+def _format_tokens(data: dict) -> str:
     resp = data.get("response") or {}
     usage = resp.get("usage", {})
     inp = usage.get("input_tokens", 0)
@@ -72,7 +62,7 @@ def format_tokens(data: dict) -> str:
     return " ".join(parts)
 
 
-def format_cost(data: dict) -> str:
+def _format_cost(data: dict) -> str:
     resp = data.get("response") or {}
     cost = resp.get("total_cost_usd", 0.0)
     if cost:
@@ -80,21 +70,20 @@ def format_cost(data: dict) -> str:
     return ""
 
 
-def format_duration(data: dict) -> str:
+def _format_duration(data: dict) -> str:
     ms = data.get("elapsed_ms", 0)
     if ms:
         return f"{ms / 1000:.1f}s"
     return ""
 
 
-def make_pages(data: dict, step: int | str, role: str, label: str) -> list[dict]:
+def _make_pages(data: dict, step: int | str, role: str, label: str) -> list[dict]:
     """Create prompt and output pages from an archive JSON dict."""
     pages = []
     model = data.get("model", "")
-    meta_parts = [p for p in [model, format_duration(data), format_tokens(data), format_cost(data)] if p]
+    meta_parts = [p for p in [model, _format_duration(data), _format_tokens(data), _format_cost(data)] if p]
     meta = " | ".join(meta_parts)
 
-    # Prompt page
     sys_prompt = data.get("system_prompt", "")
     user_prompt = data.get("prompt", "")
     prompt_parts = []
@@ -114,7 +103,6 @@ def make_pages(data: dict, step: int | str, role: str, label: str) -> list[dict]
         "metadata": meta,
     })
 
-    # Output page
     error = data.get("error")
     result = data.get("result_text", "")
     thinking = data.get("thinking", "")
@@ -144,8 +132,7 @@ def make_pages(data: dict, step: int | str, role: str, label: str) -> list[dict]
     return pages
 
 
-def make_lean_page(step: int, label: str, lean_code: str, result_text: str) -> dict:
-    """Create a page for a Lean verification attempt."""
+def _make_lean_page(step: int, label: str, lean_code: str, result_text: str) -> dict:
     success = result_text.strip() == "OK"
     segments = [
         ("normal", "```lean\n" + lean_code + "\n```"),
@@ -166,32 +153,29 @@ def make_lean_page(step: int, label: str, lean_code: str, result_text: str) -> d
     }
 
 
-def load_lean_pages(step_dir: Path, step_num: int) -> list[dict]:
-    """Load Lean verification pages from a step's lean/ directory."""
+def _load_lean_pages(step_dir: Path, step_num: int) -> list[dict]:
     lean_dir = step_dir / "lean"
     if not lean_dir.exists():
         return []
 
     pages = []
 
-    # Item verifications: item_N_slug.lean + result_N_slug.txt
     item_files = sorted(lean_dir.glob("item_*.lean"))
     for item_path in item_files:
-        name = item_path.stem  # e.g. "item_0_my-slug"
-        parts = name.split("_", 2)  # ["item", "0", "my-slug"]
+        name = item_path.stem
+        parts = name.split("_", 2)
         slug = parts[2] if len(parts) >= 3 else name
         result_path = lean_dir / f"result_{'_'.join(parts[1:])}.txt"
         lean_code = item_path.read_text()
         result_text = result_path.read_text() if result_path.exists() else "(no result)"
-        pages.append(make_lean_page(step_num, f"Lean [[{slug}]]", lean_code, result_text))
+        pages.append(_make_lean_page(step_num, f"Lean [[{slug}]]", lean_code, result_text))
 
-    # Proof submission: proof_attempt.lean + proof_result.txt
     proof_path = lean_dir / "proof_attempt.lean"
     if proof_path.exists():
         lean_code = proof_path.read_text()
         result_path = lean_dir / "proof_result.txt"
         result_text = result_path.read_text() if result_path.exists() else "(no result)"
-        pages.append(make_lean_page(step_num, "Lean Proof Attempt", lean_code, result_text))
+        pages.append(_make_lean_page(step_num, "Lean Proof Attempt", lean_code, result_text))
 
     return pages
 
@@ -211,46 +195,39 @@ def load_pages(run_dir: Path) -> list[dict]:
     for step_dir in step_dirs:
         step_num = int(step_dir.name.removeprefix("step_"))
 
-        # Planner call
-        planner = load_json(step_dir / "planner_call.json")
+        planner = _load_json(step_dir / "planner_call.json")
         if planner:
-            pages.extend(make_pages(planner, step_num, "planner", "Planner"))
+            pages.extend(_make_pages(planner, step_num, "planner", "Planner"))
 
-        # Retries
         retry_idx = 1
         while True:
             retry_path = step_dir / f"planner_call_retry_{retry_idx}.json"
-            retry_data = load_json(retry_path)
+            retry_data = _load_json(retry_path)
             if not retry_data:
                 break
-            pages.extend(make_pages(retry_data, step_num, "retry", f"Retry {retry_idx}"))
+            pages.extend(_make_pages(retry_data, step_num, "retry", f"Retry {retry_idx}"))
             retry_idx += 1
 
-        # Workers
         workers_dir = step_dir / "workers"
         if workers_dir.exists():
-            # Worker calls (spawn action)
             worker_idx = 0
             while True:
                 worker_path = workers_dir / f"worker_{worker_idx}_call.json"
-                worker_data = load_json(worker_path)
+                worker_data = _load_json(worker_path)
                 if not worker_data:
                     break
-                pages.extend(make_pages(worker_data, step_num, "worker", f"Worker {worker_idx}"))
+                pages.extend(_make_pages(worker_data, step_num, "worker", f"Worker {worker_idx}"))
                 worker_idx += 1
 
-            # Search call (literature_search action)
-            search_data = load_json(workers_dir / "search_call.json")
+            search_data = _load_json(workers_dir / "search_call.json")
             if search_data:
-                pages.extend(make_pages(search_data, step_num, "search", "Search"))
+                pages.extend(_make_pages(search_data, step_num, "search", "Search"))
 
-        # Lean verification attempts
-        pages.extend(load_lean_pages(step_dir, step_num))
+        pages.extend(_load_lean_pages(step_dir, step_num))
 
-    # Discussion call at run root
-    discussion = load_json(run_dir / "discussion_call.json")
+    discussion = _load_json(run_dir / "discussion_call.json")
     if discussion:
-        pages.extend(make_pages(discussion, "end", "discussion", "Discussion"))
+        pages.extend(_make_pages(discussion, "end", "discussion", "Discussion"))
 
     return pages
 
@@ -281,7 +258,6 @@ class InspectTUI:
         except (termios.error, OSError):
             self._old_termios = None
 
-        # Alt screen, hide cursor, enable mouse
         sys.stdout.write("\033[?1049h\033[2J\033[?25l\033[?1000h\033[?1006h")
         sys.stdout.flush()
 
@@ -322,7 +298,6 @@ class InspectTUI:
                     self.scroll_offset = max(0, self.scroll_offset - content_h // 2)
                     self._draw()
                 elif key == " ":
-                    # Space scrolls down a page
                     content_h = self.rows - HEADER_ROWS
                     self.scroll_offset += content_h // 2
                     self._draw()
@@ -354,7 +329,6 @@ class InspectTUI:
             signal.signal(signal.SIGWINCH, self._old_sigwinch)
 
     def _read_key(self) -> str:
-        """Read a single keypress, handling escape sequences and mouse events."""
         ch = os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="replace")
         if ch == "\x1b":
             import select as sel
@@ -371,13 +345,12 @@ class InspectTUI:
                     elif ch3 == "D":
                         return "left"
                     elif ch3 == "5":
-                        os.read(sys.stdin.fileno(), 1)  # consume ~
+                        os.read(sys.stdin.fileno(), 1)
                         return "pgup"
                     elif ch3 == "6":
-                        os.read(sys.stdin.fileno(), 1)  # consume ~
+                        os.read(sys.stdin.fileno(), 1)
                         return "pgdn"
                     elif ch3 == "<":
-                        # SGR mouse event: \033[<button;x;yM or \033[<button;x;ym
                         buf = ""
                         while True:
                             c = os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="replace")
@@ -391,9 +364,8 @@ class InspectTUI:
                                 return "scroll_up"
                             elif btn == 65:
                                 return "scroll_down"
-                        return ""  # ignore other mouse events
+                        return ""
                     else:
-                        # Consume rest of unknown sequence
                         while sel.select([sys.stdin], [], [], 0.01)[0]:
                             os.read(sys.stdin.fileno(), 1)
                 return "\x1b"
@@ -401,11 +373,9 @@ class InspectTUI:
         return ch
 
     def _render_lines(self, page: dict) -> list[str]:
-        """Build the display lines for a page, with ANSI codes."""
         lines = []
         width = self.cols
 
-        # Show thinking first if trace is visible
         if self.trace_visible and page.get("thinking"):
             thinking = page["thinking"]
             lines.append(f"{GRAY}── Reasoning Trace ──{RESET}")
@@ -418,7 +388,6 @@ class InspectTUI:
             lines.append(f"{GRAY}── End Trace ──{RESET}")
             lines.append("")
 
-        # Segments
         style_map = {
             "normal": "",
             "dim": DIM,
@@ -439,15 +408,12 @@ class InspectTUI:
         content_h = self.rows - HEADER_ROWS
         lines = self._render_lines(page)
 
-        # Clamp scroll
         max_scroll = max(0, len(lines) - content_h)
         self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
 
         buf = []
-        # Clear screen
         buf.append("\033[2J\033[H")
 
-        # Header line 1: step | label | page position | metadata
         step = page["step"]
         step_str = f"Step {step}" if isinstance(step, int) else str(step).capitalize()
         label = page["label"]
@@ -471,7 +437,6 @@ class InspectTUI:
             header += f" {DIM}│ {meta}{RESET}"
         buf.append(header)
 
-        # Header line 2: controls
         scroll_info = ""
         if len(lines) > content_h:
             pct = int(self.scroll_offset / max(1, max_scroll) * 100)
@@ -479,15 +444,12 @@ class InspectTUI:
         controls = f" {DIM}←/→ pages  ↑/↓/scroll  t trace  g/G top/bottom  q quit{scroll_info}{RESET}"
         buf.append(controls)
 
-        # Separator
         buf.append(f" {DIM}{'─' * (self.cols - 2)}{RESET}")
 
-        # Content area
         visible = lines[self.scroll_offset:self.scroll_offset + content_h]
         for line in visible:
             buf.append(f" {line}")
 
-        # Pad remaining lines
         for _ in range(content_h - len(visible)):
             buf.append("")
 
@@ -495,28 +457,24 @@ class InspectTUI:
         sys.stdout.flush()
 
 
-def main():
-    args = parse_args()
-    if args.run_dir:
-        run_dir = Path(args.run_dir)
+def inspect_main(run_dir: str | None = None):
+    """Entry point for the inspect subcommand."""
+    if run_dir:
+        rd = Path(run_dir)
     else:
-        run_dir = find_latest_run()
+        rd = find_latest_run()
 
-    if not run_dir.exists():
-        print(f"Error: {run_dir} does not exist", file=sys.stderr)
+    if not rd.exists():
+        print(f"Error: {rd} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading {run_dir.name}...", end="", flush=True)
-    pages = load_pages(run_dir)
+    print(f"Loading {rd.name}...", end="", flush=True)
+    pages = load_pages(rd)
     print(f" {len(pages)} pages")
 
     if not pages:
         print("No LLM calls found.")
         sys.exit(0)
 
-    tui = InspectTUI(pages, run_dir)
+    tui = InspectTUI(pages, rd)
     tui.run()
-
-
-if __name__ == "__main__":
-    main()
