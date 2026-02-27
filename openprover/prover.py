@@ -48,8 +48,6 @@ class Repo:
                 stripped = line.strip()
                 if stripped.startswith("-- "):
                     return stripped[3:].removeprefix("Summary:").strip()
-                if stripped and not stripped.startswith("--"):
-                    break
             return "(no summary)"
         first_line = text.split("\n", 1)[0]
         return first_line.removeprefix("Summary:").strip()
@@ -349,6 +347,9 @@ class Prover:
             step_num=self.step_num,
             max_steps=self.max_steps,
             parallelism=self.parallelism,
+            has_lean_theorem=bool(self.lean_theorem_text),
+            has_proof_md=(self.work_dir / "PROOF.md").exists(),
+            has_proof_lean=(self.work_dir / "PROOF.lean").exists(),
         )
 
         # Planner LLM call (with up to 2 retries on parse failure)
@@ -459,9 +460,9 @@ class Prover:
         self._save_step(step_dir, plan)
 
         # Dispatch
-        if action == "proof_found":
+        if action in ("submit_proof", "proof_found"):
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
-            return self._handle_proof_found(plan)
+            return self._handle_submit_proof(plan)
         if action == "give_up":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
             return self._handle_give_up()
@@ -521,24 +522,24 @@ class Prover:
             self.tui.log("Feedback noted — will replan next step", color="yellow")
             return "continue"
 
-    def _handle_proof_found(self, plan: dict) -> str:
+    def _handle_submit_proof(self, plan: dict) -> str:
         if self.mode == "formalize_only":
-            self.tui.log("proof_found not available in formalize-only mode", color="red")
+            self.tui.log("submit_proof not available in formalize-only mode", color="red")
             self._push_output(
-                "proof_found rejected: in formalize-only mode, use submit_lean_proof instead."
+                "submit_proof rejected: in formalize-only mode, use submit_lean_proof instead."
             )
             return "continue"
 
         proof = plan.get("proof", "")
         if not proof:
-            self.tui.log("proof_found but no proof text — continuing", color="red")
-            self._push_output("proof_found rejected: no proof text provided.")
+            self.tui.log("submit_proof but no proof text — continuing", color="red")
+            self._push_output("submit_proof rejected: no proof text provided.")
             return "continue"
         self.proof_text = proof
         (self.work_dir / "PROOF.md").write_text(proof)
-        self.tui.log("Proof found!", color="green", bold=True)
+        self.tui.log("PROOF.md written", color="green", bold=True)
         self.tui.log(f"  {self.work_dir / 'PROOF.md'}", dim=True)
-        logger.info("Proof found! PROOF.md written")
+        logger.info("PROOF.md written")
 
         if self.mode == "prove_and_formalize":
             if not (self.work_dir / "PROOF.lean").exists():
@@ -697,7 +698,7 @@ class Prover:
 
             self._push_output(
                 "Lean proof verified! PROOF.lean has been written.\n"
-                "Now produce the informal proof using proof_found."
+                "Now produce the informal proof using submit_proof."
             )
             return "continue"
         else:

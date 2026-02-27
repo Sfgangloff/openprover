@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 # ── Action types ────────────────────────────────────────────
 
 ACTIONS = [
-    "proof_found", "give_up", "read_items", "write_items",
+    "submit_proof", "give_up", "read_items", "write_items",
     "spawn", "literature_search",
     "submit_lean_proof", "read_theorem",
 ]
@@ -25,23 +25,33 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
 _TQ = '"""'  # triple-quote for embedding in prompts
 
-def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True,
-                          lean_mode: str = "prove", num_sorries: int = 0,
-                          step_num: int = 1, lean_items: bool = False) -> str:
-    """Build the planner system prompt, conditionally omitting actions."""
-    has_lean = lean_mode in ("prove_and_formalize", "formalize_only")
 
+def _build_actions(*, lean_mode: str, has_lean: bool,
+                   allow_give_up: bool, isolation: bool,
+                   num_sorries: int) -> str:
+    """Build the actions list section of the system prompt."""
     actions = (
         "- **spawn**: Send tasks to workers (they do the actual math / verification / exploration). Workers are pure reasoning - they only see the context you provide to them.\n"
         "- **read_items**: Read the full content of repo items (you only see one-line summaries by default).\n"
         "- **write_items**: Create, update, or delete one or more repo items.\n"
-        "- **read_theorem**: Re-read the original theorem statement(s) and any provided proof.\n"
     )
+    if has_lean:
+        actions += "- **read_theorem**: Re-read the original theorem statement, formal Lean statement, and any provided proof.\n"
+    else:
+        actions += "- **read_theorem**: Re-read the original theorem statement.\n"
+
     if lean_mode != "formalize_only":
-        actions += (
-            "- **proof_found**: Declare success with an informal proof. **This terminates the session** (unless a formal Lean proof is also required). "
-            "You must be confident the proof is correct - it must have been independently verified by a worker.\n"
-        )
+        if has_lean:
+            actions += (
+                "- **submit_proof**: Submit an informal proof (writes PROOF.md). "
+                "The session ends when both PROOF.md and PROOF.lean are written. "
+                "Can be re-submitted to refine, but only submit once you are confident the proof is correct.\n"
+            )
+        else:
+            actions += (
+                "- **submit_proof**: Submit the proof (writes PROOF.md). **This terminates the session.** "
+                "The proof must be complete, rigorous, and independently verified by a worker before submission.\n"
+            )
     if allow_give_up:
         actions += "- **give_up**: Declare failure.\n"
     if not isolation:
@@ -51,10 +61,15 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
     if has_lean:
         actions += (
             f"- **submit_lean_proof**: Submit a formal Lean 4 proof. Provide {num_sorries} replacement block(s) "
-            f"(one per `sorry` in THEOREM.lean), plus optional context. No `import` statements allowed (all imports are already present in the theorem statement). "
-            f"The completed file is automatically verified with Lean. **If verification succeeds, PROOF.lean is written.**\n"
+            f"(one per `sorry` in THEOREM.lean), plus optional context. No `import` statements allowed. "
+            f"Auto-verified with Lean. **If verification succeeds, PROOF.lean is written.**\n"
         )
+    return actions
 
+
+def _build_principles(*, lean_mode: str, has_lean: bool,
+                      isolation: bool, lean_items: bool) -> str:
+    """Build the principles section of the system prompt."""
     principles = (
         "- You are the project leader. Delegate all mathematical work to workers - including problem analysis, exploring structure, checking special cases, and brainstorming strategies. Use parallel workers aggressively.\n"
         "- On step 1, immediately spawn workers to analyze the problem, explore key cases, and identify promising approaches. Do not spend too much time exploring the problem yourself.\n"
@@ -63,7 +78,6 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "- Write clear, direct task descriptions for the workers. State exactly what the worker should do. Include all relevant context — workers only see what you give them.\n"
         "- You decide the proof strategy based on worker results. Balance exploration and direct proof attempts.\n"
         "- Store failed attempts in the repo - they prevent repeating mistakes.\n"
-        "- Verify the proof with an independent worker before declaring proof_found.\n"
         "- One focused task per worker. Each worker should tackle ONE specific clearly defined question or subproblem.\n"
         "- Don't get stuck. If the first proof avenue does not work, try others.\n"
     )
@@ -77,9 +91,10 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         )
     if lean_mode == "prove_and_formalize":
         principles += (
-            "- A formal Lean 4 proof (PROOF.lean) is also required. The session ends only when BOTH proof_found AND submit_lean_proof succeed.\n"
-            "- After you found a proof in English, use the read_theorem action to see the formal theorem statement in Lean.\n"
-            "- Use submit_lean_proof for the final formal proof submission.\n"
+            "- Both an informal proof (PROOF.md) and a formal Lean 4 proof (PROOF.lean) are required. "
+            "The session ends only when both are written.\n"
+            "- After you have a proof in English, use read_theorem to see the formal theorem statement in Lean.\n"
+            "- Use submit_lean_proof for the formal proof. Use submit_proof for the informal proof.\n"
         )
     elif lean_mode == "formalize_only":
         principles += (
@@ -87,11 +102,21 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
             "- Use read_theorem to view the informal proof and Lean theorem statement.\n"
             "- Use submit_lean_proof to submit the final formalized proof. The session ends when it succeeds.\n"
         )
+    elif lean_mode == "prove":
+        principles += (
+            "- Have the proof independently verified by a worker before calling submit_proof.\n"
+        )
+    return principles
 
-    toml_fields = ""
+
+def _build_toml_fields(*, lean_mode: str, has_lean: bool,
+                       isolation: bool, lean_items: bool,
+                       num_sorries: int) -> str:
+    """Build the TOML fields reference section."""
+    fields = ""
     if lean_mode != "formalize_only":
-        toml_fields += f"**proof_found**: `proof = {_TQ}...{_TQ}`\n"
-    toml_fields += (
+        fields += f"**submit_proof**: `proof = {_TQ}...{_TQ}`\n"
+    fields += (
         f'**read_items**: `read = ["slug-1", "slug-2"]`\n'
         "**write_items**: one or more `[[items]]` sections:\n"
         "```toml\n"
@@ -110,9 +135,9 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         f"**spawn**: one or more `[[tasks]]` sections with `description = {_TQ}...{_TQ}`\n"
     )
     if not isolation:
-        toml_fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
+        fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
     if lean_items:
-        toml_fields += (
+        fields += (
             f"\n**write_items** (lean format — auto-verified): add `format = \"lean\"` to the item. "
             f"Include natural language descriptions of all theorems, definitions, and proofs as `--` comments. "
             f"The first comment line is the summary.\n"
@@ -134,7 +159,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
             "Items that fail Lean verification are NOT saved to the repo.\n"
         )
     if has_lean:
-        toml_fields += (
+        fields += (
             f"\n**submit_lean_proof**: provide {num_sorries} `[[lean_blocks]]` section(s) + optional `lean_context`:\n"
             "```toml\n"
             f"lean_context = {_TQ}\n"
@@ -143,7 +168,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
             "\n"
         )
         for i in range(min(num_sorries, 3)):
-            toml_fields += (
+            fields += (
                 f"[[lean_blocks]]\n"
                 f"code = {_TQ}\n"
                 f"replacement for sorry #{i}\n"
@@ -151,9 +176,83 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
                 "\n"
             )
         if num_sorries > 3:
-            toml_fields += f"# ... up to {num_sorries} [[lean_blocks]] total\n\n"
-        toml_fields += "```\n"
+            fields += f"# ... up to {num_sorries} [[lean_blocks]] total\n\n"
+        fields += "```\n"
+    return fields
 
+
+def _build_repo_items_section(*, lean_items: bool) -> str:
+    """Build the Repo Items documentation section."""
+    section = (
+        "Items in the repo are [[slug]]-referenced files. Markdown items have format:\n"
+        "```\n"
+        "Summary: One sentence.\n"
+        "\n"
+        "<full content>\n"
+        "```\n"
+        "\n"
+    )
+    if lean_items:
+        section += (
+            "Lean items (format=\"lean\") are `.lean` files. The first `-- ` comment line is the summary:\n"
+            "```lean\n"
+            "-- Summary: One sentence.\n"
+            "\n"
+            "-- Natural language description of each definition/theorem/proof as comments.\n"
+            "theorem foo : ... := by ...\n"
+            "```\n"
+            "\n"
+        )
+    section += (
+        "Store: proven lemmas, failed attempts (brief), key observations, literature findings.\n"
+        "Each item should be self-contained and atomic - one logical thing per item.\n"
+        "Don't store: trivial facts, work-in-progress that belongs on the whiteboard.\n"
+    )
+    return section
+
+
+def _build_submit_proof_section(*, lean_mode: str, has_lean: bool) -> str:
+    """Build the CRITICAL: submit_proof section."""
+    if lean_mode == "formalize_only":
+        return ""
+    if has_lean:
+        return (
+            "## submit_proof\n"
+            "\n"
+            "Only use submit_proof when you have a COMPLETE, RIGOROUS proof. "
+            "Have it independently verified by a worker first. "
+            "You can re-submit to refine the proof if needed.\n"
+        )
+    return (
+        "## CRITICAL: submit_proof\n"
+        "\n"
+        "NEVER use submit_proof unless you have a COMPLETE, RIGOROUS proof that has been VERIFIED by an independent worker. "
+        "submit_proof **terminates the session** — there is no going back. The proof field must contain the full proof text.\n"
+    )
+
+
+def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True,
+                          lean_mode: str = "prove", num_sorries: int = 0,
+                          step_num: int = 1, lean_items: bool = False) -> str:
+    """Build the planner system prompt, conditionally omitting actions."""
+    has_lean = lean_mode in ("prove_and_formalize", "formalize_only")
+
+    actions = _build_actions(
+        lean_mode=lean_mode, has_lean=has_lean, allow_give_up=allow_give_up,
+        isolation=isolation, num_sorries=num_sorries,
+    )
+    principles = _build_principles(
+        lean_mode=lean_mode, has_lean=has_lean,
+        isolation=isolation, lean_items=lean_items,
+    )
+    toml_fields = _build_toml_fields(
+        lean_mode=lean_mode, has_lean=has_lean, isolation=isolation,
+        lean_items=lean_items, num_sorries=num_sorries,
+    )
+    repo_items = _build_repo_items_section(lean_items=lean_items)
+    submit_proof_section = _build_submit_proof_section(
+        lean_mode=lean_mode, has_lean=has_lean,
+    )
 
     return (
         "You are a senior research mathematician coordinating a proof effort.\n"
@@ -183,34 +282,11 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "- Abbreviations and arrows freely\n"
         '"WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
         "\n"
-        "## Repo Items\n"
+        f"## Repo Items\n"
         "\n"
-        "Items in the repo are [[slug]]-referenced files. Markdown items have format:\n"
-        "```\n"
-        "Summary: One sentence.\n"
+        f"{repo_items}"
         "\n"
-        "<full content>\n"
-        "```\n"
-        "\n"
-        + (
-            "Lean items (format=\"lean\") are `.lean` files. The first `-- ` comment line is the summary:\n"
-            "```lean\n"
-            "-- Summary: One sentence.\n"
-            "\n"
-            "-- Natural language description of each definition/theorem/proof as comments.\n"
-            "theorem foo : ... := by ...\n"
-            "```\n"
-            "\n"
-            if lean_items else ""
-        ) +
-        "Store: proven lemmas, failed attempts (brief), key observations, literature findings.\n"
-        "Each item should be self-contained and atomic - one logical thing per item.\n"
-        "Don't store: trivial facts, work-in-progress that belongs on the whiteboard.\n"
-        "\n"
-        "## CRITICAL: proof_found\n"
-        "\n"
-        "NEVER use proof_found unless you have a COMPLETE, RIGOROUS proof that has been VERIFIED by an independent worker. "
-        "proof_found **terminates the session** - there is no going back. The proof field must contain the full proof text.\n"
+        f"{submit_proof_section}"
         "\n"
         "## Output Format\n"
         "\n"
@@ -227,7 +303,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "```\n"
         "\n"
         "Whiteboard rule: include a complete `whiteboard` field on every step except for step 1, "
-        "including terminal actions like `proof_found` and `submit_lean_proof`.\n"
+        "including terminal actions like `submit_proof` and `submit_lean_proof`.\n"
         "\n"
         "### Action-specific TOML fields:\n"
         "\n"
@@ -263,8 +339,23 @@ def format_planner_prompt(
     step_num: int,
     max_steps: int,
     parallelism: int = 1,
+    *,
+    has_lean_theorem: bool = False,
+    has_proof_md: bool = False,
+    has_proof_lean: bool = False,
 ) -> str:
     parts = [f"# Whiteboard\n\n{whiteboard}"]
+
+    # Status indicators
+    status_lines = [f"- Theorem statement: yes"]
+    if has_lean_theorem:
+        status_lines.append(f"- Formal Lean statement: yes")
+        status_lines.append(f"- PROOF.md: {'yes' if has_proof_md else 'no'}")
+        status_lines.append(f"- PROOF.lean: {'yes' if has_proof_lean else 'no'}")
+    else:
+        status_lines.append(f"- PROOF.md: {'yes' if has_proof_md else 'no'}")
+    parts.append(f"\n\n# Status\n\n" + "\n".join(status_lines))
+
     if repo_index:
         parts.append(f"\n\n# Repository\n\n{repo_index}")
     if prev_outputs:

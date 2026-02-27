@@ -33,6 +33,7 @@ ACTION_STYLE = {
     "read_items": CYAN,
     "write_items": CYAN,
     "read_theorem": CYAN,
+    "submit_proof": GREEN,
     "proof_found": GREEN,
     "submit_lean_proof": GREEN,
     "give_up": RED,
