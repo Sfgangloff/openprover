@@ -33,8 +33,6 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
     Returns (name, status, elapsed_seconds, error_message).
     Status is one of: "proved", "not_proved", "error".
     """
-    lean_theorem_path = lean_dir / "src" / f"{problem_name}.lean"
-
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
         f.write(f"# {problem_name}\n\n{statement}\n")
         theorem_path = f.name
@@ -48,9 +46,11 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
     if args.worker_model:
         cmd.extend(["--worker-model", args.worker_model])
 
-    if lean_theorem_path.is_file():
-        cmd.extend(["--lean-project", str(lean_dir)])
-        cmd.extend(["--lean-theorem", str(lean_theorem_path)])
+    if not args.no_lean:
+        lean_theorem_path = lean_dir / "src" / f"{problem_name}.lean"
+        if lean_theorem_path.is_file():
+            cmd.extend(["--lean-project", str(lean_dir)])
+            cmd.extend(["--lean-theorem", str(lean_theorem_path)])
 
     hf_models = {"qed-nano", "qwen3-4b"}
     used_models = {args.model, args.planner_model, args.worker_model} - {None}
@@ -150,18 +150,21 @@ def main():
                         help="Server URL for local models (default: http://localhost:8000)")
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--autonomous", action="store_true")
+    parser.add_argument("--no-lean", action="store_true",
+                        help="Skip Lean setup/verification; run openprover without formal checking")
     parser.add_argument("--isolation", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     repo_path = args.repo_path.resolve()
     lean_dir = repo_path / "lean4"
-    lake_dir = lean_dir / ".lake"
 
-    if not lake_dir.is_dir():
-        print(f"Error: {lake_dir} not found.", file=sys.stderr)
-        print("The Lean 4 project must be built first.", file=sys.stderr)
-        sys.exit(1)
+    if not args.no_lean:
+        lake_dir = lean_dir / ".lake"
+        if not lake_dir.is_dir():
+            print(f"Error: {lake_dir} not found.", file=sys.stderr)
+            print("The Lean 4 project must be built first.", file=sys.stderr)
+            sys.exit(1)
 
     json_path = repo_path / "informal" / "putnam.json"
     if not json_path.is_file():
@@ -200,8 +203,6 @@ def main():
     for problem_name, statement in problems.items():
         print(f"=== Running openprover on {problem_name} ===")
 
-        lean_theorem_path = lean_dir / "src" / f"{problem_name}.lean"
-
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(f"# {problem_name}\n\n{statement}\n")
             theorem_path = f.name
@@ -215,12 +216,14 @@ def main():
         if args.worker_model:
             cmd.extend(["--worker-model", args.worker_model])
 
-        if lean_theorem_path.is_file():
-            cmd.extend(["--lean-project", str(lean_dir)])
-            cmd.extend(["--lean-theorem", str(lean_theorem_path)])
-        else:
-            print(f"Warning: Lean theorem not found at {lean_theorem_path}."
-                  " Running without formal verification.", file=sys.stderr)
+        if not args.no_lean:
+            lean_theorem_path = lean_dir / "src" / f"{problem_name}.lean"
+            if lean_theorem_path.is_file():
+                cmd.extend(["--lean-project", str(lean_dir)])
+                cmd.extend(["--lean-theorem", str(lean_theorem_path)])
+            else:
+                print(f"Warning: Lean theorem not found at {lean_theorem_path}."
+                      " Running without formal verification.", file=sys.stderr)
 
         hf_models = {"qed-nano", "qwen3-4b"}
         used_models = {args.model, args.planner_model, args.worker_model} - {None}
