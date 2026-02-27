@@ -347,14 +347,14 @@ def format_planner_prompt(
     parts = [f"# Whiteboard\n\n{whiteboard}"]
 
     # Status indicators
-    status_lines = [f"- Theorem statement: yes"]
+    status_lines = [f"- Theorem statement: already present"]
     if has_lean_theorem:
-        status_lines.append(f"- Formal Lean statement: yes")
-        status_lines.append(f"- PROOF.md: {'yes' if has_proof_md else 'no'}")
-        status_lines.append(f"- PROOF.lean: {'yes' if has_proof_lean else 'no'}")
+        status_lines.append(f"- Formal Lean statement of theorem: already present")
+        status_lines.append(f"- Proof in natural language: {'already present' if has_proof_md else 'missing'}")
+        status_lines.append(f"- Formal Lean proof (verified): {'already present' if has_proof_lean else 'missing'}")
     else:
-        status_lines.append(f"- PROOF.md: {'yes' if has_proof_md else 'no'}")
-    parts.append(f"\n\n# Status\n\n" + "\n".join(status_lines))
+        status_lines.append(f"- Proof: {'already present' if has_proof_md else 'missing'}")
+    parts.append(f"\n\n# What we have\n\n" + "\n".join(status_lines))
 
     if repo_index:
         parts.append(f"\n\n# Repository\n\n{repo_index}")

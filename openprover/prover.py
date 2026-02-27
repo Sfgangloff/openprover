@@ -721,8 +721,14 @@ class Prover:
                 f"\n\nNumber of `sorry` keywords to replace: "
                 f"{self.lean_theorem.num_sorries}"
             )
-        if self.proof_md_text:
-            parts.append(f"\n\n## PROOF.md (provided)\n\n{self.proof_md_text}")
+        proof_md_path = self.work_dir / "PROOF.md"
+        if proof_md_path.exists():
+            parts.append(f"\n\n## PROOF.md\n\n{proof_md_path.read_text()}")
+        proof_lean_path = self.work_dir / "PROOF.lean"
+        if proof_lean_path.exists():
+            parts.append(
+                f"\n\n## PROOF.lean\n\n```lean\n{proof_lean_path.read_text()}\n```"
+            )
         self._push_output("\n".join(parts))
         self.tui.log("Read theorem content", dim=True)
         return "continue"
