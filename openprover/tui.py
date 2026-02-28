@@ -554,6 +554,7 @@ class TUI:
             "detail": detail,
             "trace": trace,
             "output": output,
+            "action_output": "",
             "rejected": rejected,
             "interrupted": interrupted,
             "feedback": feedback.strip(),
@@ -594,6 +595,18 @@ class TUI:
         self._sync_step_log_line(step_idx)
         if self.view == "main":
             self._redraw()
+
+    def append_step_action_output(self, step_num: int, text: str):
+        """Append action-produced output to a step entry by step number."""
+        if not text:
+            return
+        for entry in reversed(self.step_entries):
+            if entry.get("step_num") == step_num:
+                prev = entry.get("action_output", "")
+                entry["action_output"] = (
+                    f"{prev}\n\n{text}".strip() if prev else text
+                )
+                break
 
     # ── Spinner ─────────────────────────────────────────────────
 
@@ -1047,6 +1060,36 @@ class TUI:
                 add_section("Reasoning",
                             [f"{DIM}hidden (press r to show){RESET}"],
                             color=GREEN)
+
+        if action == "spawn":
+            worker_sections: list[str] = []
+            worker_tabs = entry.get("worker_tabs") or []
+            for tab in worker_tabs:
+                label = getattr(tab, "label", "").strip() or "Worker"
+                task_description = getattr(tab, "task_description", "").strip()
+                result_lines: list[str] = []
+                log_lines = getattr(tab, "log_lines", []) or []
+                for log_entry in log_lines:
+                    text = getattr(log_entry, "text", "")
+                    if not text or text == self._dim_separator():
+                        continue
+                    result_lines.append(text)
+                if not result_lines:
+                    continue
+                worker_sections.append(f"{BOLD}{label}{RESET}")
+                if task_description:
+                    worker_sections.append(f"{DIM}task:{RESET} {task_description}")
+                worker_sections.extend(result_lines)
+                worker_sections.append("")
+            if worker_sections:
+                # Trim trailing blank line between worker blocks.
+                if worker_sections[-1] == "":
+                    worker_sections.pop()
+                add_section("Worker Outputs", worker_sections, color=MAGENTA)
+
+        action_output = (entry.get("action_output") or "").rstrip()
+        if action_output and action != "spawn":
+            add_section("Action Output", action_output.splitlines(), color=MAGENTA)
 
         self._step_detail_text = "\n".join(parts) if parts else "  (no detail)"
         self._step_detail_scroll = min(
@@ -2191,6 +2234,7 @@ class HeadlessTUI:
         self.step_entries.append({
             "action": action, "summary": summary,
             "step_num": step_num, "detail": detail,
+            "action_output": "",
             "rejected": rejected, "interrupted": interrupted,
             "feedback": feedback.strip(),
         })
@@ -2224,6 +2268,17 @@ class HeadlessTUI:
         if detail_append:
             base = entry.get("detail", "")
             entry["detail"] = f"{base}\n\n{detail_append}".strip() if base else detail_append
+
+    def append_step_action_output(self, step_num: int, text: str):
+        if not text:
+            return
+        for entry in reversed(self.step_entries):
+            if entry.get("step_num") == step_num:
+                prev = entry.get("action_output", "")
+                entry["action_output"] = (
+                    f"{prev}\n\n{text}".strip() if prev else text
+                )
+                break
 
     def show_proposal(self, plan: dict):
         pass

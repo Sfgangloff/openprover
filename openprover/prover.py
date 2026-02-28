@@ -294,6 +294,7 @@ class Prover:
             self.prev_outputs.append(text)
             if len(self.prev_outputs) > 3:
                 self.prev_outputs = self.prev_outputs[-3:]
+            self.tui.append_step_action_output(self.step_num, text)
 
     def _apply_whiteboard_from_plan(self, plan: dict):
         """Apply planner whiteboard update if provided."""
