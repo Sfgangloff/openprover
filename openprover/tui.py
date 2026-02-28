@@ -393,6 +393,12 @@ class TUI:
         """Show or clear a waiting-for-workers spinner on the planner tab."""
         planner = self.tabs[0]
         if text:
+            # Waiting is a standalone status line; clear any stale live-stream
+            # visibility flags so redraws keep showing this spinner.
+            planner.trace_buf = []
+            planner.output_buf = []
+            planner.output_non_toml_seen = False
+            planner.output_toml_seen = False
             planner.spinner_label = text
             planner.streaming = True
             planner.is_waiting = True
@@ -402,13 +408,15 @@ class TUI:
             planner.spinner_tokens = 0
             if planner is self._active_tab and self.view == "main":
                 ch = SPINNER[0]
-                self._write(f'  {DIM}{ch} {text} {self._spinner_status(0, 0)}{RESET}')
+                with self._write_lock:
+                    self._write(f'  {DIM}{ch} {text} {self._spinner_status(0, 0)}{RESET}')
         else:
             planner.streaming = False
             planner.is_waiting = False
             planner.spinner_label = ""
             if planner is self._active_tab and self.view == "main":
-                self._write('\r\033[2K')
+                with self._write_lock:
+                    self._write('\r\033[2K')
         self._redraw_header()
 
     def worker_output(self, tab_id: str, text: str):
@@ -871,7 +879,7 @@ class TUI:
 
     @staticmethod
     def _tab_shows_spinner(tab: _Tab) -> bool:
-        return tab.streaming and not (tab.id == "planner" and tab.is_waiting)
+        return tab.streaming and bool(tab.spinner_label)
 
     def _advance_tab_spinners(self):
         now = time.monotonic()
@@ -1818,10 +1826,9 @@ class TUI:
             if tab.trace_buf and self.trace_visible:
                 joined = "".join(tab.trace_buf)
                 for tline in joined.splitlines():
-                    while len(tline) > max_w:
-                        lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
-                        tline = tline[max_w:]
-                    lines.append(f'  {DIM}{tline}{RESET}')
+                    text = f'  {DIM}{tline}{RESET}'
+                    for wrapped in self._wrap_visual_text(text, max_w):
+                        lines.append(wrapped)
             if tab.output_buf:
                 joined = "".join(tab.output_buf)
                 for is_toml, seg in self._iter_toml_segments(joined):
@@ -1830,16 +1837,9 @@ class TUI:
                     if is_toml and not self.trace_visible:
                         continue
                     for tline in seg.splitlines():
-                        while len(tline) > max_w:
-                            if is_toml:
-                                lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
-                            else:
-                                lines.append(f'  {tline[:max_w]}')
-                            tline = tline[max_w:]
-                        if is_toml:
-                            lines.append(f'  {DIM}{tline}{RESET}')
-                        else:
-                            lines.append(f'  {tline}')
+                        text = f'  {DIM}{tline}{RESET}' if is_toml else f'  {tline}'
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
         return lines
 
     def _build_step_detail_lines(self) -> list[str]:
