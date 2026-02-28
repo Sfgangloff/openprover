@@ -43,7 +43,7 @@ HELP_TEXT = f"""\
   {BOLD}Controls{RESET}
 
   {DIM}Instant keys (work any time):{RESET}
-    t           toggle reasoning trace
+    r           toggle reasoning
     i           show worker input (on worker tabs)
     w           toggle whiteboard view
     a           toggle autonomous mode
@@ -92,6 +92,8 @@ class _Tab:
                  "scroll_offset",
                  "streaming", "spinner_label", "spinner_tick", "spinner_time",
                  "spinner_start", "spinner_tokens", "last_trace", "last_output",
+                 "toml_pending", "toml_close_tag", "output_non_toml_seen",
+                 "output_toml_seen",
                  "done", "task_description")
 
     def __init__(self, tab_id: str, label: str, task_description: str = ""):
@@ -109,6 +111,10 @@ class _Tab:
         self.spinner_tokens = 0
         self.last_trace = ""
         self.last_output = ""
+        self.toml_pending = ""
+        self.toml_close_tag = ""
+        self.output_non_toml_seen = False
+        self.output_toml_seen = False
         self.done = False
         self.task_description = task_description
 
@@ -288,16 +294,16 @@ class TUI:
         if self.active_tab_idx > 0:
             input_style = BOLD if self.view == "input" else DIM
             hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
-                            f'{trace_style}t trace{RESET} {DIM}·{RESET} '
+                            f'{trace_style}r reasoning{RESET} {DIM}·{RESET} '
                             f'{input_style}i input{RESET} {DIM}·{RESET} '
                             f'{auto_style}a autonomous{RESET}')
-            hints_len = len("? help · t trace · i input · a autonomous")
+            hints_len = len("? help · r reasoning · i input · a autonomous")
         else:
             hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
-                            f'{trace_style}t trace{RESET} {DIM}·{RESET} '
+                            f'{trace_style}r reasoning{RESET} {DIM}·{RESET} '
                             f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
                             f'{auto_style}a autonomous{RESET}')
-            hints_len = len("? help · t trace · w whiteboard · a autonomous")
+            hints_len = len("? help · r reasoning · w whiteboard · a autonomous")
         pad = max(w - 2 - hints_len - 1, 0)
         self._write_raw('\033[3;1H\033[2K')
         self._write_raw(f'{BLUE}│{RESET}{" " * pad}{hints_styled} {BLUE}│{RESET}')
@@ -598,8 +604,8 @@ class TUI:
             elapsed = int(now - tab.spinner_start)
             status = self._spinner_status(elapsed, tab.spinner_tokens)
             with self._write_lock:
-                if (not tab.spinner_label or tab.output_buf
-                        or (tab.trace_buf and self.trace_visible)):
+                if (not tab.spinner_label
+                        or self._has_visible_stream_content(tab)):
                     return
                 self._write_raw(f'\r\033[2K  {DIM}{ch} {tab.spinner_label} {status}{RESET}')
                 sys.stdout.flush()
@@ -610,6 +616,10 @@ class TUI:
         target = self._find_tab(tab)
         target.trace_buf = []
         target.output_buf = []
+        target.toml_pending = ""
+        target.toml_close_tag = ""
+        target.output_non_toml_seen = False
+        target.output_toml_seen = False
         target.streaming = True
         target.spinner_label = label
         target.spinner_tick = 0
@@ -626,24 +636,30 @@ class TUI:
         is_active = target is self._active_tab
         at_bottom = target.scroll_offset == 0
         is_thinking = kind == "thinking"
-        first_output_chunk = (not is_thinking) and (not target.output_buf)
-        trace_needs_newline = (
-            first_output_chunk
-            and bool(target.trace_buf)
-            and not target.trace_buf[-1].endswith("\n")
-        )
 
         # Was there visible content before this chunk?
-        had_visible = (target.output_buf
-                       or (target.trace_buf and self.trace_visible))
+        had_visible = self._has_visible_stream_content(target)
+
+        output_segments: list[tuple[bool, str]] = []
+        output_shown = False
 
         if is_thinking:
             target.trace_buf.append(text)
         else:
             target.output_buf.append(text)
+            output_segments = self._split_toml_stream_segments(target, text)
+            for is_toml, seg in output_segments:
+                if not seg:
+                    continue
+                if is_toml:
+                    target.output_toml_seen = True
+                    if self.trace_visible:
+                        output_shown = True
+                else:
+                    target.output_non_toml_seen = True
+                    output_shown = True
 
-        has_visible = (target.output_buf
-                       or (target.trace_buf and self.trace_visible))
+        has_visible = self._has_visible_stream_content(target)
 
         # Clear spinner on first visible content
         if (not had_visible and has_visible
@@ -652,14 +668,28 @@ class TUI:
                 self._write_raw('\r\033[2K')
                 sys.stdout.flush()
 
-        should_display = not is_thinking or self.trace_visible
+        trace_needs_newline = (
+            (output_shown or is_thinking)
+            and self.trace_visible
+            and bool(target.trace_buf)
+            and not target.trace_buf[-1].endswith("\n")
+        )
+
+        should_display = (is_thinking and self.trace_visible) or (not is_thinking and output_shown)
         if should_display and self.view == "main" and is_active and at_bottom:
             if trace_needs_newline and self.trace_visible:
                 self._write("\n")
             if is_thinking:
                 self._write(f'{DIM}{text}{RESET}')
             else:
-                self._write(text)
+                for is_toml, seg in output_segments:
+                    if not seg:
+                        continue
+                    if is_toml:
+                        if self.trace_visible:
+                            self._write(f'{DIM}{seg}{RESET}')
+                    else:
+                        self._write(seg)
 
     def stream_end(self, tab: str = "planner"):
         target = self._find_tab(tab)
@@ -774,7 +804,7 @@ class TUI:
 
                     ch = chr(b)
                     if self._can_handle_directly():
-                        if ch in ('t', 'i', 'w', '?', 'a'):
+                        if ch in ('r', 'i', 'w', '?', 'a'):
                             self._process_key(ch)
                             i += 1
                             continue
@@ -810,7 +840,7 @@ class TUI:
             self._key_process_lock.release()
 
     def _process_key(self, ch: str):
-        if ch == 't':
+        if ch == 'r':
             self._toggle_trace()
         elif ch == 'i':
             if self.active_tab_idx > 0:
@@ -901,7 +931,13 @@ class TUI:
             parts.append("")
         output = entry.get("output", "")
         if output:
-            parts.append(output.rstrip())
+            for is_toml, segment in self._iter_toml_segments(output.rstrip()):
+                if is_toml and not self.trace_visible:
+                    continue
+                if is_toml:
+                    parts.append(f"{DIM}{segment}{RESET}")
+                else:
+                    parts.append(segment)
             parts.append("")
         detail = entry.get("detail", "")
         if detail:
@@ -1018,7 +1054,7 @@ class TUI:
                     continue
 
                 can_toggle = (self._confirm_selected == 0 or not self._confirm_buf)
-                if can_toggle and ch in ('t', 'i', 'w', '?'):
+                if can_toggle and ch in ('r', 'i', 'w', '?'):
                     self._process_key(ch)
                     continue
 
@@ -1171,7 +1207,7 @@ class TUI:
                     continue
 
                 can_toggle = (self._confirm_selected == 0 or not self._confirm_buf)
-                if can_toggle and ch in ('t', 'w', '?'):
+                if can_toggle and ch in ('r', 'w', '?'):
                     self._process_key(ch)
                     continue
 
@@ -1562,14 +1598,23 @@ class TUI:
                         and self._confirming
                         and self._proposal_log_start >= 0):
                     output_text = self._strip_toml_block(output_text)
-                for tline in output_text.splitlines():
-                    text = f'  {tline}'
-                    for wrapped in self._wrap_visual_text(text, max_w):
-                        lines.append(wrapped)
-                if not output_text.splitlines():
-                    text = '  '
-                    for wrapped in self._wrap_visual_text(text, max_w):
-                        lines.append(wrapped)
+                rendered_any = False
+                for is_toml, seg in self._iter_toml_segments(output_text):
+                    if not seg:
+                        continue
+                    if is_toml and not self.trace_visible:
+                        continue
+                    for tline in seg.splitlines():
+                        text = f'  {DIM}{tline}{RESET}' if is_toml else f'  {tline}'
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
+                    if not seg.splitlines():
+                        text = f'  {DIM}{RESET}' if is_toml else '  '
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
+                    rendered_any = True
+                if not rendered_any:
+                    continue
             else:
                 is_step = entry.step_idx >= 0
                 base = f' {entry.text}'
@@ -1593,11 +1638,22 @@ class TUI:
                     lines.append(f'  {DIM}{tline}{RESET}')
             if tab.output_buf:
                 joined = "".join(tab.output_buf)
-                for tline in joined.splitlines():
-                    while len(tline) > max_w:
-                        lines.append(f'  {tline[:max_w]}')
-                        tline = tline[max_w:]
-                    lines.append(f'  {tline}')
+                for is_toml, seg in self._iter_toml_segments(joined):
+                    if not seg:
+                        continue
+                    if is_toml and not self.trace_visible:
+                        continue
+                    for tline in seg.splitlines():
+                        while len(tline) > max_w:
+                            if is_toml:
+                                lines.append(f'  {DIM}{tline[:max_w]}{RESET}')
+                            else:
+                                lines.append(f'  {tline[:max_w]}')
+                            tline = tline[max_w:]
+                        if is_toml:
+                            lines.append(f'  {DIM}{tline}{RESET}')
+                        else:
+                            lines.append(f'  {tline}')
         return lines
 
     # ── Redraw ──────────────────────────────────────────────────
@@ -1615,7 +1671,7 @@ class TUI:
                 tab = self._active_tab
                 lines = self._build_main_lines(tab)
                 spinner_active = (tab.streaming and tab.spinner_label
-                                  and not (tab.trace_buf and self.trace_visible))
+                                  and not self._has_visible_stream_content(tab))
                 avail = self._main_avail_rows(tab)
 
                 # Clamp scroll offset
@@ -1692,13 +1748,146 @@ class TUI:
     def _strip_toml_block(text: str) -> str:
         """Hide planner TOML decision blocks from rendered output."""
         cleaned = re.sub(
-            r"<OPENPROVER_TOML>\s*\n?.*?</OPENPROVER_TOML>",
+            r"<(?:OPENPROVER_TOML|TOML_OUTPUT)>\s*\n?.*?</(?:OPENPROVER_TOML|TOML_OUTPUT)>",
             "",
             text,
             flags=re.DOTALL | re.IGNORECASE,
         )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip("\n")
+
+    @staticmethod
+    def _iter_toml_segments(text: str) -> list[tuple[bool, str]]:
+        """Split output into plain vs TOML-tagged blocks."""
+        segments: list[tuple[bool, str]] = []
+        lowers = text.lower()
+        open_close = (
+            ("<toml_output>", "</toml_output>"),
+            ("<openprover_toml>", "</openprover_toml>"),
+        )
+        i = 0
+        while i < len(text):
+            next_idx = -1
+            next_open = ""
+            next_close = ""
+            for open_tag, close_tag in open_close:
+                idx = lowers.find(open_tag, i)
+                if idx >= 0 and (next_idx < 0 or idx < next_idx):
+                    next_idx = idx
+                    next_open = open_tag
+                    next_close = close_tag
+
+            if next_idx < 0:
+                if i < len(text):
+                    segments.append((False, text[i:]))
+                break
+
+            if next_idx > i:
+                segments.append((False, text[i:next_idx]))
+
+            close_idx = lowers.find(next_close, next_idx + len(next_open))
+            if close_idx < 0:
+                # Unclosed TOML block: treat until end as TOML output.
+                segments.append((True, text[next_idx:]))
+                break
+
+            end = close_idx + len(next_close)
+            segments.append((True, text[next_idx:end]))
+            i = end
+
+        return segments
+
+    @staticmethod
+    def _longest_partial_tag_suffix(text: str, tags: tuple[str, ...]) -> str:
+        """Return longest suffix that is a prefix of any tag."""
+        best = ""
+        for tag in tags:
+            max_len = min(len(text), len(tag) - 1)
+            for n in range(max_len, 0, -1):
+                if text.endswith(tag[:n]):
+                    if n > len(best):
+                        best = text[-n:]
+                    break
+        return best
+
+    def _split_toml_stream_segments(self, tab: _Tab,
+                                    chunk: str) -> list[tuple[bool, str]]:
+        """Stream-safe split that preserves partial TOML tags across chunks."""
+        open_to_close = {
+            "<TOML_OUTPUT>": "</TOML_OUTPUT>",
+            "<OPENPROVER_TOML>": "</OPENPROVER_TOML>",
+        }
+        open_tags = tuple(open_to_close.keys())
+        close_tags = tuple(open_to_close.values())
+        tags_all = open_tags + close_tags
+
+        data = tab.toml_pending + chunk
+        tab.toml_pending = ""
+        out: list[tuple[bool, str]] = []
+        i = 0
+
+        while i < len(data):
+            if tab.toml_close_tag:
+                close_tag = tab.toml_close_tag
+                close_idx = data.find(close_tag, i)
+                if close_idx < 0:
+                    tail = data[i:]
+                    keep = self._longest_partial_tag_suffix(tail, (close_tag,))
+                    emit = tail[:-len(keep)] if keep else tail
+                    if emit:
+                        out.append((True, emit))
+                    tab.toml_pending = keep
+                    return out
+                end = close_idx + len(close_tag)
+                out.append((True, data[i:end]))
+                i = end
+                tab.toml_close_tag = ""
+                continue
+
+            next_open_idx = -1
+            next_open_tag = ""
+            for open_tag in open_tags:
+                idx = data.find(open_tag, i)
+                if idx >= 0 and (next_open_idx < 0 or idx < next_open_idx):
+                    next_open_idx = idx
+                    next_open_tag = open_tag
+
+            if next_open_idx < 0:
+                tail = data[i:]
+                keep = self._longest_partial_tag_suffix(tail, tags_all)
+                emit = tail[:-len(keep)] if keep else tail
+                if emit:
+                    out.append((False, emit))
+                tab.toml_pending = keep
+                return out
+
+            if next_open_idx > i:
+                out.append((False, data[i:next_open_idx]))
+
+            close_tag = open_to_close[next_open_tag]
+            close_idx = data.find(close_tag, next_open_idx + len(next_open_tag))
+            if close_idx < 0:
+                tab.toml_close_tag = close_tag
+                tail = data[next_open_idx:]
+                keep = self._longest_partial_tag_suffix(tail, (close_tag,))
+                emit = tail[:-len(keep)] if keep else tail
+                if emit:
+                    out.append((True, emit))
+                tab.toml_pending = keep
+                return out
+
+            end = close_idx + len(close_tag)
+            out.append((True, data[next_open_idx:end]))
+            i = end
+
+        return out
+
+    def _has_visible_stream_content(self, tab: _Tab) -> bool:
+        if tab.output_non_toml_seen:
+            return True
+        if tab.output_toml_seen and self.trace_visible:
+            return True
+        return bool(tab.trace_buf and self.trace_visible)
 
     def _max_log_text_width(self) -> int:
         """Visible width available for plain log entry text."""
