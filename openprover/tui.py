@@ -564,6 +564,12 @@ class TUI:
         is_active = target is self._active_tab
         at_bottom = target.scroll_offset == 0
         is_thinking = kind == "thinking"
+        first_output_chunk = (not is_thinking) and (not target.output_buf)
+        trace_needs_newline = (
+            first_output_chunk
+            and bool(target.trace_buf)
+            and not target.trace_buf[-1].endswith("\n")
+        )
 
         # Was there visible content before this chunk?
         had_visible = (target.output_buf
@@ -586,6 +592,8 @@ class TUI:
 
         should_display = not is_thinking or self.trace_visible
         if should_display and self.view == "main" and is_active and at_bottom:
+            if trace_needs_newline and self.trace_visible:
+                self._write("\n")
             if is_thinking:
                 self._write(f'{DIM}{text}{RESET}')
             else:
@@ -1409,11 +1417,16 @@ class TUI:
             elif entry.is_output:
                 if tab.id == "planner" and idx < planner_live_start:
                     continue
-                for tline in entry.text.splitlines():
+                output_text = entry.text
+                if (tab.id == "planner"
+                        and self._confirming
+                        and self._proposal_log_start >= 0):
+                    output_text = self._strip_toml_block(output_text)
+                for tline in output_text.splitlines():
                     text = f'  {tline}'
                     for wrapped in self._wrap_visual_text(text, max_w):
                         lines.append(wrapped)
-                if not entry.text.splitlines():
+                if not output_text.splitlines():
                     text = '  '
                     for wrapped in self._wrap_visual_text(text, max_w):
                         lines.append(wrapped)
@@ -1531,6 +1544,13 @@ class TUI:
         if dim:
             prefix += DIM
         return f'{prefix}{text}{RESET}' if prefix else text
+
+    @staticmethod
+    def _strip_toml_block(text: str) -> str:
+        """Hide fenced TOML blocks from rendered planner output."""
+        cleaned = re.sub(r"```toml\s*\n.*?```", "", text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip("\n")
 
 
 class HeadlessTUI:
