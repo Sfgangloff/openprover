@@ -145,6 +145,8 @@ class TUI:
         self._nav_step = -1  # -1 = options focused, 0..N-1 = step index
         self._step_detail_text = ""
         self._step_detail_title = ""
+        self._step_detail_idx = -1
+        self._step_detail_scroll = 0
         # Confirmation state
         self._confirming = False
         self._browsing = False
@@ -500,13 +502,16 @@ class TUI:
         color = ACTION_STYLE.get(action, "")
         line = f'{color}■{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}'
         labels: list[str] = []
-        if entry.get("rejected"):
-            labels.append(f"{YELLOW}[rejected]{RESET}")
-        if entry.get("interrupted"):
-            labels.append(f"{YELLOW}[interrupted]{RESET}")
         feedback = (entry.get("feedback") or "").strip()
-        if feedback:
-            labels.append(f"{YELLOW}[feedback]{RESET} {feedback}")
+        if entry.get("rejected"):
+            if feedback:
+                labels.append(f"{YELLOW}rejected with feedback:{RESET} {GREEN}{feedback}{RESET}")
+            else:
+                labels.append(f"{YELLOW}rejected{RESET}")
+        elif feedback:
+            labels.append(f"{YELLOW}feedback:{RESET} {GREEN}{feedback}{RESET}")
+        if entry.get("interrupted"):
+            labels.append(f"{YELLOW}interrupted{RESET}")
         if labels:
             line += "\n" + "  " + f' {DIM}·{RESET} '.join(labels)
         return line
@@ -639,6 +644,10 @@ class TUI:
 
         # Was there visible content before this chunk?
         had_visible = self._has_visible_stream_content(target)
+        had_visible_output = (
+            target.output_non_toml_seen
+            or (target.output_toml_seen and self.trace_visible)
+        )
 
         output_segments: list[tuple[bool, str]] = []
         output_shown = False
@@ -669,7 +678,8 @@ class TUI:
                 sys.stdout.flush()
 
         trace_needs_newline = (
-            (output_shown or is_thinking)
+            output_shown
+            and not had_visible_output
             and self.trace_visible
             and bool(target.trace_buf)
             and not target.trace_buf[-1].endswith("\n")
@@ -906,44 +916,100 @@ class TUI:
     def _open_selected_step_detail(self):
         if self._nav_step < 0:
             return
-        entry = self.step_entries[self._nav_step]
+        self._step_detail_idx = self._nav_step
+        self._step_detail_scroll = 0
+        self._refresh_step_detail()
+        self.view = "step_detail"
+
+    @staticmethod
+    def _step_detail_section_title(action: str) -> str:
+        return {
+            "spawn": "Worker Plan",
+            "literature_search": "Literature Search",
+            "read_items": "Reading Notes",
+            "write_items": "Writing Notes",
+            "read_theorem": "Theorem Analysis",
+            "submit_proof": "Submission",
+            "submit_lean_proof": "Lean Submission",
+            "give_up": "Termination",
+        }.get(action, "Step Details")
+
+    def _refresh_step_detail(self):
+        if not (0 <= self._step_detail_idx < len(self.step_entries)):
+            self._step_detail_title = "Step Detail"
+            self._step_detail_text = "(no detail)"
+            return
+
+        entry = self.step_entries[self._step_detail_idx]
+        action = entry.get("action", "")
+        summary = entry.get("summary", "")
+        action_color = ACTION_STYLE.get(action, WHITE)
         self._step_detail_title = (
-            f"Step {entry['step_num']}: {entry['action']}"
-            f" — {entry['summary']}"
+            f"Step {entry.get('step_num', '?')}: "
+            f"{action_color}{action}{RESET} {DIM}—{RESET} {summary}"
         )
-        parts = []
-        status_bits = []
-        if entry.get("rejected"):
-            status_bits.append("rejected")
-        if entry.get("interrupted"):
-            status_bits.append("interrupted")
-        if status_bits:
-            parts.append(f"Status: {', '.join(status_bits)}")
-            parts.append("")
+
+        parts: list[str] = []
+
+        def add_section(title: str, lines: list[str], color: str = BLUE):
+            if not lines:
+                return
+            if parts:
+                parts.append(f"  {DIM}{'─' * 40}{RESET}")
+                parts.append("")
+            parts.append(f"  {color}{BOLD}{title}{RESET}")
+            for line in lines:
+                parts.append(f"  {line}" if line else "")
+
         feedback = (entry.get("feedback") or "").strip()
-        if feedback:
-            parts.append("Human feedback:")
-            parts.append(feedback)
-            parts.append("")
-        trace = entry.get("trace", "")
-        if trace and self.trace_visible:
-            parts.append(trace.rstrip())
-            parts.append("")
-        output = entry.get("output", "")
+        status_lines: list[str] = []
+        if entry.get("rejected"):
+            if feedback:
+                status_lines.append(
+                    f"{YELLOW}● rejected with feedback:{RESET} {GREEN}{feedback}{RESET}"
+                )
+            else:
+                status_lines.append(f"{YELLOW}● rejected{RESET}")
+        elif feedback:
+            status_lines.append(f"{YELLOW}● feedback:{RESET} {GREEN}{feedback}{RESET}")
+        if entry.get("interrupted"):
+            status_lines.append(f"{YELLOW}● execution interrupted{RESET}")
+        if not status_lines:
+            status_lines.append(f"{GREEN}● completed{RESET}")
+        add_section("Status", status_lines, color=YELLOW)
+
+        detail = (entry.get("detail") or "").strip()
+        if detail:
+            add_section(self._step_detail_section_title(action), detail.splitlines(),
+                        color=CYAN)
+
+        output_lines: list[str] = []
+        output = (entry.get("output") or "").rstrip()
         if output:
-            for is_toml, segment in self._iter_toml_segments(output.rstrip()):
+            for is_toml, segment in self._iter_toml_segments(output):
                 if is_toml and not self.trace_visible:
                     continue
-                if is_toml:
-                    parts.append(f"{DIM}{segment}{RESET}")
-                else:
-                    parts.append(segment)
-            parts.append("")
-        detail = entry.get("detail", "")
-        if detail:
-            parts.append(detail)
-        self._step_detail_text = "\n".join(parts) if parts else "(no detail)"
-        self.view = "step_detail"
+                for line in segment.splitlines():
+                    output_lines.append(f"{DIM}{line}{RESET}" if is_toml else line)
+        if output_lines:
+            add_section("Planner Output", output_lines, color=BLUE)
+
+        trace = (entry.get("trace") or "").rstrip()
+        if trace:
+            if self.trace_visible:
+                add_section("Reasoning", [f"{DIM}{line}{RESET}"
+                                          for line in trace.splitlines()],
+                            color=GREEN)
+            else:
+                add_section("Reasoning",
+                            [f"{DIM}hidden (press r to show){RESET}"],
+                            color=GREEN)
+
+        self._step_detail_text = "\n".join(parts) if parts else "  (no detail)"
+        self._step_detail_scroll = min(
+            self._step_detail_scroll,
+            self._step_detail_max_scroll(),
+        )
 
     def get_pending_action(self) -> str | None:
         self._check_keys()
@@ -1522,6 +1588,21 @@ class TUI:
     # ── View toggles ────────────────────────────────────────────
 
     def _toggle_trace(self):
+        if self.view == "step_detail":
+            old_lines = self._build_step_detail_lines()
+            old_max = max(len(old_lines) - self._step_detail_avail_rows(), 0)
+            old_ratio = (self._step_detail_scroll / old_max) if old_max > 0 else 0.0
+            self.trace_visible = not self.trace_visible
+            self._refresh_step_detail()
+            new_lines = self._build_step_detail_lines()
+            new_max = max(len(new_lines) - self._step_detail_avail_rows(), 0)
+            if old_max > 0 and new_max > 0:
+                self._step_detail_scroll = int(round(old_ratio * new_max))
+            else:
+                self._step_detail_scroll = min(self._step_detail_scroll, new_max)
+            self._redraw()
+            return
+
         tab = self._active_tab
         old_total = len(self._build_main_lines(tab))
         old_max_off = max(old_total - self._main_avail_rows(tab), 0)
@@ -1534,8 +1615,7 @@ class TUI:
         else:
             tab.scroll_offset = min(tab.scroll_offset, new_max_off)
         self._scroll_selection_into_view()
-        if self.view == "main":
-            self._redraw()
+        self._redraw()
 
     def _toggle_view(self, target: str):
         self.view = "main" if self.view == target else target
@@ -1544,6 +1624,11 @@ class TUI:
     # ── Scrolling ────────────────────────────────────────────────
 
     def _scroll_up(self):
+        if self.view == "step_detail":
+            page = max(self._step_detail_avail_rows() - 1, 1)
+            self._step_detail_scroll = max(self._step_detail_scroll - page, 0)
+            self._redraw()
+            return
         tab = self._active_tab
         page = max(self._main_avail_rows(tab) - 1, 1)
         lines = self._build_main_lines(tab)
@@ -1552,12 +1637,22 @@ class TUI:
         self._redraw()
 
     def _scroll_down(self):
+        if self.view == "step_detail":
+            page = max(self._step_detail_avail_rows() - 1, 1)
+            max_scroll = self._step_detail_max_scroll()
+            self._step_detail_scroll = min(self._step_detail_scroll + page, max_scroll)
+            self._redraw()
+            return
         tab = self._active_tab
         page = max(self._main_avail_rows(tab) - 1, 1)
         tab.scroll_offset = max(tab.scroll_offset - page, 0)
         self._redraw()
 
     def _scroll_lines_up(self, n: int = 3):
+        if self.view == "step_detail":
+            self._step_detail_scroll = max(self._step_detail_scroll - n, 0)
+            self._redraw()
+            return
         tab = self._active_tab
         lines = self._build_main_lines(tab)
         max_off = max(len(lines) - self._main_avail_rows(tab), 0)
@@ -1565,6 +1660,11 @@ class TUI:
         self._redraw()
 
     def _scroll_lines_down(self, n: int = 3):
+        if self.view == "step_detail":
+            max_scroll = self._step_detail_max_scroll()
+            self._step_detail_scroll = min(self._step_detail_scroll + n, max_scroll)
+            self._redraw()
+            return
         tab = self._active_tab
         tab.scroll_offset = max(tab.scroll_offset - n, 0)
         self._redraw()
@@ -1656,6 +1756,20 @@ class TUI:
                             lines.append(f'  {tline}')
         return lines
 
+    def _build_step_detail_lines(self) -> list[str]:
+        max_w = max(self.cols - 2, 20)
+        lines: list[str] = []
+        for dline in self._step_detail_text.splitlines() or [""]:
+            lines.extend(self._wrap_visual_text(dline, max_w))
+        return lines
+
+    def _step_detail_avail_rows(self) -> int:
+        # One title line + one separator line.
+        return max(self.rows - self._content_start + 1 - 2, 1)
+
+    def _step_detail_max_scroll(self) -> int:
+        return max(len(self._build_step_detail_lines()) - self._step_detail_avail_rows(), 0)
+
     # ── Redraw ──────────────────────────────────────────────────
 
     def _redraw(self):
@@ -1725,8 +1839,21 @@ class TUI:
                 self._write_raw(f'  {BOLD}{self._step_detail_title}{RESET}')
                 self._write_raw(f' {DIM}(esc to return){RESET}\n')
                 self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
-                for dline in self._step_detail_text.splitlines():
-                    self._write_raw(f'  {dline}\n')
+                lines = self._build_step_detail_lines()
+                avail = self._step_detail_avail_rows()
+                max_scroll = max(len(lines) - avail, 0)
+                if self._step_detail_scroll > max_scroll:
+                    self._step_detail_scroll = max_scroll
+                start = self._step_detail_scroll
+                end = min(start + avail, len(lines))
+                for dline in lines[start:end]:
+                    self._write_raw(f'{dline}\n')
+
+                above = start
+                below = max(len(lines) - end, 0)
+                if above > 0 or below > 0:
+                    indicator = f' {DIM}↑ {above} above · ↓ {below} below{RESET}'
+                    self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
 
             sys.stdout.flush()
 
