@@ -533,7 +533,7 @@ class Prover:
             if text:
                 self.tui.log(f"Feedback: {text}", color="yellow")
             self._push_output(f"Human feedback: {user_resp}")
-            self.tui.log("Feedback noted — will replan next step", color="yellow")
+            self.tui.show_replan_notice("Feedback noted — will replan next step")
             return "continue"
 
     def _handle_submit_proof(self, plan: dict) -> str:
@@ -744,7 +744,7 @@ class Prover:
                 f"\n\n## PROOF.lean\n\n```lean\n{proof_lean_path.read_text()}\n```"
             )
         self._push_output("\n".join(parts))
-        self.tui.log("Read theorem content", dim=True)
+        self.tui.log("Read theorem content", color="yellow")
         return "continue"
 
     def _handle_spawn(self, plan: dict, step_dir: Path,
@@ -799,7 +799,7 @@ class Prover:
                     feedback=text,
                 )
                 self._push_output(f"Human feedback: {user_resp}")
-                self.tui.log("Feedback noted — will replan next step", color="yellow")
+                self.tui.show_replan_notice("Feedback noted — will replan next step")
                 return "continue"
 
         self._apply_whiteboard_from_plan(plan)
@@ -960,7 +960,7 @@ class Prover:
                     feedback=text,
                 )
                 self._push_output(f"Human feedback: {user_resp}")
-                self.tui.log("Feedback noted — will replan next step", color="yellow")
+                self.tui.show_replan_notice("Feedback noted — will replan next step")
                 return "continue"
 
         self._apply_whiteboard_from_plan(plan)

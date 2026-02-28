@@ -156,6 +156,8 @@ class TUI:
         self._saved_worker_tabs: list[_Tab] | None = None
         # Proposal log range (for cleanup after confirmation)
         self._proposal_log_start: int = -1
+        # Transient feedback/replan notice in planner tab.
+        self._replan_notice_entry: _LogEntry | None = None
         # Run parameters (shown in help view)
         self.run_params: dict[str, str] = {}
 
@@ -453,6 +455,7 @@ class TUI:
 
     def show_proposal(self, plan: dict):
         planner = self.tabs[0]
+        self.clear_replan_notice()
         self._proposal_log_start = len(planner.log_lines)
         sep = self._dim_separator()
         self._tab_log(planner, sep)
@@ -500,7 +503,7 @@ class TUI:
         if feedback:
             labels.append(f"{YELLOW}[feedback]{RESET} {feedback}")
         if labels:
-            line += f' {DIM}·{RESET} ' + f' {DIM}·{RESET} '.join(labels)
+            line += "\n" + "  " + f' {DIM}·{RESET} '.join(labels)
         return line
 
     def _sync_step_log_line(self, step_idx: int):
@@ -1055,6 +1058,40 @@ class TUI:
         planner = self.tabs[0]
         planner.log_lines = planner.log_lines[:self._proposal_log_start]
         self._proposal_log_start = -1
+
+    def show_replan_notice(self, text: str):
+        """Show a transient notice cleared when next proposal appears."""
+        planner = self.tabs[0]
+        self.clear_replan_notice()
+        entry = _LogEntry(self._style(text, color="yellow"))
+        planner.log_lines.append(entry)
+        if len(planner.log_lines) > 500:
+            planner.log_lines = planner.log_lines[-500:]
+            if entry not in planner.log_lines:
+                self._replan_notice_entry = None
+            else:
+                self._replan_notice_entry = entry
+        else:
+            self._replan_notice_entry = entry
+        if planner is self._active_tab and self.view == "main":
+            if planner.scroll_offset > 0:
+                planner.scroll_offset = 0
+                self._redraw()
+            else:
+                self._write(f' {entry.text}\n')
+
+    def clear_replan_notice(self):
+        entry = self._replan_notice_entry
+        if entry is None:
+            return
+        planner = self.tabs[0]
+        try:
+            planner.log_lines.remove(entry)
+        except ValueError:
+            pass
+        self._replan_notice_entry = None
+        if planner is self._active_tab and self.view == "main":
+            self._redraw()
 
     def show_interrupt_options(self):
         """Show continue / give feedback after CTRL+C interruption."""
@@ -1776,6 +1813,12 @@ class HeadlessTUI:
             entry["detail"] = f"{base}\n\n{detail_append}".strip() if base else detail_append
 
     def show_proposal(self, plan: dict):
+        pass
+
+    def show_replan_notice(self, text: str):
+        print(f"[log] {text}", flush=True)
+
+    def clear_replan_notice(self):
         pass
 
     def get_confirmation(self) -> str:
