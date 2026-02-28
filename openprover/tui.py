@@ -35,7 +35,6 @@ ACTION_STYLE = {
     "write_items": CYAN,
     "read_theorem": CYAN,
     "submit_proof": GREEN,
-    "proof_found": GREEN,
     "submit_lean_proof": GREEN,
     "give_up": RED,
 }
@@ -832,19 +831,18 @@ class TUI:
             self._scroll_up()
         elif ch == '\x1b[6~':
             self._scroll_down()
-        elif ch == '\x1b[A':  # up arrow — step history or scroll up
-            if self.view == "main" and self.active_tab_idx == 0 and self.step_entries:
-                self._nav_up()
-                self._redraw()
+        elif ch == '\x1b[A':  # up arrow — planner history only
+            if self.view == "main" and self.active_tab_idx == 0:
+                if self.step_entries:
+                    self._nav_up()
+                    self._redraw()
             else:
                 self._scroll_lines_up()
-        elif ch == '\x1b[B':  # down arrow — step history or scroll down
-            if self.view == "main" and self.active_tab_idx == 0 and self.step_entries:
-                if self._nav_step >= 0:
+        elif ch == '\x1b[B':  # down arrow — planner history only
+            if self.view == "main" and self.active_tab_idx == 0:
+                if self.step_entries:
                     self._nav_down()
                     self._redraw()
-                else:
-                    self._scroll_lines_down()
             else:
                 self._scroll_lines_down()
         elif ch == 'scroll_up':
@@ -1692,8 +1690,13 @@ class TUI:
 
     @staticmethod
     def _strip_toml_block(text: str) -> str:
-        """Hide fenced TOML blocks from rendered planner output."""
-        cleaned = re.sub(r"```toml\s*\n.*?```", "", text, flags=re.DOTALL | re.IGNORECASE)
+        """Hide planner TOML decision blocks from rendered output."""
+        cleaned = re.sub(
+            r"<OPENPROVER_TOML>\s*\n?.*?</OPENPROVER_TOML>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip("\n")
 

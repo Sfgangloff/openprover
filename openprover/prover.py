@@ -415,7 +415,8 @@ class Prover:
             if plan is None:
                 parse_error = (
                     "Failed to parse TOML output. Your response must end with "
-                    "a ```toml code block containing action = \"...\" and other required fields."
+                    "an <OPENPROVER_TOML>...</OPENPROVER_TOML> block containing "
+                    "action = \"...\" and other required fields."
                 )
                 remaining = MAX_PARSE_RETRIES - attempt
                 self.tui.log(
@@ -471,7 +472,7 @@ class Prover:
         self._save_step(step_dir, plan)
 
         # Dispatch
-        if action in ("submit_proof", "proof_found"):
+        if action == "submit_proof":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
             return self._handle_submit_proof(plan)
         if action == "give_up":
@@ -590,13 +591,9 @@ class Prover:
 
     def _handle_write_items(self, plan: dict, step_dir: Path) -> str:
         items = plan.get("items", [])
-        # Fallback: support old write_slug/write_content format
         if not items:
-            slug = plan.get("write_slug", "")
-            if not slug:
-                self.tui.log("write_items but no items specified", color="yellow")
-                return "continue"
-            items = [{"slug": slug, "content": plan.get("write_content")}]
+            self.tui.log("write_items but no items specified", color="yellow")
+            return "continue"
 
         lean_feedback: list[str] = []
         lean_idx = 0
@@ -1104,8 +1101,9 @@ class Prover:
                 desc = task.get("description", "")
                 lines.append(f'description = """\n{desc}\n"""')
         if "lean_blocks" in plan:
-            for i, block in enumerate(plan["lean_blocks"]):
-                lines.append(f'\nlean_block_{i} = """\n{block}\n"""')
+            for block in plan["lean_blocks"]:
+                lines.append("\n[[lean_blocks]]")
+                lines.append(f'code = """\n{block}\n"""')
         (step_dir / "planner.toml").write_text("\n".join(lines) + "\n")
 
     @staticmethod

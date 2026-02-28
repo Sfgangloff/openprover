@@ -24,6 +24,8 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 # ── System prompts ──────────────────────────────────────────
 
 _TQ = '"""'  # triple-quote for embedding in prompts
+_TOML_OPEN_TAG = "<OPENPROVER_TOML>"
+_TOML_CLOSE_TAG = "</OPENPROVER_TOML>"
 
 
 def _build_actions(*, lean_mode: str, has_lean: bool,
@@ -120,7 +122,7 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
     fields += (
         f'**read_items**: `read = ["slug-1", "slug-2"]`\n'
         "**write_items**: one or more `[[items]]` sections:\n"
-        "```toml\n"
+        f"{_TOML_OPEN_TAG}\n"
         "[[items]]\n"
         f'slug = "item-slug"\n'
         f"content = {_TQ}\n"
@@ -132,7 +134,7 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
         "[[items]]\n"
         f'slug = "another-item"\n'
         "# omit content to delete\n"
-        "```\n"
+        f"{_TOML_CLOSE_TAG}\n"
         f"**spawn**: one or more `[[tasks]]` sections with `description = {_TQ}...{_TQ}`\n"
     )
     if not isolation:
@@ -142,7 +144,7 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
             f"\n**write_items** (lean format — auto-verified): add `format = \"lean\"` to the item. "
             f"Include natural language descriptions of all theorems, definitions, and proofs as `--` comments. "
             f"The first comment line is the summary.\n"
-            "```toml\n"
+            f"{_TOML_OPEN_TAG}\n"
             "[[items]]\n"
             'slug = "helper-lemma"\n'
             'format = "lean"\n'
@@ -156,13 +158,13 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
             "  | zero => rfl\n"
             "  | succ n ih => simp [Nat.succ_mul, ih]\n"
             f"{_TQ}\n"
-            "```\n"
+            f"{_TOML_CLOSE_TAG}\n"
             "Items that fail Lean verification are NOT saved to the repo.\n"
         )
     if has_lean:
         fields += (
             f"\n**submit_lean_proof**: provide {num_sorries} `[[lean_blocks]]` section(s) + optional `lean_context`:\n"
-            "```toml\n"
+            f"{_TOML_OPEN_TAG}\n"
             f"lean_context = {_TQ}\n"
             "optional helper definitions (placed after imports, no import statements allowed)\n"
             f"{_TQ}\n"
@@ -178,7 +180,7 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
             )
         if num_sorries > 3:
             fields += f"# ... up to {num_sorries} [[lean_blocks]] total\n\n"
-        fields += "```\n"
+        fields += f"{_TOML_CLOSE_TAG}\n"
     return fields
 
 
@@ -291,9 +293,9 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "\n"
         "## Output Format\n"
         "\n"
-        "Think step by step, then end your response with a TOML decision block:\n"
+        "Think step by step, then end your response with a TOML decision block wrapped in exact tags:\n"
         "\n"
-        "```toml\n"
+        f"{_TOML_OPEN_TAG}\n"
         'action = "spawn"\n'
         'summary = "One-line description for the log"\n'
         f"whiteboard = {_TQ}\n"
@@ -301,7 +303,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         f"{_TQ}\n"
         "\n"
         "# Action-specific fields below (include only what's relevant)\n"
-        "```\n"
+        f"{_TOML_CLOSE_TAG}\n"
         "\n"
         "Whiteboard rule: include a complete `whiteboard` field on every step except for step 1, "
         "including terminal actions like `submit_proof` and `submit_lean_proof`.\n"
@@ -492,7 +494,8 @@ def format_planner_retry(
         f"Error: {error}\n\n"
         f"Your previous output ended with:\n"
         f"```\n{excerpt}\n```\n\n"
-        f"Please respond again with a valid ```toml decision block."
+        f"Please respond again with a valid TOML decision block wrapped in "
+        f"{_TOML_OPEN_TAG} ... {_TOML_CLOSE_TAG}."
     )
 
 
@@ -500,13 +503,14 @@ def format_planner_retry(
 
 def parse_planner_toml(text: str) -> dict | None:
     """Extract and parse the TOML decision block from planner output."""
-    # Find ```toml ... ``` block
-    match = re.search(r'```toml\s*\n(.*?)```', text, re.DOTALL)
+    # Find <OPENPROVER_TOML> ... </OPENPROVER_TOML> block
+    match = re.search(
+        rf"{re.escape(_TOML_OPEN_TAG)}\s*\n?(.*?){re.escape(_TOML_CLOSE_TAG)}",
+        text,
+        re.DOTALL,
+    )
     if not match:
-        # Fallback: try to find TOML-like content at the end
-        match = re.search(r'(action\s*=\s*"[^"]+".*)$', text, re.DOTALL)
-        if not match:
-            return None
+        return None
 
     toml_text = match.group(1)
 
@@ -527,14 +531,10 @@ def parse_planner_toml(text: str) -> dict | None:
 def _collect_lean_blocks(parsed: dict):
     """Normalize lean_block_N numbered keys into a lean_blocks list.
 
-    Supports two styles from the LLM:
-    1. ``[[lean_blocks]]`` array-of-tables with ``code`` field (preferred)
-    2. ``lean_block_0``, ``lean_block_1``, ... numbered top-level keys
-
+    Supports ``[[lean_blocks]]`` array-of-tables with ``code`` field.
     Also rescues ``lean_context`` if it ended up inside a lean_blocks entry
     (TOML puts keys after [[lean_blocks]] into that table).
     """
-    # Style 1: already collected by parser as list of dicts with "code"
     if "lean_blocks" in parsed and isinstance(parsed["lean_blocks"], list):
         blocks = parsed["lean_blocks"]
         if blocks and isinstance(blocks[0], dict):
@@ -543,16 +543,6 @@ def _collect_lean_blocks(parsed: dict):
                 if "lean_context" in b and "lean_context" not in parsed:
                     parsed["lean_context"] = b.pop("lean_context")
             parsed["lean_blocks"] = [b.get("code", "") for b in blocks]
-        return
-
-    # Style 2: numbered keys
-    lean_blocks = []
-    i = 0
-    while f"lean_block_{i}" in parsed:
-        lean_blocks.append(parsed.pop(f"lean_block_{i}"))
-        i += 1
-    if lean_blocks:
-        parsed["lean_blocks"] = lean_blocks
 
 
 def _parse_toml_minimal(text: str) -> dict | None:
