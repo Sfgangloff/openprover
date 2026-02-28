@@ -1223,7 +1223,11 @@ class TUI:
                 len(self._wrap_visual_text(f'  {line}', max_w))
                 for line in src
             )
-        return len(self._wrap_visual_text(f' {entry.text}', max_w))
+        base = f' {entry.text}'
+        continuation = " " * self._leading_visible_spaces(base)
+        return len(self._wrap_visual_text(
+            base, max_w, continuation_prefix=continuation
+        ))
 
     @staticmethod
     def _planner_live_start(tab: _Tab) -> int:
@@ -1236,10 +1240,16 @@ class TUI:
         return last_step + 1
 
     @staticmethod
-    def _wrap_visual_text(text: str, max_w: int) -> list[str]:
+    def _wrap_visual_text(
+            text: str, max_w: int, continuation_prefix: str = "") -> list[str]:
         """Wrap text by visible width while preserving ANSI sequences."""
         if max_w <= 0:
             return [text]
+        cont = continuation_prefix
+        cont_w = len(cont)
+        if cont_w >= max_w:
+            cont = ""
+            cont_w = 0
         parts: list[str] = []
         buf: list[str] = []
         visible = 0
@@ -1258,11 +1268,33 @@ class TUI:
             visible += 1
             if visible >= max_w:
                 parts.append("".join(buf))
-                buf = []
-                visible = 0
+                if i < n and cont:
+                    buf = [cont]
+                    visible = cont_w
+                else:
+                    buf = []
+                    visible = 0
         if buf or not parts:
             parts.append("".join(buf))
         return parts
+
+    @staticmethod
+    def _leading_visible_spaces(text: str) -> int:
+        """Count visible leading spaces while ignoring ANSI escapes."""
+        i = 0
+        n = len(text)
+        spaces = 0
+        while i < n:
+            if text[i] == '\x1b':
+                m = re.match(r'\x1b\[[0-9;?]*[ -/]*[@-~]', text[i:])
+                if m:
+                    i += len(m.group(0))
+                    continue
+            if text[i] != " ":
+                break
+            spaces += 1
+            i += 1
+        return spaces
 
     def _selection_render_range(self, tab: _Tab) -> tuple[int, int] | None:
         max_w = max(self.cols - 4, 20)
@@ -1433,7 +1465,10 @@ class TUI:
             else:
                 is_step = entry.step_idx >= 0
                 base = f' {entry.text}'
-                wrapped_lines = self._wrap_visual_text(base, max_w)
+                continuation = " " * self._leading_visible_spaces(base)
+                wrapped_lines = self._wrap_visual_text(
+                    base, max_w, continuation_prefix=continuation
+                )
                 if is_step and entry.step_idx == self._nav_step:
                     for wrapped in wrapped_lines:
                         lines.append(f' {GREEN}▎{RESET}{wrapped}')
