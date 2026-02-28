@@ -553,8 +553,8 @@ class Prover:
             return "continue"
         self.proof_text = proof
         (self.work_dir / "PROOF.md").write_text(proof)
-        self.tui.log("PROOF.md written", color="green", bold=True)
-        self.tui.log(f"  {self.work_dir / 'PROOF.md'}", dim=True)
+        proof_path = self.work_dir / "PROOF.md"
+        self.tui.log(f"PROOF.md written  {proof_path}", color="green")
         logger.info("PROOF.md written")
 
         if self.mode == "prove_and_formalize":
@@ -1049,7 +1049,7 @@ class Prover:
         resolved_refs = self.repo.resolve_wikilinks(description)
         prompt = prompts.format_worker_prompt(description, resolved_refs)
 
-        self.tui.stream_start("working", tab=worker_id)
+        self.tui.stream_start("generating worker instructions...", tab=worker_id)
         try:
             resp = self.worker_llm.call(
                 prompt=prompt,
