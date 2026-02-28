@@ -395,7 +395,7 @@ class TUI:
     def worker_output(self, tab_id: str, text: str):
         """Display worker result in its tab as regular (always-visible) content."""
         tab = self._find_tab(tab_id)
-        sep_text = f'{DIM}{"─" * max(self.cols - 4, 20)}{RESET}'
+        sep_text = self._dim_separator()
         tab.log_lines.append(_LogEntry(sep_text))
         for line in text.splitlines():
             tab.log_lines.append(_LogEntry(line))
@@ -455,7 +455,7 @@ class TUI:
     def show_proposal(self, plan: dict):
         planner = self.tabs[0]
         self._proposal_log_start = len(planner.log_lines)
-        sep = f'{DIM}{"─" * max(self.cols - 4, 20)}{RESET}'
+        sep = self._dim_separator()
         self._tab_log(planner, sep)
         self._tab_log(planner, f'{DIM}Next step:{RESET}')
 
@@ -1586,6 +1586,15 @@ class TUI:
         cleaned = re.sub(r"```toml\s*\n.*?```", "", text, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip("\n")
+
+    def _max_log_text_width(self) -> int:
+        """Visible width available for plain log entry text."""
+        # Regular log entries are rendered with one leading visible space.
+        return max(max(self.cols - 4, 20) - 1, 1)
+
+    def _dim_separator(self) -> str:
+        """Separator line that never wraps as a regular log entry."""
+        return f'{DIM}{"─" * self._max_log_text_width()}{RESET}'
 
 
 class HeadlessTUI:
