@@ -1826,9 +1826,33 @@ class TUI:
                 tab = self._active_tab
                 self._write_raw(f'  {BOLD}Worker Input{RESET} {DIM}(esc to return){RESET}\n')
                 self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
-                desc = tab.task_description or "(no task description)"
-                for tline in desc.splitlines():
-                    self._write_raw(f'  {tline}\n')
+                sections: list[str] = []
+
+                def add_input_section(title: str, lines: list[str], color: str = BLUE):
+                    if not lines:
+                        return
+                    if sections:
+                        sections.append(f'  {DIM}{"─" * 40}{RESET}')
+                        sections.append("")
+                    sections.append(f"  {color}{BOLD}{title}{RESET}")
+                    for line in lines:
+                        sections.append(f"  {line}" if line else "")
+
+                status_line = (
+                    f"{GREEN}● completed{RESET}" if tab.done else f"{CYAN}● running{RESET}"
+                )
+                add_input_section("Status", [status_line], color=YELLOW)
+                add_input_section("Worker", [tab.label], color=MAGENTA)
+
+                desc = (tab.task_description or "").strip()
+                add_input_section(
+                    "Input",
+                    desc.splitlines() if desc else ["(no task description)"],
+                    color=CYAN,
+                )
+
+                for iline in sections:
+                    self._write_raw(f'{iline}\n')
             elif self.view == "help":
                 self._write_raw(HELP_TEXT)
                 if self.run_params:
