@@ -73,6 +73,7 @@ class LLMClient:
         self.archive_dir = archive_dir
         self.call_count = 0
         self.total_cost = 0.0
+        self.mcp_config: dict | None = None  # set by Prover for MCP tool-calling
         self._interrupted = threading.Event()
         self._active_procs: list[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
@@ -98,6 +99,8 @@ class LLMClient:
         web_search: bool = False,
         stream_callback=None,
         archive_path: Path | None = None,
+        tool_callback=None,
+        max_tokens: int | None = None,  # accepted for API compat, not used by Claude CLI
     ) -> dict:
         """Make an LLM call and archive it.
 
@@ -105,6 +108,8 @@ class LLMClient:
             web_search: If True, enable WebSearch tool instead of disabling all tools.
             stream_callback: If provided, called with text chunks as they arrive.
                 Signature: callback(text: str).
+            tool_callback: If provided, called when MCP tool events are detected.
+                Signature: tool_callback(name: str, input: dict, result: str, status: str).
 
         Returns dict with keys: result (str), cost (float), duration_ms (int),
         raw (full JSON response).
@@ -135,6 +140,12 @@ class LLMClient:
         if web_search:
             cmd.extend(["--permission-mode", "bypassPermissions",
                          "--allowedTools", "WebSearch WebFetch"])
+        elif self.mcp_config:
+            cmd.extend(["--mcp-config", json.dumps(self.mcp_config),
+                         "--strict-mcp-config",
+                         "--permission-mode", "bypassPermissions",
+                         "--allowedTools",
+                         "mcp__lean_tools__lean_verify mcp__lean_tools__lean_search"])
         else:
             cmd.extend(["--tools", ""])
         if json_schema:
@@ -146,6 +157,7 @@ class LLMClient:
             return self._call_streaming(
                 cmd, prompt, system_prompt, json_schema,
                 call_num, label, start, stream_callback, archive_path,
+                tool_callback=tool_callback,
             )
 
         proc = subprocess.run(
@@ -197,8 +209,15 @@ class LLMClient:
         }
 
     def _call_streaming(self, cmd, prompt, system_prompt, json_schema,
-                        call_num, label, start, callback, archive_path=None):
-        """Stream text deltas to callback, return final result."""
+                        call_num, label, start, callback, archive_path=None,
+                        tool_callback=None):
+        """Stream text deltas to callback, return final result.
+
+        Args:
+            tool_callback: Optional callback for MCP tool events.
+                Signature: tool_callback(tool_name: str, tool_input: dict,
+                                         result: str, status: str)
+        """
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -211,6 +230,12 @@ class LLMClient:
         result_data = None
         thinking_parts = []
         interrupted = False
+        # Tool event tracking for MCP calls
+        _cur_tool_name = ""
+        _cur_tool_input_parts: list[str] = []
+        _cur_tool_result_parts: list[str] = []
+        _in_tool_use = False
+        _in_tool_result = False
         # Use readline() instead of iterator — the iterator uses an internal
         # read-ahead buffer that defeats real-time streaming.
         try:
@@ -232,15 +257,54 @@ class LLMClient:
 
                 if msg.get("type") == "stream_event":
                     event = msg.get("event", {})
-                    if event.get("type") == "content_block_delta":
+                    etype = event.get("type", "")
+
+                    if etype == "content_block_start":
+                        cb = event.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            _in_tool_use = True
+                            _cur_tool_name = cb.get("name", "")
+                            _cur_tool_input_parts = []
+                        elif cb.get("type") == "tool_result":
+                            _in_tool_result = True
+                            _cur_tool_result_parts = []
+
+                    elif etype == "content_block_delta":
                         delta = event.get("delta", {})
-                        thinking = delta.get("thinking", "")
-                        text = delta.get("text", "")
-                        if thinking:
-                            thinking_parts.append(thinking)
-                            callback(thinking, "thinking")
-                        elif text:
-                            callback(text, "text")
+                        dtype = delta.get("type", "")
+                        if dtype == "input_json_delta" and _in_tool_use:
+                            _cur_tool_input_parts.append(
+                                delta.get("partial_json", ""))
+                        elif dtype == "content_block_delta" and _in_tool_result:
+                            _cur_tool_result_parts.append(
+                                delta.get("text", ""))
+                        else:
+                            thinking = delta.get("thinking", "")
+                            text = delta.get("text", "")
+                            if thinking:
+                                thinking_parts.append(thinking)
+                                callback(thinking, "thinking")
+                            elif text:
+                                callback(text, "text")
+
+                    elif etype == "content_block_stop":
+                        if _in_tool_use:
+                            _in_tool_use = False
+                        elif _in_tool_result and tool_callback and _cur_tool_name:
+                            # Tool cycle complete — report to callback
+                            try:
+                                tool_input = json.loads(
+                                    "".join(_cur_tool_input_parts))
+                            except (json.JSONDecodeError, ValueError):
+                                tool_input = {"raw": "".join(
+                                    _cur_tool_input_parts)}
+                            tool_result = "".join(_cur_tool_result_parts)
+                            status = "ok"  # best-effort
+                            tool_callback(_cur_tool_name, tool_input,
+                                          tool_result, status)
+                            _cur_tool_name = ""
+                            _in_tool_result = False
+
                 elif msg.get("type") == "result":
                     result_data = msg
         finally:

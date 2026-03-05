@@ -3,13 +3,14 @@
 import json
 import logging
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts
 from .lean import LeanTheorem, LeanWorkDir, run_lean_check
-from .llm import Interrupted
+from .llm import Interrupted, LLMClient
 from .tui import TUI
 
 logger = logging.getLogger("openprover")
@@ -276,20 +277,40 @@ class Prover:
         # Unified view for cost/call tracking
         self.llm = self.planner_llm
 
-        # LeanExplore for worker tool calls
+        # Tool calling for workers
         self.lean_explore_service = None
         if self.lean_worker_actions:
-            if not getattr(self.worker_llm, 'vllm', False):
-                raise ValueError("--lean-worker-actions requires a vLLM worker model")
-            try:
-                from lean_explore.search import SearchEngine, Service
-                engine = SearchEngine(use_local_data=False)
-                self.lean_explore_service = Service(engine=engine)
-                logger.info("LeanExplore service initialized")
-            except ImportError:
-                logger.warning("lean_explore not installed — lean_search tool disabled")
-            except Exception as e:
-                logger.warning("LeanExplore init failed: %s", e)
+            if isinstance(self.worker_llm, LLMClient):
+                # Claude CLI: configure MCP server for tool calling
+                mcp_config = {
+                    "mcpServers": {
+                        "lean_tools": {
+                            "command": sys.executable,
+                            "args": ["-m", "openprover.mcp_server"],
+                            "env": {
+                                "LEAN_PROJECT_DIR": str(self.lean_project_dir),
+                                "LEAN_WORK_DIR": str(
+                                    self.lean_work_dir.dir
+                                    if self.lean_work_dir else ""),
+                            },
+                        }
+                    }
+                }
+                self.worker_llm.mcp_config = mcp_config
+                logger.info("Claude MCP tool calling configured")
+            elif getattr(self.worker_llm, 'vllm', False):
+                # vLLM: initialize LeanExplore for in-process tool execution
+                try:
+                    from lean_explore.search import SearchEngine, Service
+                    engine = SearchEngine(use_local_data=False)
+                    self.lean_explore_service = Service(engine=engine)
+                    logger.info("LeanExplore service initialized")
+                except ImportError:
+                    logger.warning("lean_explore not installed — lean_search tool disabled")
+                except Exception as e:
+                    logger.warning("LeanExplore init failed: %s", e)
+            else:
+                logger.warning("lean_worker_actions enabled but worker is neither Claude nor vLLM — tools disabled")
 
         # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()
@@ -1135,11 +1156,17 @@ class Prover:
         description = task.get("description", "")
         resolved_refs = self.repo.resolve_wikilinks(description)
         prompt = prompts.format_worker_prompt(description, resolved_refs)
-        use_tools = self.lean_worker_actions and getattr(self.worker_llm, 'vllm', False)
+        use_vllm_tools = self.lean_worker_actions and getattr(self.worker_llm, 'vllm', False)
+        use_mcp_tools = self.lean_worker_actions and getattr(self.worker_llm, 'mcp_config', None)
+        use_tools = use_vllm_tools or use_mcp_tools
         system_prompt = prompts.worker_system_prompt(lean_worker_actions=use_tools)
 
-        if not use_tools:
-            # Single-turn path (Claude CLI or non-vLLM)
+        if not use_vllm_tools:
+            # Single-turn path: Claude CLI (with or without MCP) or non-vLLM
+            # When MCP is configured, Claude CLI handles tool calling internally.
+            def _tool_cb(name, tool_input, result, status):
+                self.tui.add_worker_action(worker_id, name, tool_input, result, status)
+
             self.tui.stream_start("working...", tab=worker_id)
             try:
                 resp = self.worker_llm.call(
@@ -1148,6 +1175,7 @@ class Prover:
                     label=worker_id,
                     stream_callback=self._stream_cb(worker_id),
                     archive_path=archive_path,
+                    tool_callback=_tool_cb if use_mcp_tools else None,
                 )
                 self.tui.stream_end(tab=worker_id)
 

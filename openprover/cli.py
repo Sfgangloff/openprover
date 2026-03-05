@@ -66,7 +66,7 @@ def _cmd_prove():
     parser.add_argument("--lean-items", action=argparse.BooleanOptionalAction, default=None,
                         help="Allow saving .lean items to the repo (auto-enabled with --lean-project)")
     parser.add_argument("--lean-worker-actions", action=argparse.BooleanOptionalAction, default=None,
-                        help="Enable worker tool calls (lean_verify, lean_search) via vLLM (auto-enabled with --lean-project + vLLM worker)")
+                        help="Enable worker tool calls (lean_verify, lean_search) via MCP/vLLM (auto-enabled with --lean-project + capable worker)")
     parser.add_argument("--repl-dir", type=Path, metavar="DIR",
                         help="Path to lean-repl directory (reserved for future use)")
 
@@ -115,15 +115,17 @@ def _cmd_prove():
         "minimax-m2.5": "MiniMaxAI/MiniMax-M2.5",
     }
     VLLM_MODELS = {"minimax-m2.5"}  # served via vLLM (standard OpenAI API)
+    CLAUDE_MODELS = {"sonnet", "opus"}
+    TOOL_CAPABLE_MODELS = VLLM_MODELS | CLAUDE_MODELS
 
     # Resolve --lean-worker-actions default
     if args.lean_worker_actions is None:
-        args.lean_worker_actions = (args.lean_project is not None and worker_model in VLLM_MODELS)
+        args.lean_worker_actions = (args.lean_project is not None and worker_model in TOOL_CAPABLE_MODELS)
     if args.lean_worker_actions:
         if not args.lean_project:
             parser.error("--lean-worker-actions requires --lean-project")
-        if worker_model not in VLLM_MODELS:
-            parser.error("--lean-worker-actions requires a vLLM worker model (e.g. minimax-m2.5)")
+        if worker_model not in TOOL_CAPABLE_MODELS:
+            parser.error("--lean-worker-actions requires a tool-capable worker model (sonnet, opus, or minimax-m2.5)")
 
     def _make_client(model_alias, archive_dir):
         if model_alias in HF_MODEL_MAP:

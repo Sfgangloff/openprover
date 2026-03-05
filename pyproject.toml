@@ -7,6 +7,9 @@ name = "openprover"
 version = "0.1.0"
 description = "Theorem prover powered by language models"
 requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0",
+]
 
 [project.scripts]
 openprover = "openprover.cli:main"
