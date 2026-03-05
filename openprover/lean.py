@@ -84,16 +84,20 @@ class LeanTheorem:
 
 
 def run_lean_check(lean_file: Path, project_dir: Path,
-                   timeout: int = 300) -> tuple[bool, str]:
-    """Run ``lake env lean <file>`` and return (success, feedback).
+                   timeout: int = 300) -> tuple[bool, str, str]:
+    """Run ``lake env lean <file>`` and return (success, feedback, cmd_info).
 
     Success means returncode 0 and empty stdout.
+    cmd_info is a human-readable string with the exact command and cwd.
     """
+    cmd = ["lake", "env", "lean", str(lean_file.resolve())]
+    cwd = str(project_dir)
+    cmd_info = f"cwd: {cwd}\ncmd: {' '.join(cmd)}"
     logger.info("Verifying %s", lean_file.name)
     try:
         proc = subprocess.run(
-            ["lake", "env", "lean", str(lean_file.resolve())],
-            cwd=str(project_dir),
+            cmd,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -103,7 +107,7 @@ def run_lean_check(lean_file: Path, project_dir: Path,
 
         if proc.returncode == 0 and not stdout:
             logger.info("Lean check passed: %s", lean_file.name)
-            return (True, "")
+            return (True, "", cmd_info)
 
         parts = []
         if stdout:
@@ -112,14 +116,14 @@ def run_lean_check(lean_file: Path, project_dir: Path,
             parts.append(stderr)
         feedback = '\n'.join(parts)
         logger.info("Lean check failed: %s", lean_file.name)
-        return (False, feedback)
+        return (False, feedback, cmd_info)
 
     except subprocess.TimeoutExpired:
         logger.warning("Lean verification timed out: %s (%ds)", lean_file.name, timeout)
-        return (False, f"Lean verification timed out after {timeout}s")
+        return (False, f"Lean verification timed out after {timeout}s", cmd_info)
     except FileNotFoundError:
         logger.error("lake command not found")
-        return (False, "lake command not found — is Lean/Lake installed and on PATH?")
+        return (False, "lake command not found — is Lean/Lake installed and on PATH?", cmd_info)
 
 
 class LeanWorkDir:

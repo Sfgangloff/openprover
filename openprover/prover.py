@@ -725,13 +725,14 @@ class Prover:
             if fmt == "lean" and content and self.lean_work_dir:
                 path = self.lean_work_dir.make_file(slug, content)
                 self.tui.log(f"Verifying [[{slug}]]...", dim=True)
-                success, feedback = run_lean_check(path, self.lean_project_dir)
+                success, feedback, cmd_info = run_lean_check(path, self.lean_project_dir)
 
                 lean_dir = step_dir / "lean"
                 lean_dir.mkdir(exist_ok=True)
                 (lean_dir / f"item_{lean_idx}_{slug}.lean").write_text(content)
                 (lean_dir / f"result_{lean_idx}_{slug}.txt").write_text(
                     "OK" if success else feedback)
+                (lean_dir / f"cmd_{lean_idx}_{slug}.txt").write_text(cmd_info)
                 lean_idx += 1
 
                 if success:
@@ -792,13 +793,14 @@ class Prover:
         proof_path = self.lean_work_dir.make_file("proof-attempt", proof_text)
         self.tui.log(f"Verifying Lean proof: {proof_path.name}...", dim=True)
 
-        success, feedback = run_lean_check(proof_path, self.lean_project_dir)
+        success, feedback, cmd_info = run_lean_check(proof_path, self.lean_project_dir)
 
         # Archive lean I/O
         lean_dir = step_dir / "lean"
         lean_dir.mkdir(exist_ok=True)
         (lean_dir / "proof_attempt.lean").write_text(proof_text)
         (lean_dir / "proof_result.txt").write_text("OK" if success else feedback)
+        (lean_dir / "proof_cmd.txt").write_text(cmd_info)
 
         if success:
             self.lean_work_dir.write_proof(proof_text)
@@ -1355,7 +1357,7 @@ class Prover:
 
         slug = f"worker_verify_{worker_id}"
         path = self.lean_work_dir.make_file(slug, code)
-        success, feedback = run_lean_check(path, self.lean_project_dir)
+        success, feedback, _cmd_info = run_lean_check(path, self.lean_project_dir)
         status = "ok" if success else "error"
         result = "OK — no errors" if success else feedback
         logger.info("[%s] lean_verify: %s", worker_id, status)
