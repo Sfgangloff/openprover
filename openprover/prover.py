@@ -15,6 +15,44 @@ from .tui import TUI
 logger = logging.getLogger("openprover")
 
 
+WORKER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lean_verify",
+            "description": "Verify Lean 4 code. Returns compiler output (errors/warnings or OK).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Lean 4 source code to verify.",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lean_search",
+            "description": "Search Mathlib and Lean 4 declarations by natural language query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+
 def slugify(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -139,11 +177,13 @@ class Prover:
                  lean_theorem_path: Path | None = None,
                  proof_path: Path | None = None,
                  make_worker_llm=None,
-                 lean_items: bool = False):
+                 lean_items: bool = False,
+                 lean_worker_actions: bool = False):
         self.model = model_name
         self._make_llm = make_llm
         self._make_worker_llm = make_worker_llm or make_llm
         self.lean_items = lean_items
+        self.lean_worker_actions = lean_worker_actions
         self.max_steps = max_steps
         self.autonomous = autonomous
         self.verbose = verbose
@@ -235,6 +275,21 @@ class Prover:
         self.worker_llm = self._make_worker_llm(archive_dir)
         # Unified view for cost/call tracking
         self.llm = self.planner_llm
+
+        # LeanExplore for worker tool calls
+        self.lean_explore_service = None
+        if self.lean_worker_actions:
+            if not getattr(self.worker_llm, 'vllm', False):
+                raise ValueError("--lean-worker-actions requires a vLLM worker model")
+            try:
+                from lean_explore.search import SearchEngine, Service
+                engine = SearchEngine(use_local_data=False)
+                self.lean_explore_service = Service(engine=engine)
+                logger.info("LeanExplore service initialized")
+            except ImportError:
+                logger.warning("lean_explore not installed — lean_search tool disabled")
+            except Exception as e:
+                logger.warning("LeanExplore init failed: %s", e)
 
         # Derive theorem name for header
         lines = self.theorem_text.strip().splitlines()
@@ -414,9 +469,41 @@ class Prover:
             # Parse TOML decision
             plan = prompts.parse_planner_toml(resp["result"])
             if plan is None:
+                # Check if truncated — try Phase 2 forced output
+                finish = resp.get("finish_reason", "")
+                if finish in ("length", "max_tokens") and attempt == 0:
+                    logger.info("Planner truncated (finish_reason=%s) — Phase 2", finish)
+                    self.tui.log("Planner output truncated — forcing decision...", color="yellow")
+                    phase2_prompt = prompts.format_planner_truncated(prompt, resp["result"])
+                    self.tui.stream_start("forcing decision", tab="planner")
+                    try:
+                        phase2_max = getattr(self.planner_llm, 'answer_reserve', 4096)
+                        resp = self.planner_llm.call(
+                            prompt=phase2_prompt,
+                            system_prompt=system_prompt,
+                            label=f"planner_step_{self.step_num}_phase2",
+                            stream_callback=self._stream_cb("planner"),
+                            archive_path=step_dir / "planner_call_phase2.json",
+                            **({"max_tokens": phase2_max} if hasattr(self.planner_llm, 'answer_reserve') else {}),
+                        )
+                    except Interrupted:
+                        self.tui.stream_end(tab="planner")
+                        return self._handle_interrupt(step_dir)
+                    except RuntimeError as e:
+                        self.tui.stream_end(tab="planner")
+                        logger.error("Phase 2 error: %s", e)
+                        self.tui.log(f"Error: {e}", color="red")
+                        self._save_step_meta(step_dir, status="llm_error", error=str(e))
+                        return "continue"
+                    self.tui.stream_end(tab="planner")
+                    last_resp = resp
+                    plan = prompts.parse_planner_toml(resp["result"])
+                    if plan is not None:
+                        break
+
                 parse_error = (
                     "Failed to parse TOML output. Your response must end with "
-                    "an <OPENPROVER_TOML>...</OPENPROVER_TOML> block containing "
+                    "an <OPENPROVER_ACTION>...</OPENPROVER_ACTION> block containing "
                     "action = \"...\" and other required fields."
                 )
                 remaining = MAX_PARSE_RETRIES - attempt
@@ -1048,28 +1135,233 @@ class Prover:
         description = task.get("description", "")
         resolved_refs = self.repo.resolve_wikilinks(description)
         prompt = prompts.format_worker_prompt(description, resolved_refs)
+        use_tools = self.lean_worker_actions and getattr(self.worker_llm, 'vllm', False)
+        system_prompt = prompts.worker_system_prompt(lean_worker_actions=use_tools)
 
-        self.tui.stream_start("generating worker instructions...", tab=worker_id)
+        if not use_tools:
+            # Single-turn path (Claude CLI or non-vLLM)
+            self.tui.stream_start("working...", tab=worker_id)
+            try:
+                resp = self.worker_llm.call(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    label=worker_id,
+                    stream_callback=self._stream_cb(worker_id),
+                    archive_path=archive_path,
+                )
+                self.tui.stream_end(tab=worker_id)
+
+                # Phase 2 if truncated
+                if resp.get("finish_reason") in ("length", "max_tokens"):
+                    logger.info("[%s] truncated — Phase 2", worker_id)
+                    self.tui.stream_start("forcing output...", tab=worker_id)
+                    answer_reserve = getattr(self.worker_llm, 'answer_reserve', 4096)
+                    phase2_prompt = (
+                        f"{prompt}\n\n---\n\n"
+                        f"Your previous reasoning was cut off. Continue with your final answer.\n\n"
+                        f"Previous output (last 2000 chars):\n"
+                        f"```\n{resp['result'][-2000:]}\n```"
+                    )
+                    resp2 = self.worker_llm.call(
+                        prompt=phase2_prompt,
+                        system_prompt=system_prompt,
+                        label=f"{worker_id}_phase2",
+                        stream_callback=self._stream_cb(worker_id),
+                        archive_path=archive_path.parent / f"{archive_path.stem}_phase2.json" if archive_path else None,
+                        max_tokens=answer_reserve,
+                    )
+                    self.tui.stream_end(tab=worker_id)
+                    resp = {
+                        "result": resp2["result"],
+                        "thinking": resp["thinking"] + resp2.get("thinking", ""),
+                        "cost": resp["cost"] + resp2["cost"],
+                        "duration_ms": resp["duration_ms"] + resp2["duration_ms"],
+                        "raw": resp2["raw"],
+                        "finish_reason": resp2.get("finish_reason", "stop"),
+                    }
+
+                resp["error"] = ""
+            except Interrupted:
+                self.tui.stream_end(tab=worker_id)
+                resp = {"result": "(terminated by user)", "cost": 0.0,
+                        "duration_ms": 0, "raw": {}, "error": "interrupted"}
+            except RuntimeError as e:
+                self.tui.stream_end(tab=worker_id)
+                resp = {"result": f"Worker error: {e}", "cost": 0.0,
+                        "duration_ms": 0, "raw": {}, "error": str(e)}
+            self.tui.worker_output(worker_id, resp["result"])
+            return resp
+
+        # Multi-turn tool-calling path (vLLM)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        total_cost = 0.0
+        total_duration = 0
+        call_idx = 0
+
         try:
-            resp = self.worker_llm.call(
-                prompt=prompt,
-                system_prompt=prompts.WORKER_SYSTEM_PROMPT,
-                label=worker_id,
-                stream_callback=self._stream_cb(worker_id),
-                archive_path=archive_path,
-            )
-            self.tui.stream_end(tab=worker_id)
-            resp["error"] = ""
+            while True:
+                self.tui.stream_start("working..." if call_idx == 0 else "continuing...", tab=worker_id)
+                call_archive = (
+                    archive_path.parent / f"{archive_path.stem}_{call_idx}.json"
+                    if archive_path else None
+                )
+                resp = self.worker_llm.chat(
+                    messages=messages,
+                    tools=WORKER_TOOLS,
+                    label=f"{worker_id}_turn_{call_idx}",
+                    stream_callback=self._stream_cb(worker_id),
+                    archive_path=call_archive,
+                )
+                self.tui.stream_end(tab=worker_id)
+                total_cost += resp["cost"]
+                total_duration += resp["duration_ms"]
+                call_idx += 1
+
+                finish = resp.get("finish_reason", "stop")
+
+                if finish == "stop":
+                    break
+
+                if finish == "tool_calls" and resp.get("tool_calls"):
+                    # Append assistant message with tool calls
+                    assistant_msg = {"role": "assistant", "content": resp["result"] or None}
+                    assistant_msg["tool_calls"] = resp["tool_calls"]
+                    messages.append(assistant_msg)
+
+                    # Execute each tool call
+                    for tc in resp["tool_calls"]:
+                        tool_name = tc["function"]["name"]
+                        try:
+                            tool_args = json.loads(tc["function"]["arguments"])
+                        except json.JSONDecodeError:
+                            tool_args = {"raw": tc["function"]["arguments"]}
+
+                        tool_result, tool_status = self._execute_worker_tool(
+                            tool_name, tool_args, worker_id,
+                        )
+
+                        # Add to TUI
+                        self.tui.add_worker_action(
+                            worker_id, tool_name, tool_args,
+                            tool_result, tool_status,
+                        )
+
+                        # Append tool result message
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_result,
+                        })
+                    continue
+
+                if finish == "length":
+                    # Phase 2: force output, no tools
+                    logger.info("[%s] truncated — Phase 2", worker_id)
+                    assistant_msg = {"role": "assistant", "content": resp["result"] or ""}
+                    messages.append(assistant_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": "Your response was cut off. Continue with your final answer.",
+                    })
+                    self.tui.stream_start("forcing output...", tab=worker_id)
+                    answer_reserve = getattr(self.worker_llm, 'answer_reserve', 4096)
+                    resp = self.worker_llm.chat(
+                        messages=messages,
+                        tools=None,
+                        max_tokens=answer_reserve,
+                        label=f"{worker_id}_phase2",
+                        stream_callback=self._stream_cb(worker_id),
+                        archive_path=(
+                            archive_path.parent / f"{archive_path.stem}_phase2.json"
+                            if archive_path else None
+                        ),
+                    )
+                    self.tui.stream_end(tab=worker_id)
+                    total_cost += resp["cost"]
+                    total_duration += resp["duration_ms"]
+                    break
+
+                # Unknown finish reason — treat as done
+                break
+
+            result = {
+                "result": resp["result"],
+                "thinking": resp.get("thinking", ""),
+                "cost": total_cost,
+                "duration_ms": total_duration,
+                "raw": resp["raw"],
+                "finish_reason": resp.get("finish_reason", "stop"),
+                "error": "",
+            }
         except Interrupted:
             self.tui.stream_end(tab=worker_id)
-            resp = {"result": "(terminated by user)", "cost": 0.0,
-                    "duration_ms": 0, "raw": {}, "error": "interrupted"}
+            result = {"result": "(terminated by user)", "cost": total_cost,
+                      "duration_ms": total_duration, "raw": {}, "error": "interrupted"}
         except RuntimeError as e:
             self.tui.stream_end(tab=worker_id)
-            resp = {"result": f"Worker error: {e}", "cost": 0.0,
-                    "duration_ms": 0, "raw": {}, "error": str(e)}
-        self.tui.worker_output(worker_id, resp["result"])
-        return resp
+            result = {"result": f"Worker error: {e}", "cost": total_cost,
+                      "duration_ms": total_duration, "raw": {}, "error": str(e)}
+
+        self.tui.worker_output(worker_id, result["result"])
+        return result
+
+    def _execute_worker_tool(self, name: str, args: dict, worker_id: str) -> tuple[str, str]:
+        """Execute a worker tool call. Returns (result_text, status)."""
+        if name == "lean_verify":
+            return self._tool_lean_verify(args, worker_id)
+        if name == "lean_search":
+            return self._tool_lean_search(args, worker_id)
+        return (f"Unknown tool: {name}", "error")
+
+    def _tool_lean_verify(self, args: dict, worker_id: str) -> tuple[str, str]:
+        """Verify Lean code via lean_check."""
+        code = args.get("code", "")
+        if not code:
+            return ("No code provided", "error")
+        if not self.lean_work_dir:
+            return ("Lean project not configured", "error")
+
+        slug = f"worker_verify_{worker_id}"
+        path = self.lean_work_dir.make_file(slug, code)
+        success, feedback = run_lean_check(path, self.lean_project_dir)
+        status = "ok" if success else "error"
+        result = "OK — no errors" if success else feedback
+        logger.info("[%s] lean_verify: %s", worker_id, status)
+        return (result, status)
+
+    def _tool_lean_search(self, args: dict, worker_id: str) -> tuple[str, str]:
+        """Search Mathlib declarations."""
+        import asyncio
+        query = args.get("query", "")
+        if not query:
+            return ("No query provided", "error")
+        if not self.lean_explore_service:
+            return ("lean_search not available (lean_explore not installed)", "error")
+
+        try:
+            results = asyncio.run(
+                self.lean_explore_service.search(query, limit=10)
+            )
+            if not results:
+                return ("No results found", "ok")
+            parts = []
+            for r in results:
+                name = getattr(r, 'name', str(r))
+                doc = getattr(r, 'doc_string', '') or ''
+                sig = getattr(r, 'signature', '') or ''
+                entry = f"**{name}**"
+                if sig:
+                    entry += f"\n```lean\n{sig}\n```"
+                if doc:
+                    entry += f"\n{doc}"
+                parts.append(entry)
+            return ("\n\n".join(parts), "ok")
+        except Exception as e:
+            logger.warning("[%s] lean_search error: %s", worker_id, e)
+            return (f"Search error: {e}", "error")
 
     # ── Saving & discussion ──────────────────────────────────
 

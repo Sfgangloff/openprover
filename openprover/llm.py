@@ -175,6 +175,7 @@ class LLMClient:
             "cost": cost,
             "duration_ms": duration,
             "raw": raw,
+            "finish_reason": raw.get("stop_reason", "end_turn"),
         }
 
     def _call_streaming(self, cmd, prompt, system_prompt, json_schema,
@@ -270,6 +271,7 @@ class LLMClient:
             "cost": cost,
             "duration_ms": duration,
             "raw": result_data,
+            "finish_reason": result_data.get("stop_reason", "end_turn"),
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,
@@ -323,6 +325,7 @@ class HFClient:
         self._interrupted = threading.Event()
         self.max_context_length = MODEL_CONTEXT_LENGTHS[model]
         self.max_output_tokens = self.max_context_length
+        self.answer_reserve = answer_reserve
         self.max_thinking_tokens = max(
             self.max_context_length - answer_reserve,
             self.max_context_length // 2,
@@ -359,10 +362,12 @@ class HFClient:
         web_search: bool = False,
         stream_callback=None,
         archive_path: Path | None = None,
+        max_tokens: int | None = None,
     ) -> dict:
         """Make an LLM call via HTTP and archive it.
 
         Same interface as LLMClient.call(). web_search and json_schema are ignored.
+        max_tokens overrides the default token budget for this call.
         """
         self.call_count += 1
         call_num = self.call_count
@@ -378,11 +383,15 @@ class HFClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
+        effective_max_tokens = max_tokens if max_tokens is not None else (
+            self.max_thinking_tokens + self.answer_reserve if self.vllm
+            else self.max_output_tokens
+        )
         if self.vllm:
             payload = {
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": self.max_output_tokens,
+                "max_tokens": effective_max_tokens,
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "stream": bool(stream_callback),
@@ -391,7 +400,7 @@ class HFClient:
             payload = {
                 "model": self.model,
                 "messages": messages,
-                "max_output_tokens": self.max_output_tokens,
+                "max_output_tokens": effective_max_tokens,
                 "max_thinking_tokens": self.max_thinking_tokens,
                 "temperature": 0.6,
                 "top_p": 0.95,
@@ -468,7 +477,9 @@ class HFClient:
                           None, "interrupted", elapsed_ms, archive_path)
             raise Interrupted()
 
-        msg = raw["choices"][0]["message"]
+        choice = raw["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason", "stop")
         reasoning = msg.get("reasoning_content") or ""
         full_text = msg.get("content", "")
         if reasoning:
@@ -487,6 +498,7 @@ class HFClient:
             "cost": 0.0,
             "duration_ms": elapsed_ms,
             "raw": raw,
+            "finish_reason": finish_reason,
         }
 
     def _call_streaming(self, payload, prompt, system_prompt, json_schema,
@@ -520,6 +532,7 @@ class HFClient:
         in_thinking = not self.vllm  # serve_hf starts in thinking; vLLM uses reasoning_content
         pending = ""         # buffer for partial </think> detection (serve_hf only)
         interrupted = False
+        finish_reason = "stop"
 
         for raw_line in resp:
             if self._interrupted.is_set():
@@ -536,7 +549,11 @@ class HFClient:
                 chunk = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            choice = chunk.get("choices", [{}])[0]
+            chunk_finish = choice.get("finish_reason")
+            if chunk_finish:
+                finish_reason = chunk_finish
+            delta = choice.get("delta", {})
 
             if self.vllm:
                 # vLLM with --reasoning-parser separates thinking/content
@@ -610,6 +627,233 @@ class HFClient:
             "cost": 0.0,
             "duration_ms": elapsed_ms,
             "raw": {"result": result_text},
+            "finish_reason": finish_reason,
+        }
+
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
+        label: str = "",
+        stream_callback=None,
+        archive_path: Path | None = None,
+    ) -> dict:
+        """Multi-turn chat with optional tool calling (vLLM only).
+
+        Args:
+            messages: OpenAI-format message list.
+            tools: OpenAI-format tool definitions, or None.
+            max_tokens: Token budget for this call.
+            stream_callback: If provided, called with (text, kind) chunks.
+            archive_path: Override archive file path.
+
+        Returns dict with keys: result, thinking, cost, duration_ms, raw,
+        finish_reason, tool_calls.
+        """
+        if not self.vllm:
+            raise RuntimeError("chat() is only supported for vLLM models")
+
+        self.call_count += 1
+        call_num = self.call_count
+
+        effective_max_tokens = max_tokens if max_tokens is not None else (
+            self.max_thinking_tokens + self.answer_reserve
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": effective_max_tokens,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "stream": bool(stream_callback),
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        # Archive input
+        prompt_text = json.dumps(messages, ensure_ascii=False)
+        self._archive(call_num, label, prompt_text, "", None,
+                      None, None, 0, archive_path)
+
+        logger.info("[%s] chat %s%s", label, self.model,
+                    " (streaming)" if stream_callback else "")
+        start = time.time()
+
+        if self._interrupted.is_set():
+            elapsed_ms = int((time.time() - start) * 1000)
+            self._archive(call_num, label, prompt_text, "", None,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
+
+        try:
+            if stream_callback:
+                return self._chat_streaming(
+                    payload, prompt_text, call_num, label, start,
+                    stream_callback, archive_path,
+                )
+            else:
+                return self._chat_non_streaming(
+                    payload, prompt_text, call_num, label, start, archive_path,
+                )
+        except (urllib.error.URLError, ConnectionError) as e:
+            elapsed_ms = int((time.time() - start) * 1000)
+            self._archive(call_num, label, prompt_text, "", None,
+                          None, str(e), elapsed_ms, archive_path)
+            raise RuntimeError(f"vLLM chat request failed: {e}")
+
+    def _chat_non_streaming(self, payload, prompt_text, call_num, label,
+                            start, archive_path):
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+            raw = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            elapsed_ms = int((time.time() - start) * 1000)
+            if e.code == 499:
+                self._archive(call_num, label, prompt_text, "", None,
+                              None, "interrupted", elapsed_ms, archive_path)
+                raise Interrupted()
+            self._archive(call_num, label, prompt_text, "", None,
+                          None, f"HTTP {e.code}: {body}", elapsed_ms, archive_path)
+            raise
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        choice = raw["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason", "stop")
+        reasoning = msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+
+        self._archive(call_num, label, prompt_text, "", None,
+                      raw, None, elapsed_ms, archive_path,
+                      thinking=reasoning, result_text=content)
+        logger.info("[%s] done %dms finish=%s tools=%d", label, elapsed_ms,
+                    finish_reason, len(tool_calls) if tool_calls else 0)
+
+        return {
+            "result": content,
+            "thinking": reasoning,
+            "cost": 0.0,
+            "duration_ms": elapsed_ms,
+            "raw": raw,
+            "finish_reason": finish_reason,
+            "tool_calls": tool_calls,
+        }
+
+    def _chat_streaming(self, payload, prompt_text, call_num, label,
+                        start, callback, archive_path):
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            elapsed_ms = int((time.time() - start) * 1000)
+            if e.code == 499:
+                self._archive(call_num, label, prompt_text, "", None,
+                              None, "interrupted", elapsed_ms, archive_path)
+                raise Interrupted()
+            self._archive(call_num, label, prompt_text, "", None,
+                          None, f"HTTP {e.code}: {body}", elapsed_ms, archive_path)
+            raise
+
+        thinking_parts: list[str] = []
+        output_parts: list[str] = []
+        tool_call_acc: dict[int, dict] = {}  # index → {id, function: {name, arguments}}
+        finish_reason = "stop"
+        interrupted = False
+
+        for raw_line in resp:
+            if self._interrupted.is_set():
+                interrupted = True
+                resp.close()
+                break
+            line = raw_line.decode().strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            choice = chunk.get("choices", [{}])[0]
+            chunk_finish = choice.get("finish_reason")
+            if chunk_finish:
+                finish_reason = chunk_finish
+            delta = choice.get("delta", {})
+
+            # Reasoning content
+            reasoning = delta.get("reasoning_content", "")
+            if reasoning:
+                callback(reasoning, "thinking")
+                thinking_parts.append(reasoning)
+
+            # Text content
+            content = delta.get("content", "")
+            if content:
+                callback(content, "text")
+                output_parts.append(content)
+
+            # Tool call deltas
+            for tc_delta in delta.get("tool_calls", []):
+                idx = tc_delta.get("index", 0)
+                if idx not in tool_call_acc:
+                    tool_call_acc[idx] = {
+                        "id": tc_delta.get("id", ""),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                acc = tool_call_acc[idx]
+                if tc_delta.get("id"):
+                    acc["id"] = tc_delta["id"]
+                fn = tc_delta.get("function", {})
+                if fn.get("name"):
+                    acc["function"]["name"] = fn["name"]
+                if fn.get("arguments"):
+                    acc["function"]["arguments"] += fn["arguments"]
+
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        if interrupted:
+            self._archive(call_num, label, prompt_text, "", None,
+                          None, "interrupted", elapsed_ms, archive_path)
+            raise Interrupted()
+
+        thinking_text = "".join(thinking_parts)
+        result_text = "".join(output_parts)
+        tool_calls = ([tool_call_acc[i] for i in sorted(tool_call_acc)]
+                      if tool_call_acc else None)
+
+        self._archive(call_num, label, prompt_text, "", None,
+                      {"result": result_text, "tool_calls": tool_calls},
+                      None, elapsed_ms, archive_path,
+                      thinking=thinking_text, result_text=result_text)
+        logger.info("[%s] done %dms finish=%s tools=%d", label, elapsed_ms,
+                    finish_reason, len(tool_calls) if tool_calls else 0)
+
+        return {
+            "result": result_text,
+            "thinking": thinking_text,
+            "cost": 0.0,
+            "duration_ms": elapsed_ms,
+            "raw": {"result": result_text, "tool_calls": tool_calls},
+            "finish_reason": finish_reason,
+            "tool_calls": tool_calls,
         }
 
     def _archive(self, call_num, label, prompt, system_prompt, json_schema,

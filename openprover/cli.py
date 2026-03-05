@@ -65,6 +65,8 @@ def _cmd_prove():
                         help="Path to existing PROOF.md (formalize-only mode, requires --lean-theorem)")
     parser.add_argument("--lean-items", action=argparse.BooleanOptionalAction, default=None,
                         help="Allow saving .lean items to the repo (auto-enabled with --lean-project)")
+    parser.add_argument("--lean-worker-actions", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable worker tool calls (lean_verify, lean_search) via vLLM (auto-enabled with --lean-project + vLLM worker)")
     parser.add_argument("--repl-dir", type=Path, metavar="DIR",
                         help="Path to lean-repl directory (reserved for future use)")
 
@@ -114,6 +116,15 @@ def _cmd_prove():
     }
     VLLM_MODELS = {"minimax-m2.5"}  # served via vLLM (standard OpenAI API)
 
+    # Resolve --lean-worker-actions default
+    if args.lean_worker_actions is None:
+        args.lean_worker_actions = (args.lean_project is not None and worker_model in VLLM_MODELS)
+    if args.lean_worker_actions:
+        if not args.lean_project:
+            parser.error("--lean-worker-actions requires --lean-project")
+        if worker_model not in VLLM_MODELS:
+            parser.error("--lean-worker-actions requires a vLLM worker model (e.g. minimax-m2.5)")
+
     def _make_client(model_alias, archive_dir):
         if model_alias in HF_MODEL_MAP:
             return HFClient(HF_MODEL_MAP[model_alias], archive_dir,
@@ -146,6 +157,7 @@ def _cmd_prove():
         proof_path=args.proof,
         make_worker_llm=make_worker_llm,
         lean_items=args.lean_items,
+        lean_worker_actions=args.lean_worker_actions,
     )
 
     # Check if this is a finished run → inspect mode

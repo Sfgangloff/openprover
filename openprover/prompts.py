@@ -24,8 +24,8 @@ ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 # ── System prompts ──────────────────────────────────────────
 
 _TQ = '"""'  # triple-quote for embedding in prompts
-_TOML_OPEN_TAG = "<OPENPROVER_TOML>"
-_TOML_CLOSE_TAG = "</OPENPROVER_TOML>"
+_TOML_OPEN_TAG = "<OPENPROVER_ACTION>"
+_TOML_CLOSE_TAG = "</OPENPROVER_ACTION>"
 
 
 def _build_actions(*, lean_mode: str, has_lean: bool,
@@ -313,19 +313,39 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         f"{toml_fields}"
     )
 
-WORKER_SYSTEM_PROMPT = (
-    "You are a research mathematician working on a specific task.\n"
-    "\n"
-    "Complete the task thoroughly and report your findings. "
-    "If you fail to complete the task, be specific about what failed and why.\n"
-    "\n"
-    "If asked to verify a proof: be rigorous. Check every step. "
-    "Don't fill in gaps yourself. End your response with exactly one of:\n"
-    "VERDICT: CORRECT\n"
-    "VERDICT: INCORRECT\n"
-    "\n"
-    "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX.\n"
-)
+def worker_system_prompt(*, lean_worker_actions: bool = False) -> str:
+    """Build worker system prompt, optionally documenting tool actions."""
+    base = (
+        "You are a research mathematician working on a specific task.\n"
+        "\n"
+        "Complete the task thoroughly and report your findings. "
+        "If you fail to complete the task, be specific about what failed and why.\n"
+        "\n"
+        "If asked to verify a proof: be rigorous. Check every step. "
+        "Don't fill in gaps yourself. End your response with exactly one of:\n"
+        "VERDICT: CORRECT\n"
+        "VERDICT: INCORRECT\n"
+        "\n"
+        "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX.\n"
+    )
+    if lean_worker_actions:
+        base += (
+            "\n"
+            "## Available Tools\n"
+            "\n"
+            "You have access to the following tools:\n"
+            "\n"
+            "- **lean_verify(code)**: Verify standalone Lean 4 code. "
+            "The code must include all necessary imports (e.g. `import Mathlib`). "
+            "Returns 'OK' on success or compiler errors on failure.\n"
+            "\n"
+            "- **lean_search(query)**: Search Lean 4 declarations across Batteries, "
+            "Init, Lean, Mathlib, and Std. Returns matching names, types, and docs.\n"
+            "\n"
+            "Use these tools to check Lean code and find relevant lemmas.\n"
+        )
+    return base
+
 
 SEARCH_SYSTEM_PROMPT = (
     "You are a mathematical research assistant. Search for relevant mathematical "
@@ -499,11 +519,29 @@ def format_planner_retry(
     )
 
 
+def format_planner_truncated(
+    original_prompt: str,
+    truncated_output: str,
+) -> str:
+    """Build a Phase 2 prompt when planner output was truncated."""
+    excerpt = truncated_output[-2000:] if len(truncated_output) > 2000 else truncated_output
+    if len(truncated_output) > 2000:
+        excerpt = "..." + excerpt
+    return (
+        f"{original_prompt}\n\n"
+        f"---\n\n"
+        f"Your previous response was cut off. Here is what you generated:\n\n"
+        f"```\n{excerpt}\n```\n\n"
+        f"Produce ONLY the {_TOML_OPEN_TAG} ... {_TOML_CLOSE_TAG} decision block. "
+        f"Do not reason further."
+    )
+
+
 # ── TOML parser ─────────────────────────────────────────────
 
 def parse_planner_toml(text: str) -> dict | None:
     """Extract and parse the TOML decision block from planner output."""
-    # Find <OPENPROVER_TOML> ... </OPENPROVER_TOML> block
+    # Find <OPENPROVER_ACTION> ... </OPENPROVER_ACTION> block
     match = re.search(
         rf"{re.escape(_TOML_OPEN_TAG)}\s*\n?(.*?){re.escape(_TOML_CLOSE_TAG)}",
         text,

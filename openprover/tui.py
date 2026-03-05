@@ -39,6 +39,11 @@ ACTION_STYLE = {
     "give_up": RED,
 }
 
+TOOL_STYLE = {
+    "lean_verify": CYAN,
+    "lean_search": MAGENTA,
+}
+
 HELP_TEXT = f"""\
   {BOLD}Controls{RESET}
 
@@ -94,7 +99,8 @@ class _Tab:
                  "spinner_start", "spinner_tokens", "last_trace", "last_output",
                  "toml_pending", "toml_close_tag", "output_non_toml_seen",
                  "output_toml_seen", "is_waiting",
-                 "done", "task_description")
+                 "done", "task_description",
+                 "entries", "nav_idx")
 
     def __init__(self, tab_id: str, label: str, task_description: str = ""):
         self.id = tab_id
@@ -118,6 +124,9 @@ class _Tab:
         self.is_waiting = False
         self.done = False
         self.task_description = task_description
+        # Navigable entries (action entries for worker tabs)
+        self.entries: list[dict] = []
+        self.nav_idx: int = -1  # -1 = none selected, 0..N-1 = entry index
 
 
 class TUI:
@@ -430,6 +439,42 @@ class TUI:
             tab.log_lines = tab.log_lines[-500:]
         if tab is self._active_tab and self.view == "main":
             self._redraw()
+
+    def add_worker_action(self, tab_id: str, tool: str, args: dict,
+                          result: str, status: str):
+        """Record a completed tool call in a worker tab as a navigable entry."""
+        tab = self._find_tab(tab_id)
+        entry = {
+            "type": "action",
+            "tool": tool,
+            "args": args,
+            "result": result,
+            "status": status,
+        }
+        idx = len(tab.entries)
+        tab.entries.append(entry)
+        line = self._format_action_line(entry)
+        self._tab_log(tab, line, step_idx=idx)
+
+    @staticmethod
+    def _format_action_line(entry: dict) -> str:
+        tool = entry.get("tool", "?")
+        status = entry.get("status", "")
+        color = TOOL_STYLE.get(tool, WHITE)
+        if status == "ok":
+            icon = f"{GREEN}✓{RESET}"
+        else:
+            icon = f"{YELLOW}✗{RESET}"
+        # Short summary from args
+        args = entry.get("args", {})
+        if "query" in args:
+            summary = args["query"][:60]
+        elif "code" in args:
+            first = args["code"].strip().split("\n")[0][:60]
+            summary = first
+        else:
+            summary = ""
+        return f'{color}▸{RESET} {BOLD}{tool}{RESET} {icon} {DIM}—{RESET} {summary}'
 
     def clear_worker_tabs(self):
         """Remove all worker tabs, keeping planner and logs."""
@@ -935,18 +980,30 @@ class TUI:
             self._scroll_up()
         elif ch == '\x1b[6~':
             self._scroll_down()
-        elif ch == '\x1b[A':  # up arrow — planner history only
-            if self.view == "main" and self.active_tab_idx == 0:
-                if self.step_entries:
+        elif ch == '\x1b[A':  # up arrow — navigate entries
+            if self.view == "main":
+                tab = self._active_tab
+                if tab.id == "planner" and self.step_entries:
                     self._nav_up()
                     self._redraw()
+                elif tab.entries:
+                    self._tab_nav_up(tab)
+                    self._redraw()
+                else:
+                    self._scroll_lines_up()
             else:
                 self._scroll_lines_up()
-        elif ch == '\x1b[B':  # down arrow — planner history only
-            if self.view == "main" and self.active_tab_idx == 0:
-                if self.step_entries:
+        elif ch == '\x1b[B':  # down arrow — navigate entries
+            if self.view == "main":
+                tab = self._active_tab
+                if tab.id == "planner" and self.step_entries:
                     self._nav_down()
                     self._redraw()
+                elif tab.entries:
+                    self._tab_nav_down(tab)
+                    self._redraw()
+                else:
+                    self._scroll_lines_down()
             else:
                 self._scroll_lines_down()
         elif ch == 'scroll_up':
@@ -961,12 +1018,18 @@ class TUI:
                 self._nav_step = -1
                 self._restore_worker_tabs()
                 self._redraw()
+            elif self._active_tab.nav_idx >= 0:
+                self._active_tab.nav_idx = -1
+                self._redraw()
         elif ch in ('\n', '\r'):
             if self.view != "main":
                 self.view = "main"
                 self._redraw()
             elif self._nav_step >= 0:
                 self._open_selected_step_detail()
+                self._redraw()
+            elif self._active_tab.nav_idx >= 0:
+                self._open_selected_action_detail()
                 self._redraw()
             elif self._active_tab.scroll_offset > 0:
                 self._active_tab.scroll_offset = 0
@@ -1410,11 +1473,18 @@ class TUI:
                     continue
 
                 if len(ch) >= 3 and ch[:2] == '\x1b[':
+                    tab = self._active_tab
                     if ch == '\x1b[A':
-                        self._nav_up()
+                        if tab.id == "planner":
+                            self._nav_up()
+                        elif tab.entries:
+                            self._tab_nav_up(tab)
                         self._redraw()
                     elif ch == '\x1b[B':
-                        self._nav_down()
+                        if tab.id == "planner":
+                            self._nav_down()
+                        elif tab.entries:
+                            self._tab_nav_down(tab)
                         self._redraw()
                     elif ch == '\x1b[C':
                         self._switch_tab(1)
@@ -1434,6 +1504,9 @@ class TUI:
                         self._nav_step = -1
                         self._restore_worker_tabs()
                         self._redraw()
+                    elif self._active_tab.nav_idx >= 0:
+                        self._active_tab.nav_idx = -1
+                        self._redraw()
                     continue
 
                 if ch in ('\n', '\r'):
@@ -1442,6 +1515,9 @@ class TUI:
                         self._redraw()
                     elif self._nav_step >= 0:
                         self._open_selected_step_detail()
+                        self._redraw()
+                    elif self._active_tab.nav_idx >= 0:
+                        self._open_selected_action_detail()
                         self._redraw()
                     elif self._active_tab.scroll_offset > 0:
                         self._active_tab.scroll_offset = 0
@@ -1481,6 +1557,87 @@ class TUI:
                 self._nav_step = -1
                 self._restore_worker_tabs()
                 self._scroll_selection_into_view()
+
+    def _tab_nav_up(self, tab: _Tab):
+        """Navigate up in a non-planner tab's entries."""
+        if not tab.entries:
+            return
+        if tab.nav_idx == -1:
+            tab.nav_idx = len(tab.entries) - 1
+        elif tab.nav_idx > 0:
+            tab.nav_idx -= 1
+        self._scroll_selection_into_view()
+
+    def _tab_nav_down(self, tab: _Tab):
+        """Navigate down in a non-planner tab's entries."""
+        if not tab.entries:
+            return
+        if tab.nav_idx >= 0:
+            if tab.nav_idx < len(tab.entries) - 1:
+                tab.nav_idx += 1
+            else:
+                tab.nav_idx = -1
+        self._scroll_selection_into_view()
+
+    def _open_selected_action_detail(self):
+        """Open detail view for the selected action in a worker tab."""
+        tab = self._active_tab
+        if tab.nav_idx < 0 or tab.nav_idx >= len(tab.entries):
+            return
+        self._step_detail_idx = tab.nav_idx
+        self._step_detail_scroll = 0
+        self._refresh_action_detail(tab)
+        self.view = "step_detail"
+
+    def _refresh_action_detail(self, tab: _Tab):
+        """Build detail page for a worker tool call entry."""
+        if not (0 <= self._step_detail_idx < len(tab.entries)):
+            self._step_detail_title = "Action Detail"
+            self._step_detail_text = "(no detail)"
+            return
+
+        entry = tab.entries[self._step_detail_idx]
+        tool = entry.get("tool", "?")
+        tool_color = TOOL_STYLE.get(tool, WHITE)
+        self._step_detail_title = f"{tool_color}{tool}{RESET}"
+
+        parts: list[str] = []
+
+        def add_section(title: str, lines: list[str], color: str = BLUE):
+            if not lines:
+                return
+            if parts:
+                parts.append(f"  {DIM}{'─' * 40}{RESET}")
+                parts.append("")
+            parts.append(f"  {color}{BOLD}{title}{RESET}")
+            for line in lines:
+                parts.append(f"  {line}" if line else "")
+
+        # Status
+        status = entry.get("status", "")
+        if status == "ok":
+            add_section("Status", [f"{GREEN}● succeeded{RESET}"], color=YELLOW)
+        else:
+            add_section("Status", [f"{RED}● failed{RESET}"], color=YELLOW)
+
+        # Arguments
+        args = entry.get("args", {})
+        if "code" in args:
+            code_lines = args["code"].splitlines()
+            add_section("Code", code_lines, color=CYAN)
+        if "query" in args:
+            add_section("Query", [args["query"]], color=CYAN)
+
+        # Result
+        result = entry.get("result", "")
+        if result:
+            add_section("Result", result.splitlines(), color=MAGENTA)
+
+        self._step_detail_text = "\n".join(parts) if parts else "  (no detail)"
+        self._step_detail_scroll = min(
+            self._step_detail_scroll,
+            self._step_detail_max_scroll(),
+        )
 
     def _load_historical_workers(self):
         """Load worker tabs from the selected historical step."""
@@ -1604,7 +1761,8 @@ class TUI:
         max_w = max(self.cols - 4, 20)
         planner_live_start = self._planner_live_start(tab)
         line_idx = 0
-        if self._nav_step >= 0:
+        nav = self._nav_step if tab.id == "planner" else tab.nav_idx
+        if nav >= 0:
             for idx, entry in enumerate(tab.log_lines):
                 if (tab.id == "planner"
                         and (entry.is_trace or entry.is_output)
@@ -1613,7 +1771,7 @@ class TUI:
                 rendered = self._entry_render_lines(tab, entry, max_w)
                 if rendered <= 0:
                     continue
-                if entry.step_idx == self._nav_step:
+                if entry.step_idx == nav:
                     return (line_idx, line_idx + rendered - 1)
                 line_idx += rendered
             return None
@@ -1810,13 +1968,14 @@ class TUI:
                 if not rendered_any:
                     continue
             else:
-                is_step = entry.step_idx >= 0
+                is_entry = entry.step_idx >= 0
                 base = f' {entry.text}'
                 continuation = " " * self._leading_visible_spaces(base)
                 wrapped_lines = self._wrap_visual_text(
                     base, max_w, continuation_prefix=continuation
                 )
-                if is_step and entry.step_idx == self._nav_step:
+                nav = self._nav_step if tab.id == "planner" else tab.nav_idx
+                if is_entry and entry.step_idx == nav:
                     for wrapped in wrapped_lines:
                         lines.append(f' {GREEN}▎{RESET}{wrapped}')
                 else:
@@ -2012,7 +2171,7 @@ class TUI:
     def _strip_toml_block(text: str) -> str:
         """Hide planner TOML decision blocks from rendered output."""
         cleaned = re.sub(
-            r"<(?:OPENPROVER_TOML|TOML_OUTPUT)>\s*\n?.*?</(?:OPENPROVER_TOML|TOML_OUTPUT)>",
+            r"<(?:OPENPROVER_ACTION|TOML_OUTPUT)>\s*\n?.*?</(?:OPENPROVER_ACTION|TOML_OUTPUT)>",
             "",
             text,
             flags=re.DOTALL | re.IGNORECASE,
@@ -2027,7 +2186,7 @@ class TUI:
         lowers = text.lower()
         open_close = (
             ("<toml_output>", "</toml_output>"),
-            ("<openprover_toml>", "</openprover_toml>"),
+            ("<openprover_action>", "</openprover_action>"),
         )
         i = 0
         while i < len(text):
@@ -2079,7 +2238,7 @@ class TUI:
         """Stream-safe split that preserves partial TOML tags across chunks."""
         open_to_close = {
             "<TOML_OUTPUT>": "</TOML_OUTPUT>",
-            "<OPENPROVER_TOML>": "</OPENPROVER_TOML>",
+            "<OPENPROVER_ACTION>": "</OPENPROVER_ACTION>",
         }
         open_tags = tuple(open_to_close.keys())
         close_tags = tuple(open_to_close.values())
@@ -2316,6 +2475,10 @@ class HeadlessTUI:
 
     def worker_output(self, tab_id: str, text: str):
         pass
+
+    def add_worker_action(self, tab_id: str, tool: str, args: dict,
+                          result: str, status: str):
+        print(f"[action] {tool} — {status}", flush=True)
 
     def clear_worker_tabs(self):
         pass
