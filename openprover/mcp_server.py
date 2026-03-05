@@ -69,7 +69,7 @@ def lean_verify(code: str) -> str:
     work_dir = _get_work_dir()
     project_dir = _get_project_dir()
     path = work_dir.make_file("mcp_verify", code)
-    success, feedback = run_lean_check(path, project_dir)
+    success, feedback, _cmd_info = run_lean_check(path, project_dir)
     return "OK — no errors" if success else feedback
 
 
