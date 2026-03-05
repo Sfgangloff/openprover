@@ -288,9 +288,10 @@ class Prover:
                             "command": sys.executable,
                             "args": ["-m", "openprover.mcp_server"],
                             "env": {
-                                "LEAN_PROJECT_DIR": str(self.lean_project_dir),
+                                "LEAN_PROJECT_DIR": str(
+                                    self.lean_project_dir.resolve()),
                                 "LEAN_WORK_DIR": str(
-                                    self.lean_work_dir.dir
+                                    self.lean_work_dir.dir.resolve()
                                     if self.lean_work_dir else ""),
                             },
                         }

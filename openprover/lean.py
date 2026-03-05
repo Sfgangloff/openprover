@@ -92,7 +92,7 @@ def run_lean_check(lean_file: Path, project_dir: Path,
     logger.info("Verifying %s", lean_file.name)
     try:
         proc = subprocess.run(
-            ["lake", "env", "lean", str(lean_file)],
+            ["lake", "env", "lean", str(lean_file.resolve())],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
