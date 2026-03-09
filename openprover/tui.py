@@ -1818,15 +1818,14 @@ class TUI:
         max_off = self._max_scroll_offset(lines, tab)
         if tab.scroll_offset > max_off:
             tab.scroll_offset = max_off
-        visible = avail - 1 if tab.scroll_offset > 0 else avail
+        visible = avail - 1 if total > avail else avail
         end = total - tab.scroll_offset
         start = max(end - visible, 0)
         target_start, target_end = sel
 
         if target_start < start:
             # Scroll up so target_start is at top; account for indicator
-            visible_up = avail - 1  # indicator will be shown
-            new_end = min(total, target_start + visible_up)
+            new_end = min(total, target_start + visible)
             tab.scroll_offset = max(total - new_end, 0)
         elif target_end >= end:
             tab.scroll_offset = max(total - (target_end + 1), 0)
@@ -2057,8 +2056,8 @@ class TUI:
                 if tab.scroll_offset > max_off:
                     tab.scroll_offset = max_off
 
-                # Viewport window (indicator takes 1 row when scrolled)
-                visible = avail - 1 if tab.scroll_offset > 0 else avail
+                # Viewport window (indicator takes 1 row when content overflows)
+                visible = avail - 1 if len(lines) > avail else avail
                 end = len(lines) - tab.scroll_offset
                 start = max(end - visible, 0)
                 for line in lines[start:end]:
@@ -2072,8 +2071,15 @@ class TUI:
                     self._write_raw(f'  {DIM}{ch} {tab.spinner_label} {status}{RESET}')
 
                 # Scroll indicator
-                if tab.scroll_offset > 0:
-                    indicator = f' {DIM}↓ {tab.scroll_offset} more lines below{RESET}'
+                above = start
+                below = tab.scroll_offset
+                if above > 0 or below > 0:
+                    parts = []
+                    if above > 0:
+                        parts.append(f'↑ {above} above')
+                    if below > 0:
+                        parts.append(f'↓ {below} below')
+                    indicator = f' {DIM}{" · ".join(parts)}{RESET}'
                     self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
 
                 if self._confirming and not self._browsing and self.active_tab_idx == 0:
