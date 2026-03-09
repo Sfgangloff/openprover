@@ -373,13 +373,6 @@ class Prover:
                 self.prev_outputs = self.prev_outputs[-3:]
             self.tui.append_step_action_output(self.step_num, text)
 
-    def _apply_whiteboard_from_plan(self, plan: dict):
-        """Apply planner whiteboard update if provided."""
-        if plan.get("whiteboard"):
-            self.whiteboard = plan["whiteboard"]
-            (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
-            self.tui.whiteboard = self.whiteboard
-
     def _setup_logging(self):
         """Configure file logging to trace.log in the run directory."""
         root = logging.getLogger("openprover")
@@ -444,7 +437,6 @@ class Prover:
             allow_give_up=self.step_num >= self.max_steps * self.give_up_ratio,
             lean_mode=self.mode,
             num_sorries=self.lean_theorem.num_sorries if self.lean_theorem else 0,
-            step_num=self.step_num,
             lean_items=self.lean_items,
         )
         plan = None
@@ -537,21 +529,6 @@ class Prover:
                 logger.info("Parse error (attempt %d/%d)", attempt + 1, MAX_PARSE_RETRIES + 1)
                 continue
 
-            # Whiteboard: required on step 2+, optional on step 1
-            if not plan.get("whiteboard") and self.step_num > 1:
-                parse_error = (
-                    "TOML block parsed but missing required 'whiteboard' field. "
-                    'You must include whiteboard = """...""" with the full updated whiteboard.'
-                )
-                remaining = MAX_PARSE_RETRIES - attempt
-                self.tui.log(
-                    f"Planner output missing whiteboard — "
-                    f"{'retrying' if remaining else 'giving up'}...",
-                    color="red",
-                )
-                plan = None
-                continue
-
             break  # success
 
         if plan is None:
@@ -562,14 +539,6 @@ class Prover:
         action = plan.get("action", "")
         summary = plan.get("summary", "")
         logger.info("Action: %s — %s", action, summary)
-
-        # Apply whiteboard immediately only when there is no interactive
-        # accept/reject decision gate for this action.
-        deferred_whiteboard = (
-            action in ("spawn", "literature_search") and not self.autonomous
-        )
-        if not deferred_whiteboard:
-            self._apply_whiteboard_from_plan(plan)
 
         # Log non-interactive steps immediately. For actions that require
         # confirmation, record history only after the user accepts the proposal.
@@ -604,6 +573,9 @@ class Prover:
         if action == "read_theorem":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
             return self._handle_read_theorem()
+        if action == "write_whiteboard":
+            self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
+            return self._handle_write_whiteboard(plan)
 
         self.tui.log(f"Unknown action: {action}", color="red")
         self._save_step_meta(step_dir, status="unknown_action", action=action,
@@ -856,6 +828,17 @@ class Prover:
         self.tui.log("Read theorem content", color="yellow")
         return "continue"
 
+    def _handle_write_whiteboard(self, plan: dict) -> str:
+        wb = plan.get("whiteboard", "")
+        if not wb:
+            self.tui.log("write_whiteboard but no whiteboard content", color="yellow")
+            return "continue"
+        self.whiteboard = wb
+        (self.work_dir / "WHITEBOARD.md").write_text(self.whiteboard)
+        self.tui.whiteboard = self.whiteboard
+        self.tui.log("Whiteboard updated", color="yellow")
+        return "continue"
+
     def _handle_spawn(self, plan: dict, step_dir: Path,
                       planner_resp: dict | None = None) -> str:
         tasks = plan.get("tasks", [])
@@ -911,7 +894,6 @@ class Prover:
                 self.tui.show_replan_notice("Feedback noted — will replan next step")
                 return "continue"
 
-        self._apply_whiteboard_from_plan(plan)
         step_idx = self.tui.step_complete(
             self.step_num,
             self.max_steps,
@@ -1072,7 +1054,6 @@ class Prover:
                 self.tui.show_replan_notice("Feedback noted — will replan next step")
                 return "continue"
 
-        self._apply_whiteboard_from_plan(plan)
         step_idx = self.tui.step_complete(
             self.step_num,
             self.max_steps,

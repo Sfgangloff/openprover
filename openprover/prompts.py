@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 ACTIONS = [
     "submit_proof", "give_up", "read_items", "write_items",
     "spawn", "literature_search",
-    "submit_lean_proof", "read_theorem",
+    "submit_lean_proof", "read_theorem", "write_whiteboard",
 ]
 ACTIONS_NO_SEARCH = [a for a in ACTIONS if a != "literature_search"]
 
@@ -41,6 +41,7 @@ def _build_actions(*, lean_mode: str, has_lean: bool,
         actions += "- **read_theorem**: Re-read the original theorem statement, formal Lean statement, and any provided proof.\n"
     else:
         actions += "- **read_theorem**: Re-read the original theorem statement.\n"
+    actions += "- **write_whiteboard**: Update the whiteboard with new information.\n"
 
     if lean_mode != "formalize_only":
         if has_lean:
@@ -82,6 +83,11 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "- Store failed attempts in the repo - they prevent repeating mistakes.\n"
         "- One focused task per worker. Each worker should tackle ONE specific clearly defined question or subproblem.\n"
         "- Don't get stuck. If the first proof avenue does not work, try others.\n"
+        "- Use write_whiteboard to keep track of the high-level state after learning something new. "
+        "Record: current plan, failed attempts (brief), alternative branches to explore if the current plan fails. "
+        "Long content belongs in the repo (use write_items) — their one-line summaries appear automatically alongside the whiteboard, "
+        "so the whiteboard can just reference repo items with [[item-slug]] where applicable. "
+        "Update the whiteboard at most once per planner loop, typically right after receiving new information from the previous action.\n"
     )
     if not isolation:
         principles += "- Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
@@ -136,6 +142,7 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
         "# omit content to delete\n"
         f"{_TOML_CLOSE_TAG}\n\n"
         f"**spawn**: one or more `[[tasks]]` sections with `description = {_TQ}...{_TQ}`\n"
+        f"**write_whiteboard**: `whiteboard = {_TQ}...{_TQ}` (complete replacement of current whiteboard)\n"
     )
     if not isolation:
         fields += f'**literature_search**: `search_query = "..."` and `search_context = {_TQ}...{_TQ}`\n'
@@ -236,7 +243,7 @@ def _build_submit_proof_section(*, lean_mode: str, has_lean: bool) -> str:
 
 def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True,
                           lean_mode: str = "prove", num_sorries: int = 0,
-                          step_num: int = 1, lean_items: bool = False) -> str:
+                          lean_items: bool = False) -> str:
     """Build the planner system prompt, conditionally omitting actions."""
     has_lean = lean_mode in ("prove_and_formalize", "formalize_only")
 
@@ -280,10 +287,11 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "## Whiteboard Style\n"
         "\n"
         "Terse, dense, like shorthand on a real whiteboard:\n"
-        "- Sections: Goal, Strategy, Status, Open Questions, Tried\n"
+        "- Sections: Goal, Plan, Status, Open Questions, Tried\n"
         "- Use LaTeX (will be displayed via MathJax): $inline$ and $$display$$\n"
         "- Abbreviations and arrows freely\n"
         '"WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
+        "- Keep it concise — long results belong in repo items, not on the whiteboard.\n"
         "\n"
         f"## Repo Items\n"
         "\n"
@@ -298,15 +306,9 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         f"{_TOML_OPEN_TAG}\n"
         'action = "spawn"\n'
         'summary = "One-line description for the log"\n'
-        f"whiteboard = {_TQ}\n"
-        f"Updated whiteboard {'(optional on first step)' if step_num == 1 else '(REQUIRED — COMPLETE, replaces previous)'}\n"
-        f"{_TQ}\n"
         "\n"
         "# Action-specific fields below (include only what's relevant)\n"
         f"{_TOML_CLOSE_TAG}\n"
-        "\n"
-        "Whiteboard rule: include a complete `whiteboard` field on every step except for step 1, "
-        "including terminal actions like `submit_proof` and `submit_lean_proof`.\n"
         "\n"
         "### Action-specific TOML fields:\n"
         "\n"
