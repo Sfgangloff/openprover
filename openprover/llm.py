@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -77,6 +78,8 @@ class LLMClient:
         self._interrupted = threading.Event()
         self._active_procs: list[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
+        # Raise Claude CLI's default 32k output token cap
+        self._env = {**os.environ, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000"}
 
     def interrupt(self):
         """Signal all active LLM calls to stop."""
@@ -169,7 +172,7 @@ class LLMClient:
 
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            stderr=subprocess.PIPE, text=True, env=self._env,
         )
         with self._procs_lock:
             self._active_procs.append(proc)
@@ -236,7 +239,7 @@ class LLMClient:
         """
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1,
+            stderr=subprocess.PIPE, text=True, bufsize=1, env=self._env,
         )
         with self._procs_lock:
             self._active_procs.append(proc)
