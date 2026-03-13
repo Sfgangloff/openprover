@@ -36,6 +36,7 @@ ACTION_STYLE = {
     "write_items": CYAN,
     "read_theorem": CYAN,
     "submit_proof": GREEN,
+    "submit_lean_proof": GREEN,
     "give_up": RED,
 }
 
@@ -597,10 +598,14 @@ class TUI:
                     self._tab_log(planner, f'  {DIM}… ({len(lines) - 6} more lines){RESET}')
 
         elif action == "submit_proof":
-            for key in ("proof_slug", "lean_proof_slug"):
-                val = plan.get(key)
-                if val:
-                    self._tab_log(planner, f'  {DIM}{key}: {val}{RESET}')
+            val = plan.get("proof_slug")
+            if val:
+                self._tab_log(planner, f'  {DIM}proof_slug: {val}{RESET}')
+
+        elif action == "submit_lean_proof":
+            val = plan.get("lean_proof_slug")
+            if val:
+                self._tab_log(planner, f'  {DIM}lean_proof_slug: {val}{RESET}')
 
     def _format_step_line(self, entry: dict) -> str:
         action = entry.get("action", "")
@@ -1110,6 +1115,7 @@ class TUI:
             "write_items": "Writing Notes",
             "read_theorem": "Theorem Analysis",
             "submit_proof": "Submission",
+            "submit_lean_proof": "Lean Submission",
             "give_up": "Termination",
         }.get(action, "Step Details")
 

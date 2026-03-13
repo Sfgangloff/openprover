@@ -541,6 +541,9 @@ class Prover:
         if action == "submit_proof":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
             return self._handle_submit_proof(plan, step_dir)
+        if action == "submit_lean_proof":
+            self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
+            return self._handle_submit_lean_proof(plan, step_dir)
         if action == "give_up":
             self._save_step_meta(step_dir, status="ok", action=action, resp=resp)
             return self._handle_give_up()
@@ -662,114 +665,122 @@ class Prover:
             self.tui.show_replan_notice("Feedback noted — will replan next step")
             return "continue"
 
-    def _handle_submit_proof(self, plan: dict, step_dir: Path) -> str:
+    def _handle_submit_proof(self, plan: dict, _step_dir: Path) -> str:
+        """Handle submit_proof — informal markdown proof only."""
         proof_slug = plan.get("proof_slug", "")
-        lean_proof_slug = plan.get("lean_proof_slug", "")
-        feedback_parts: list[str] = []
 
-        # ── Informal proof (proof_slug) ──────────────────────────
-        if proof_slug:
-            if self.mode == "formalize_only":
-                feedback_parts.append(
-                    "proof_slug ignored: in formalize-only mode, only lean_proof_slug is used."
-                )
-            else:
-                content = self.repo.read_item(proof_slug)
-                if not content:
-                    self.tui.log(f"submit_proof: [[{proof_slug}]] not found", color="red")
-                    self._push_output(f"submit_proof rejected: repo item [[{proof_slug}]] not found.")
-                    return "continue"
-                self.proof_text = content
-                (self.work_dir / "PROOF.md").write_text(content)
-                self.tui.log(f"PROOF.md written from [[{proof_slug}]]", color="green")
-                logger.info("PROOF.md written from [[%s]]", proof_slug)
-                feedback_parts.append(f"PROOF.md written from [[{proof_slug}]].")
-
-        # ── Formal lean proof (lean_proof_slug) ──────────────────
-        if lean_proof_slug:
-            if not self.lean_theorem:
-                self.tui.log("submit_proof: lean_proof_slug requires --lean-theorem", color="red")
-                self._push_output("submit_proof rejected: no THEOREM.lean configured.")
-                return "continue"
-
-            content = self.repo.read_item(lean_proof_slug)
-            if not content:
-                self.tui.log(f"submit_proof: [[{lean_proof_slug}]] not found", color="red")
-                self._push_output(f"submit_proof rejected: repo item [[{lean_proof_slug}]] not found.")
-                return "continue"
-
-            # Parse blocks and optional context from the item content
-            blocks, context = self._parse_lean_proof_item(content)
-            logger.info("Lean proof from [[%s]]: %d block(s)", lean_proof_slug, len(blocks))
-
-            try:
-                proof_text = self.lean_theorem.assemble_proof(blocks, context)
-            except ValueError as e:
-                self.tui.log(f"Assembly error: {e}", color="red")
-                logger.warning("Assembly error: %s", e)
-                self._push_output(f"submit_proof lean assembly error: {e}")
-                return "continue"
-
-            # Write and verify
-            proof_path = self.lean_work_dir.make_file("proof-attempt", proof_text)
-            self.tui.log(f"Verifying Lean proof: {proof_path.name}...", dim=True)
-            success, lean_feedback, cmd_info = run_lean_check(proof_path, self.lean_project_dir)
-
-            # Archive
-            lean_dir = step_dir / "lean"
-            lean_dir.mkdir(exist_ok=True)
-            (lean_dir / "proof_attempt.lean").write_text(proof_text)
-            (lean_dir / "proof_result.txt").write_text("OK" if success else lean_feedback)
-            (lean_dir / "proof_cmd.txt").write_text(cmd_info)
-
-            if success:
-                self.lean_work_dir.write_proof(proof_text)
-                (self.work_dir / "PROOF.lean").write_text(proof_text)
-                self.tui.log("Lean proof verified!", color="green", bold=True)
-                logger.info("Lean proof verified! PROOF.lean written from [[%s]]", lean_proof_slug)
-                feedback_parts.append(f"PROOF.lean written from [[{lean_proof_slug}]] (verified OK).")
-            else:
-                self.tui.log("Lean verification failed", color="red")
-                logger.info("Lean proof verification failed")
-                self._push_output(
-                    f"submit_proof: Lean verification FAILED for [[{lean_proof_slug}]].\n\n"
-                    f"Lean feedback:\n```\n{lean_feedback}\n```\n\n"
-                    f"Fix the issues and try again."
-                )
-                return "continue"
-
-        # ── Validate we got something ────────────────────────────
-        if not proof_slug and not lean_proof_slug:
-            self.tui.log("submit_proof: no slugs provided", color="red")
-            self._push_output("submit_proof rejected: provide proof_slug and/or lean_proof_slug.")
+        if not proof_slug:
+            self.tui.log("submit_proof: no proof_slug provided", color="red")
+            self._push_output("submit_proof rejected: provide proof_slug.")
             return "continue"
 
-        # ── Check completion ─────────────────────────────────────
+        if self.mode == "formalize_only":
+            self.tui.log("submit_proof: not available in formalize-only mode", color="red")
+            self._push_output("submit_proof rejected: in formalize-only mode, use submit_lean_proof instead.")
+            return "continue"
+
+        content = self.repo.read_item(proof_slug)
+        if not content:
+            self.tui.log(f"submit_proof: [[{proof_slug}]] not found", color="red")
+            self._push_output(f"submit_proof rejected: repo item [[{proof_slug}]] not found.")
+            return "continue"
+
+        self.proof_text = content
+        (self.work_dir / "PROOF.md").write_text(content)
+        self.tui.log(f"PROOF.md written from [[{proof_slug}]]", color="green")
+        logger.info("PROOF.md written from [[%s]]", proof_slug)
+        feedback = f"PROOF.md written from [[{proof_slug}]]."
+
+        return self._check_completion(feedback)
+
+    def _handle_submit_lean_proof(self, plan: dict, step_dir: Path) -> str:
+        """Handle submit_lean_proof — formal Lean proof blocks."""
+        lean_proof_slug = plan.get("lean_proof_slug", "")
+
+        if not lean_proof_slug:
+            self.tui.log("submit_lean_proof: no lean_proof_slug provided", color="red")
+            self._push_output("submit_lean_proof rejected: provide lean_proof_slug.")
+            return "continue"
+
+        if not self.lean_theorem:
+            self.tui.log("submit_lean_proof: no THEOREM.lean configured", color="red")
+            self._push_output("submit_lean_proof rejected: no THEOREM.lean configured.")
+            return "continue"
+
+        content = self.repo.read_item(lean_proof_slug)
+        if not content:
+            self.tui.log(f"submit_lean_proof: [[{lean_proof_slug}]] not found", color="red")
+            self._push_output(f"submit_lean_proof rejected: repo item [[{lean_proof_slug}]] not found.")
+            return "continue"
+
+        # Parse blocks and optional context from the item content
+        blocks, context = self._parse_lean_proof_item(content)
+        logger.info("Lean proof from [[%s]]: %d block(s)", lean_proof_slug, len(blocks))
+
+        try:
+            proof_text = self.lean_theorem.assemble_proof(blocks, context)
+        except ValueError as e:
+            self.tui.log(f"Assembly error: {e}", color="red")
+            logger.warning("Assembly error: %s", e)
+            self._push_output(f"submit_lean_proof assembly error: {e}")
+            return "continue"
+
+        # Write and verify
+        proof_path = self.lean_work_dir.make_file("proof-attempt", proof_text)
+        self.tui.log(f"Verifying Lean proof: {proof_path.name}...", dim=True)
+        success, lean_feedback, cmd_info = run_lean_check(proof_path, self.lean_project_dir)
+
+        # Archive
+        lean_dir = step_dir / "lean"
+        lean_dir.mkdir(exist_ok=True)
+        (lean_dir / "proof_attempt.lean").write_text(proof_text)
+        (lean_dir / "proof_result.txt").write_text("OK" if success else lean_feedback)
+        (lean_dir / "proof_cmd.txt").write_text(cmd_info)
+
+        if success:
+            self.lean_work_dir.write_proof(proof_text)
+            (self.work_dir / "PROOF.lean").write_text(proof_text)
+            self.tui.log("Lean proof verified!", color="green", bold=True)
+            logger.info("Lean proof verified! PROOF.lean written from [[%s]]", lean_proof_slug)
+            feedback = f"PROOF.lean written from [[{lean_proof_slug}]] (verified OK)."
+            return self._check_completion(feedback)
+        else:
+            self.tui.log("Lean verification failed", color="red")
+            logger.info("Lean proof verification failed")
+            self._push_output(
+                f"submit_lean_proof: Lean verification FAILED for [[{lean_proof_slug}]].\n\n"
+                f"Lean feedback:\n```\n{lean_feedback}\n```\n\n"
+                f"Fix the issues and try again."
+            )
+            return "continue"
+
+    def _check_completion(self, feedback: str) -> str:
+        """Check if all required proofs are present and return stop/continue."""
         has_md = (self.work_dir / "PROOF.md").exists()
         has_lean = (self.work_dir / "PROOF.lean").exists()
 
         if self.mode == "prove":
             if has_md:
-                self._push_output("\n".join(feedback_parts))
+                self._push_output(feedback)
                 return "stop"
         elif self.mode == "formalize_only":
             if has_lean:
-                self._push_output("\n".join(feedback_parts))
+                self._push_output(feedback)
                 return "stop"
         elif self.mode == "prove_and_formalize":
             if has_md and has_lean:
                 self.tui.log("Both PROOF.md and PROOF.lean complete!", color="green", bold=True)
                 logger.info("Both PROOF.md and PROOF.lean complete")
-                self._push_output("\n".join(feedback_parts))
+                self._push_output(feedback)
                 return "stop"
             missing = []
             if not has_md:
-                missing.append("PROOF.md (provide proof_slug)")
+                missing.append("PROOF.md (use submit_proof)")
             if not has_lean:
-                missing.append("PROOF.lean (provide lean_proof_slug)")
-            feedback_parts.append(f"Still missing: {', '.join(missing)}.")
+                missing.append("PROOF.lean (use submit_lean_proof)")
+            feedback += f"\nStill missing: {', '.join(missing)}."
 
-        self._push_output("\n".join(feedback_parts))
+        self._push_output(feedback)
         return "continue"
 
     @staticmethod

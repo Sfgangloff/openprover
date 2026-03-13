@@ -14,7 +14,7 @@ except ModuleNotFoundError:
 # ── Action types ────────────────────────────────────────────
 
 ACTIONS = [
-    "submit_proof", "give_up", "read_items", "write_items",
+    "submit_proof", "submit_lean_proof", "give_up", "read_items", "write_items",
     "spawn", "literature_search",
     "read_theorem", "write_whiteboard",
 ]
@@ -49,12 +49,15 @@ def _build_actions(*, lean_mode: str, has_lean: bool,
         )
     elif lean_mode == "prove_and_formalize":
         actions += (
-            "- **submit_proof**: Submit by referencing repo item slugs for both informal and formal proofs. "
-            "The formal proof (Lean 4) is auto-verified. The session ends when both are accepted.\n"
+            "- **submit_proof**: Submit the informal proof by referencing a repo item slug (proof_slug). "
+            "The session ends when both informal and formal proofs are accepted.\n"
+            "- **submit_lean_proof**: Submit the formal Lean 4 proof blocks by referencing a repo item slug (lean_proof_slug). "
+            "The blocks are assembled with THEOREM.lean and auto-verified. "
+            "The session ends when both informal and formal proofs are accepted.\n"
         )
     elif lean_mode == "formalize_only":
         actions += (
-            "- **submit_proof**: Submit the formal Lean 4 proof by referencing a repo item slug. "
+            "- **submit_lean_proof**: Submit the formal Lean 4 proof blocks by referencing a repo item slug (lean_proof_slug). "
             "Auto-verified with Lean. **If verification succeeds, the session ends.**\n"
         )
     if allow_give_up:
@@ -103,15 +106,20 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
     if lean_mode == "prove_and_formalize":
         principles += (
             "- Both an informal proof and a formal Lean 4 proof are required. "
-            "The session ends only when both are submitted via submit_proof.\n"
+            "The session ends only when both are submitted (submit_proof for informal, submit_lean_proof for formal).\n"
             "- After you have a proof in English, use read_theorem to see the formal theorem statement in Lean.\n"
             "- Before submitting, run at least one independent verification worker that checks the full informal proof end-to-end.\n"
+            "- **Lean workflow**: First develop the complete Lean proof file as a repo item using write_items with format=\"lean\" "
+            "(this auto-verifies it). Once the Lean file is valid in the repo, submit the proof blocks via submit_lean_proof — "
+            "this triggers a separate independent verification.\n"
         )
     elif lean_mode == "formalize_only":
         principles += (
             "- An informal proof (PROOF.md) is already provided. Your only goal is to produce PROOF.lean.\n"
             "- Use read_theorem to view the informal proof and Lean theorem statement.\n"
-            "- Submit the formal proof via submit_proof with lean_proof_slug. The session ends when verification succeeds.\n"
+            "- **Lean workflow**: First develop the complete Lean proof file as a repo item using write_items with format=\"lean\" "
+            "(this auto-verifies it). Once the Lean file is valid in the repo, submit the proof blocks via submit_lean_proof — "
+            "this triggers a separate independent verification. The session ends when verification succeeds.\n"
         )
     elif lean_mode == "prove":
         principles += (
@@ -125,17 +133,16 @@ def _build_toml_fields(*, lean_mode: str, has_lean: bool,
                        num_sorries: int) -> str:
     """Build the TOML fields reference section."""
     fields = ""
-    # submit_proof field docs (mode-dependent)
+    # submit_proof / submit_lean_proof field docs (mode-dependent)
     if lean_mode == "prove":
         fields += '**submit_proof**: `proof_slug = "slug-of-proof-item"`\n'
     elif lean_mode == "prove_and_formalize":
         fields += (
-            "**submit_proof**: `proof_slug = \"slug-of-informal-proof\"` and "
-            "`lean_proof_slug = \"slug-of-lean-proof\"` (both required to end session; "
-            "you can submit one at a time)\n"
+            '**submit_proof**: `proof_slug = "slug-of-informal-proof"`\n'
+            '**submit_lean_proof**: `lean_proof_slug = "slug-of-lean-proof"`\n'
         )
     elif lean_mode == "formalize_only":
-        fields += '**submit_proof**: `lean_proof_slug = "slug-of-lean-proof"`\n'
+        fields += '**submit_lean_proof**: `lean_proof_slug = "slug-of-lean-proof"`\n'
 
     fields += (
         f'**read_items**: `read = ["slug-1", "slug-2"]`\n'
@@ -233,27 +240,43 @@ def _build_repo_items_section(*, lean_items: bool) -> str:
 
 
 def _build_submit_proof_section(*, lean_mode: str, has_lean: bool) -> str:
-    """Build the submit_proof section."""
-    section = (
-        "## submit_proof\n"
-        "\n"
-        "submit_proof references repo item slug(s) — write the proof as a repo item first, "
-        "then submit when finalized. "
-    )
+    """Build the submit_proof / submit_lean_proof section."""
+    section = ""
     if lean_mode == "formalize_only":
         section += (
-            "Provide `lean_proof_slug` pointing to a repo item with the Lean proof body. "
-            "It will be assembled with the theorem template and auto-verified.\n"
+            "## submit_lean_proof\n"
+            "\n"
+            "submit_lean_proof references a repo item slug containing the Lean proof blocks. "
+            "Write the proof as a repo item first (use write_items with format=\"lean\" to develop "
+            "and validate the complete Lean file), then submit the blocks via submit_lean_proof. "
+            "Provide `lean_proof_slug` pointing to a repo item with the proof blocks "
+            "(using `--- BLOCK ---` / `--- CONTEXT ---` delimiters). "
+            "The blocks are assembled with the theorem template and independently verified.\n"
         )
     elif has_lean:
         section += (
-            "Provide `proof_slug` for the informal proof and/or `lean_proof_slug` for the formal Lean proof. "
-            "You can submit one at a time. The lean proof is assembled with the theorem template and auto-verified. "
-            "The session ends when both are accepted. "
-            "Have the informal proof independently verified by a worker first.\n"
+            "## submit_proof\n"
+            "\n"
+            "submit_proof references a repo item slug for the informal proof. "
+            "Write the proof as a repo item first, then submit when finalized. "
+            "Provide `proof_slug` for the informal proof. "
+            "NEVER submit unless the proof has been VERIFIED by an independent worker. "
+            "The session ends when both informal and formal proofs are accepted.\n"
+            "\n"
+            "## submit_lean_proof\n"
+            "\n"
+            "submit_lean_proof references a repo item slug containing the Lean proof blocks. "
+            "**Workflow**: First develop the complete Lean file as a repo item using write_items with format=\"lean\" "
+            "(auto-verified on write). Once valid, submit the proof blocks via submit_lean_proof with `lean_proof_slug`. "
+            "The blocks are assembled with the theorem template and independently verified. "
+            "The session ends when both informal and formal proofs are accepted.\n"
         )
     else:
         section += (
+            "## submit_proof\n"
+            "\n"
+            "submit_proof references a repo item slug — write the proof as a repo item first, "
+            "then submit when finalized. "
             "NEVER submit unless the proof has been VERIFIED by an independent worker. "
             "submit_proof **terminates the session** — there is no going back.\n"
         )
