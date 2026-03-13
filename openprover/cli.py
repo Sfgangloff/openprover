@@ -83,7 +83,7 @@ def main():
 
 
 def _cmd_fetch_lean_data():
-    from .lean_data import fetch_lean_data
+    from .lean.data import fetch_lean_data
     fetch_lean_data()
 
 
@@ -354,7 +354,7 @@ def _cmd_prove():
         if worker_model not in TOOL_CAPABLE_MODELS:
             parser.error("--lean-worker-actions requires a tool-capable worker model (sonnet, opus, or minimax-m2.5)")
         # Auto-fetch Lean Explore data if not available
-        from .lean_data import is_lean_data_available, fetch_lean_data
+        from .lean.data import is_lean_data_available, fetch_lean_data
         if not is_lean_data_available():
             if not args.headless:
                 print(" fetching lean data…", end="", flush=True)

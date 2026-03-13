@@ -1,0 +1,364 @@
+"""Drawing and layout for the TUI."""
+
+import sys
+import time
+
+from openprover import __version__
+from ._colors import (
+    DIM, BOLD, RESET, WHITE, BLUE, GREEN, YELLOW, CYAN, MAGENTA,
+    SPINNER, HEADER_ROWS, HELP_TEXT,
+)
+from ._types import _Tab
+
+
+class RenderMixin:
+
+    def _draw_header(self):
+        w = self.cols
+        step = f"step {self.step_num}/{self.max_steps}" if self.step_num else ""
+
+        # Row 1
+        model = getattr(self, 'model_name', '') or ''
+        self._write_raw('\033[1;1H\033[2K')
+        self._write_raw(f'{BLUE}╭─{RESET} {BOLD}OpenProver{RESET} {DIM}v{__version__}{RESET}')
+        if step:
+            self._write_raw(f' {BLUE}──{RESET} {DIM}{step}{RESET}')
+        if model:
+            self._write_raw(f' {BLUE}·{RESET} {YELLOW}{model}{RESET}')
+        r1_text = f"─ OpenProver v{__version__}"
+        if step:
+            r1_text += f" ── {step}"
+        if model:
+            r1_text += f" · {model}"
+        r1_text += " "
+        fill1 = max(w - len(r1_text) - 2, 0)
+        self._write_raw(f' {BLUE}{"─" * fill1}╮{RESET}')
+
+        # Row 2 — theorem
+        name = (self.theorem_name or "").replace("\n", " ").replace("\r", "")
+        max_name = max(w - 4, 10)
+        if len(name) > max_name:
+            display_name = name[:max_name - 3] + "..."
+        else:
+            display_name = name
+        name_pad = max(w - 3 - len(display_name), 0)
+        self._write_raw('\033[2;1H\033[2K')
+        self._write_raw(f'{BLUE}│{RESET} {WHITE}{display_name}{RESET}')
+        self._write_raw(f'{" " * name_pad}{BLUE}│{RESET}')
+
+        # Row 3 — hints
+        help_style = BOLD if self.view == "help" else DIM
+        auto_style = BOLD if self.autonomous else DIM
+        wb_style = BOLD if self.view == "whiteboard" else DIM
+        trace_style = BOLD if self.trace_visible else DIM
+        if self.active_tab_idx > 0:
+            input_style = BOLD if self.view == "input" else DIM
+            hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
+                            f'{trace_style}r reasoning{RESET} {DIM}·{RESET} '
+                            f'{input_style}i input{RESET} {DIM}·{RESET} '
+                            f'{auto_style}a autonomous{RESET}')
+            hints_len = len("? help · r reasoning · i input · a autonomous")
+        else:
+            hints_styled = (f'{help_style}? help{RESET} {DIM}·{RESET} '
+                            f'{trace_style}r reasoning{RESET} {DIM}·{RESET} '
+                            f'{wb_style}w whiteboard{RESET} {DIM}·{RESET} '
+                            f'{auto_style}a autonomous{RESET}')
+            hints_len = len("? help · r reasoning · w whiteboard · a autonomous")
+        pad = max(w - 2 - hints_len - 1, 0)
+        self._write_raw('\033[3;1H\033[2K')
+        self._write_raw(f'{BLUE}│{RESET}{" " * pad}{hints_styled} {BLUE}│{RESET}')
+
+        # Row 4 — bottom border + run dir + tab bar
+        self._write_raw('\033[4;1H\033[2K')
+        run_dir = getattr(self, 'work_dir', '') or ''
+        tab_parts = []
+        visible_len = 0
+        for i, tab in enumerate(self.tabs):
+            name = tab.label
+            if len(name) > 20:
+                name = name[:17] + "..."
+            if tab.done:
+                name += " ✓"
+            elif self._tab_shows_spinner(tab) and not tab.is_waiting:
+                name += f" {SPINNER[tab.spinner_tick]}"
+            bracket = f"[{name}]"
+            visible_len += len(bracket) + 1
+            if i == self.active_tab_idx:
+                tab_parts.append(f'{BOLD}{WHITE}{bracket}{RESET}')
+            else:
+                tab_parts.append(f'{DIM}{bracket}{RESET}')
+        tab_str = " ".join(tab_parts)
+        if run_dir:
+            # Show tabs on the left, run dir on the right
+            dir_text = run_dir
+            max_dir = w - visible_len - 6  # leave room for borders + tabs
+            if len(dir_text) > max_dir:
+                dir_text = "…" + dir_text[-(max_dir - 1):]
+            fill = max(w - 2 - len(dir_text) - 1 - visible_len, 0)
+            self._write_raw(
+                f'{BLUE}╰{RESET} {tab_str}'
+                f'{BLUE}{"─" * fill}{RESET}'
+                f' {DIM}{dir_text}{RESET}{BLUE}╯{RESET}')
+        else:
+            fill = max(w - 2 - visible_len, 0)
+            self._write_raw(f'{BLUE}╰{RESET} {tab_str}{BLUE}{"─" * fill}╯{RESET}')
+
+    def _draw_confirmation(self):
+        fb = "".join(self._confirm_buf)
+        lbl = self._confirm_accept_label
+        cur = self._confirm_cursor
+        self._write_raw('\n')
+        if self._nav_step >= 0 or self._nav_proposal:
+            self._write_raw(f' {DIM}○ {lbl}{RESET}\n')
+            self._write_raw(f' {DIM}○ give feedback{RESET}')
+        elif self._confirm_selected == 0:
+            self._write_raw(f' {GREEN}●{RESET} {BOLD}{lbl}{RESET}\n')
+            self._write_raw(f' {DIM}○ give feedback{RESET}')
+        else:
+            self._write_raw(f' {DIM}○ {lbl}{RESET}\n')
+            self._write_raw(f' {GREEN}●{RESET} {fb}')
+            # Position terminal cursor within the text
+            chars_after = len(fb) - cur
+            if chars_after > 0:
+                self._write_raw(f'\033[{chars_after}D')
+
+    def _build_main_lines(self, tab: _Tab | None = None) -> list[str]:
+        """Build flat list of rendered lines for the active tab."""
+        if tab is None:
+            tab = self._active_tab
+        lines: list[str] = []
+        max_w = max(self.cols - 4, 20)
+        planner_live_start = self._planner_live_start(tab)
+        for idx, entry in enumerate(tab.log_lines):
+            if entry.is_trace:
+                if tab.id == "planner" and idx < planner_live_start:
+                    continue
+                if not self.trace_visible:
+                    continue
+                for tline in entry.text.splitlines():
+                    text = f'  {DIM}{tline}{RESET}'
+                    for wrapped in self._wrap_visual_text(text, max_w):
+                        lines.append(wrapped)
+                if not entry.text.splitlines():
+                    text = f'  {DIM}{RESET}'
+                    for wrapped in self._wrap_visual_text(text, max_w):
+                        lines.append(wrapped)
+            elif entry.is_output:
+                if tab.id == "planner" and idx < planner_live_start:
+                    continue
+                output_text = entry.text
+                if (tab.id == "planner"
+                        and self._confirming
+                        and self._proposal_log_start >= 0):
+                    output_text = self._strip_toml_block(output_text)
+                rendered_any = False
+                for is_toml, seg in self._iter_toml_segments(output_text):
+                    if not seg:
+                        continue
+                    if is_toml and not self.trace_visible:
+                        continue
+                    for tline in seg.splitlines():
+                        text = f'  {DIM}{tline}{RESET}' if is_toml else f'  {tline}'
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
+                    if not seg.splitlines():
+                        text = f'  {DIM}{RESET}' if is_toml else '  '
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
+                    rendered_any = True
+                if not rendered_any:
+                    continue
+            else:
+                is_entry = entry.step_idx >= 0
+                base = f' {entry.text}'
+                continuation = " " * self._leading_visible_spaces(base)
+                wrapped_lines = self._wrap_visual_text(
+                    base, max_w, continuation_prefix=continuation
+                )
+                nav = self._nav_step if tab.id == "planner" else tab.nav_idx
+                is_proposal_line = (
+                    self._nav_proposal and tab.id == "planner"
+                    and self._proposal_log_start >= 0
+                    and idx >= self._proposal_log_start
+                )
+                if (is_entry and entry.step_idx == nav) or is_proposal_line:
+                    for wrapped in wrapped_lines:
+                        lines.append(f' {GREEN}▎{RESET}{wrapped}')
+                else:
+                    lines.extend(wrapped_lines)
+        # Active streaming content (not yet baked)
+        if tab.streaming:
+            if tab.trace_buf and self.trace_visible:
+                joined = "".join(tab.trace_buf)
+                for tline in joined.splitlines():
+                    text = f'  {DIM}{tline}{RESET}'
+                    for wrapped in self._wrap_visual_text(text, max_w):
+                        lines.append(wrapped)
+            if tab.output_buf:
+                joined = "".join(tab.output_buf)
+                for is_toml, seg in self._iter_toml_segments(joined):
+                    if not seg:
+                        continue
+                    if is_toml and not self.trace_visible:
+                        continue
+                    for tline in seg.splitlines():
+                        text = f'  {DIM}{tline}{RESET}' if is_toml else f'  {tline}'
+                        for wrapped in self._wrap_visual_text(text, max_w):
+                            lines.append(wrapped)
+        return lines
+
+    def _build_step_detail_lines(self) -> list[str]:
+        max_w = max(self.cols - 2, 20)
+        lines: list[str] = []
+        for dline in self._step_detail_text.splitlines() or [""]:
+            lines.extend(self._wrap_visual_text(dline, max_w))
+        return lines
+
+    def _step_detail_avail_rows(self) -> int:
+        # One title line + one separator line.
+        return max(self.rows - self._content_start + 1 - 2, 1)
+
+    def _step_detail_max_scroll(self) -> int:
+        return max(len(self._build_step_detail_lines()) - self._step_detail_avail_rows(), 0)
+
+    def _redraw(self):
+        with self._write_lock:
+            self._write_raw('\033[?25l')
+            self._draw_header()
+            cs = self._content_start
+            for row in range(cs, self.rows + 1):
+                self._write_raw(f'\033[{row};1H\033[2K')
+            self._write_raw(f'\033[{cs};1H')
+
+            if self.view == "main":
+                tab = self._active_tab
+                lines = self._build_main_lines(tab)
+                spinner_active = (tab.streaming and tab.spinner_label
+                                  and not self._has_visible_stream_content(tab))
+                avail = self._main_avail_rows(tab)
+
+                # Clamp scroll offset
+                max_off = self._max_scroll_offset(lines, tab)
+                if tab.scroll_offset > max_off:
+                    tab.scroll_offset = max_off
+
+                # Viewport window (indicator takes 1 row when content overflows)
+                visible = avail - 1 if len(lines) > avail else avail
+                end = len(lines) - tab.scroll_offset
+                start = max(end - visible, 0)
+                for line in lines[start:end]:
+                    self._write_raw(f'{line}\n')
+
+                # Spinner (no \n so _update_spinner can overwrite in place)
+                if spinner_active:
+                    ch = SPINNER[tab.spinner_tick]
+                    elapsed = int(time.monotonic() - tab.spinner_start)
+                    status = self._spinner_status(elapsed, tab.spinner_tokens)
+                    bar = f' {GREEN}▎{RESET}' if self._spinner_selected(tab) else '  '
+                    self._write_raw(f'{bar}{DIM}{ch} {tab.spinner_label} {status}{RESET}')
+
+                # Scroll indicator
+                above = start
+                below = tab.scroll_offset
+                if above > 0 or below > 0:
+                    parts = []
+                    if above > 0:
+                        parts.append(f'↑ {above} above')
+                    if below > 0:
+                        parts.append(f'↓ {below} below')
+                    indicator = f' {DIM}{" · ".join(parts)}{RESET}'
+                    self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
+
+                if self._confirming and not self._browsing and self.active_tab_idx == 0:
+                    self._draw_confirmation()
+                    self._write_raw('\033[?25h')
+            elif self.view == "whiteboard":
+                self._write_raw(f'  {BOLD}Whiteboard{RESET} {DIM}(esc to return){RESET}\n')
+                self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
+                sections: list[str] = []
+                current_title = "Notes"
+                current_lines: list[str] = []
+
+                def flush_whiteboard_section():
+                    if not current_lines:
+                        return
+                    if sections:
+                        sections.append(f'  {DIM}{"─" * 40}{RESET}')
+                        sections.append("")
+                    sections.append(f"  {CYAN}{BOLD}{current_title}{RESET}")
+                    for line in current_lines:
+                        sections.append(f"  {line}" if line else "")
+
+                source_lines = self.whiteboard.splitlines() or ["(whiteboard is empty)"]
+                for wline in source_lines:
+                    stripped = wline.strip()
+                    if stripped.startswith("## "):
+                        flush_whiteboard_section()
+                        current_title = stripped[3:].strip() or "Notes"
+                        current_lines = []
+                        continue
+                    current_lines.append(wline)
+                flush_whiteboard_section()
+                if not sections:
+                    sections.append("  (whiteboard is empty)")
+
+                for iline in sections:
+                    self._write_raw(f'{iline}\n')
+            elif self.view == "input":
+                tab = self._active_tab
+                status_badge = (
+                    f"{GREEN}● completed{RESET}" if tab.done
+                    else f"{CYAN}● running{RESET}"
+                )
+                self._write_raw(f'  {BOLD}Worker Input{RESET}  {status_badge} {DIM}(esc to return){RESET}\n')
+                self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
+                sections: list[str] = []
+
+                def add_input_section(title: str, lines: list[str], color: str = BLUE):
+                    if not lines:
+                        return
+                    if sections:
+                        sections.append(f'  {DIM}{"─" * 40}{RESET}')
+                        sections.append("")
+                    sections.append(f"  {color}{BOLD}{title}{RESET}")
+                    for line in lines:
+                        sections.append(f"  {line}" if line else "")
+
+                add_input_section("Worker", [tab.label], color=MAGENTA)
+
+                desc = (tab.task_description or "").strip()
+                add_input_section(
+                    "Input",
+                    desc.splitlines() if desc else ["(no task description)"],
+                    color=CYAN,
+                )
+
+                for iline in sections:
+                    self._write_raw(f'{iline}\n')
+            elif self.view == "help":
+                self._write_raw(HELP_TEXT)
+                if self.run_params:
+                    self._write_raw(f'\n  {BOLD}Parameters{RESET}\n\n')
+                    for key, val in self.run_params.items():
+                        self._write_raw(f'    {DIM}{key:<16}{RESET}{val}\n')
+            elif self.view == "step_detail":
+                self._write_raw(f'  {BOLD}{self._step_detail_title}{RESET}')
+                self._write_raw(f' {DIM}(esc to return){RESET}\n')
+                self._write_raw(f'  {DIM}{"─" * 40}{RESET}\n')
+                lines = self._build_step_detail_lines()
+                avail = self._step_detail_avail_rows()
+                max_scroll = max(len(lines) - avail, 0)
+                if self._step_detail_scroll > max_scroll:
+                    self._step_detail_scroll = max_scroll
+                start = self._step_detail_scroll
+                end = min(start + avail, len(lines))
+                for dline in lines[start:end]:
+                    self._write_raw(f'{dline}\n')
+
+                above = start
+                below = max(len(lines) - end, 0)
+                if above > 0 or below > 0:
+                    indicator = f' {DIM}↑ {above} above · ↓ {below} below{RESET}'
+                    self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
+
+            sys.stdout.flush()

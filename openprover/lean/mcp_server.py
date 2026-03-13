@@ -15,7 +15,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .lean import LeanWorkDir, run_lean_check
+from .core import LeanWorkDir, run_lean_check
 
 mcp = FastMCP("lean_tools")
 

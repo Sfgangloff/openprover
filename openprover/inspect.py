@@ -10,15 +10,7 @@ import textwrap
 import tty
 from pathlib import Path
 
-DIM = "\033[2m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-RED = "\033[38;5;174m"
-GREEN = "\033[38;5;114m"
-YELLOW = "\033[38;5;222m"
-BLUE = "\033[38;5;75m"
-CYAN = "\033[38;5;116m"
-GRAY = "\033[38;5;245m"
+from .tui._colors import DIM, BOLD, RESET, RED, GREEN, YELLOW, BLUE, CYAN, GRAY
 
 HEADER_ROWS = 3
 
