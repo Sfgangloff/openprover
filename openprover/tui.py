@@ -577,11 +577,12 @@ class TUI:
             for item in items:
                 slug = item.get("slug", "?")
                 content = item.get("content", "")
+                ext = ".lean" if item.get("format") == "lean" else ".md"
                 if content:
                     first_line = content.strip().splitlines()[0] if content.strip() else ""
-                    self._tab_log(planner, f'  {DIM}•{RESET} {slug} {DIM}— {first_line}{RESET}')
+                    self._tab_log(planner, f'  {DIM}•{RESET} {slug}{ext} {DIM}— {first_line}{RESET}')
                 else:
-                    self._tab_log(planner, f'  {DIM}•{RESET} {slug} {DIM}(delete){RESET}')
+                    self._tab_log(planner, f'  {DIM}•{RESET} {slug}{ext} {DIM}(delete){RESET}')
 
         elif action == "read_items":
             slugs = plan.get("read", [])
