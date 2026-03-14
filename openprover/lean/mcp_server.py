@@ -100,19 +100,27 @@ def lean_search(query: str) -> str:
 
     try:
         rerank = 25 if _gpu_available() else 0
-        results = asyncio.run(service.search(query, limit=10, rerank_top=rerank))
+        response = asyncio.run(service.search(query, limit=10, rerank_top=rerank))
+        results = response.results
         if not results:
             return "No results found"
         parts = []
         for r in results:
-            name = getattr(r, 'name', str(r))
-            doc = getattr(r, 'doc_string', '') or ''
-            sig = getattr(r, 'signature', '') or ''
-            entry = f"**{name}**"
-            if sig:
-                entry += f"\n```lean\n{sig}\n```"
+            name = getattr(r, 'name', '')
+            module = getattr(r, 'module', '') or ''
+            source = getattr(r, 'source_text', '') or ''
+            doc = getattr(r, 'docstring', '') or ''
+            info = getattr(r, 'informalization', '') or ''
+            header = f"**{name}**"
+            if module:
+                header += f"  ({module})"
+            entry = header
+            if source:
+                entry += f"\n```lean\n{source.strip()}\n```"
             if doc:
-                entry += f"\n{doc}"
+                entry += f"\n{doc.strip()}"
+            if info:
+                entry += f"\nInformalization: {info.strip()}"
             parts.append(entry)
         return "\n\n".join(parts)
     except Exception as e:
