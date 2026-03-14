@@ -42,6 +42,7 @@ class TUI(TextMixin, StreamMixin, NavMixin, TabsMixin, StepsMixin,
         self._key_queue: queue.Queue[str] = queue.Queue()
         self._bg_thread: threading.Thread | None = None
         self._bg_stop = False
+        self._split_dirty = False
         # Step history includes action/summary/detail plus status flags/feedback.
         self.step_entries: list[dict] = []
         self._nav_step = -1  # -1 = options focused, 0..N-1 = step index

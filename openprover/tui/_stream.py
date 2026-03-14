@@ -29,7 +29,7 @@ class StreamMixin:
         now = time.monotonic()
         if self._main_visible:
             if self.view == "whiteboard_split":
-                self._redraw()
+                self._split_dirty = True
                 return
             ch = SPINNER[tab.spinner_tick]
             elapsed = int(now - tab.spinner_start)
@@ -65,7 +65,7 @@ class StreamMixin:
         self._redraw_header()
         if target is self._active_tab and self._main_visible:
             if self.view == "whiteboard_split":
-                self._redraw()
+                self._split_dirty = True
             else:
                 self._write(f'  {DIM}{SPINNER[0]} {label} {self._spinner_status(0, 0)}{RESET}')
 
@@ -117,7 +117,7 @@ class StreamMixin:
         if (not had_visible and has_visible
                 and self._main_visible and is_active and at_bottom):
             if self.view == "whiteboard_split":
-                self._redraw()
+                self._split_dirty = True
                 return
             with self._write_lock:
                 self._write_raw('\r\033[2K')
@@ -134,7 +134,7 @@ class StreamMixin:
         should_display = (is_thinking and self.trace_visible) or (not is_thinking and output_shown)
         if should_display and self._main_visible and is_active and at_bottom:
             if self.view == "whiteboard_split":
-                self._redraw()
+                self._split_dirty = True
                 return
             if trace_needs_newline and self.trace_visible:
                 self._write("\n")

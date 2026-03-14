@@ -19,6 +19,10 @@ class InputMixin:
                 if tab.spinner_label and tab.streaming:
                     self._update_spinner()
 
+                if self._split_dirty:
+                    self._split_dirty = False
+                    self._redraw()
+
                 # Process queued keys when idle (no streaming, no confirmation)
                 if not self._confirming and not tab.streaming:
                     if not self._key_queue.empty():
@@ -92,7 +96,7 @@ class InputMixin:
                             i += 1
                             continue
                         if ch in ('\n', '\r') and (
-                            self.view != "main"
+                            self.view not in ("main", "whiteboard_split")
                             or self._active_tab.scroll_offset > 0
                         ):
                             self._process_key(ch)
@@ -197,7 +201,7 @@ class InputMixin:
                 self._active_tab.nav_idx = -1
                 self._redraw()
         elif ch in ('\n', '\r'):
-            if self.view != "main":
+            if self.view not in ("main", "whiteboard_split"):
                 self.view = "main"
                 self._redraw()
             elif self._nav_step >= 0:
@@ -318,7 +322,7 @@ class InputMixin:
                     continue
 
                 if ch in ('\n', '\r'):
-                    if self.view != "main":
+                    if self.view not in ("main", "whiteboard_split"):
                         self.view = "main"
                         self._redraw()
                         continue
@@ -468,7 +472,7 @@ class InputMixin:
                     continue
 
                 if ch in ('\n', '\r'):
-                    if self.view != "main":
+                    if self.view not in ("main", "whiteboard_split"):
                         self.view = "main"
                         self._redraw()
                         continue
@@ -575,7 +579,7 @@ class InputMixin:
                     continue
 
                 if ch in ('\n', '\r'):
-                    if self.view != "main":
+                    if self.view not in ("main", "whiteboard_split"):
                         self.view = "main"
                         self._redraw()
                     elif self._nav_step >= 0:

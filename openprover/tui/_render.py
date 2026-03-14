@@ -177,6 +177,10 @@ class RenderMixin:
             else:
                 is_entry = entry.step_idx >= 0
                 base = f' {entry.text}'
+                # Re-fit separator lines to current width
+                raw = entry.text.replace('\033[2m', '').replace('\033[0m', '').strip()
+                if raw and all(c == '─' for c in raw) and len(raw) > max_w - 2:
+                    base = f' {DIM}{"─" * (max_w - 2)}{RESET}'
                 continuation = " " * self._leading_visible_spaces(base)
                 wrapped_lines = self._wrap_visual_text(
                     base, max_w, continuation_prefix=continuation
@@ -324,25 +328,28 @@ class RenderMixin:
                 tab = self._active_tab
                 left_w = self.cols // 2 - 1
                 right_w = self.cols - left_w - 1
-                left_lines = self._build_main_lines(tab, max_w_override=max(left_w - 4, 10))
+                left_max_w = max(left_w - 4, 10)
+                left_lines = self._build_main_lines(tab, max_w_override=left_max_w)
                 right_lines = self._build_whiteboard_lines(max(right_w - 2, 10))
                 sep = f'{DIM}│{RESET}'
 
+                confirming = (self._confirming and not self._browsing
+                              and self.active_tab_idx == 0)
+                confirm_rows = 3 if confirming else 0
                 spinner_active = (tab.streaming and tab.spinner_label
                                   and not self._has_visible_stream_content(tab))
-                avail = self._main_avail_rows(tab)
+                total_rows = self.rows - cs + 1
 
-                # Clamp scroll
+                # Left column: content viewport
+                avail = self._main_avail_rows(tab)
                 max_off = self._max_scroll_offset(left_lines, tab)
                 if tab.scroll_offset > max_off:
                     tab.scroll_offset = max_off
-
                 visible = avail - 1 if len(left_lines) > avail else avail
                 end = len(left_lines) - tab.scroll_offset
                 start = max(end - visible, 0)
                 left_view = left_lines[start:end]
 
-                # Spinner line on left
                 if spinner_active:
                     ch = SPINNER[tab.spinner_tick]
                     elapsed = int(time.monotonic() - tab.spinner_start)
@@ -350,28 +357,55 @@ class RenderMixin:
                     bar = f' {GREEN}▎{RESET}' if self._spinner_selected(tab) else '  '
                     left_view.append(f'{bar}{DIM}{ch} {tab.spinner_label} {status}{RESET}')
 
-                n_rows = max(len(left_view), len(right_lines))
-                for i in range(n_rows):
-                    left = left_view[i] if i < len(left_view) else ""
-                    right = right_lines[i] if i < len(right_lines) else ""
-                    self._write_raw(f'{self._pad_to_width(left, left_w)}{sep}{right}\n')
+                # Build confirmation lines for left column
+                confirm_lines: list[str] = []
+                if confirming:
+                    fb = "".join(self._confirm_buf)
+                    lbl = self._confirm_accept_label
+                    if self._nav_step >= 0 or self._nav_proposal:
+                        confirm_lines.append("")
+                        confirm_lines.append(f' {DIM}○ {lbl}{RESET}')
+                        confirm_lines.append(f' {DIM}○ give feedback{RESET}')
+                    elif self._confirm_selected == 0:
+                        confirm_lines.append("")
+                        confirm_lines.append(f' {GREEN}●{RESET} {BOLD}{lbl}{RESET}')
+                        confirm_lines.append(f' {DIM}○ give feedback{RESET}')
+                    else:
+                        confirm_lines.append("")
+                        confirm_lines.append(f' {DIM}○ {lbl}{RESET}')
+                        confirm_lines.append(f' {GREEN}●{RESET} {fb}')
 
-                # Scroll indicator on left
+                # Scroll indicator line
                 above = start
                 below = tab.scroll_offset
+                scroll_line = ""
                 if above > 0 or below > 0:
                     parts = []
                     if above > 0:
                         parts.append(f'↑ {above} above')
                     if below > 0:
                         parts.append(f'↓ {below} below')
-                    indicator = f' {DIM}{" · ".join(parts)}{RESET}'
-                    padded = self._pad_to_width(indicator, left_w)
-                    self._write_raw(f'\033[{self.rows};1H\033[2K{padded}{sep}')
+                    scroll_line = f' {DIM}{" · ".join(parts)}{RESET}'
 
-                if self._confirming and not self._browsing and self.active_tab_idx == 0:
-                    self._draw_confirmation()
-                    self._write_raw('\033[?25h')
+                # Render all rows with separator
+                for i in range(total_rows):
+                    right = right_lines[i] if i < len(right_lines) else ""
+                    if i < len(left_view):
+                        left = left_view[i]
+                    elif i < len(left_view) + len(confirm_lines):
+                        left = confirm_lines[i - len(left_view)]
+                    elif i == total_rows - 1 and scroll_line:
+                        left = scroll_line
+                    else:
+                        left = ""
+                    self._write_raw(f'{self._pad_to_width(left, left_w)}{sep}{right}\n')
+
+                # Position cursor for feedback editing
+                if confirming and self._confirm_selected == 1:
+                    fb_row = cs + len(left_view) + len(confirm_lines) - 1
+                    cur = self._confirm_cursor
+                    fb_col = 3 + cur  # " ● " = 3 visible chars before text
+                    self._write_raw(f'\033[{fb_row};{fb_col + 1}H\033[?25h')
             elif self.view == "input":
                 tab = self._active_tab
                 status_badge = (
