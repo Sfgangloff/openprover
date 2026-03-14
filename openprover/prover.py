@@ -173,6 +173,7 @@ class Prover:
         self._current_action_output = ""
         self.proof_text = ""
         self.resumed = resumed
+        self._respawn_plan = None  # set on resume if last step was interrupted spawn
 
         # Lean configuration
         self.lean_project_dir = lean_project_dir
@@ -312,6 +313,7 @@ class Prover:
                 f"Resuming from step {self.step_num}/{self.max_steps}",
                 color="cyan",
             )
+            self._maybe_respawn_interrupted_workers()
 
         while self.step_num < self.max_steps and not self.shutting_down:
             self.step_num += 1
@@ -370,6 +372,40 @@ class Prover:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    def _maybe_respawn_interrupted_workers(self):
+        """On resume, if the last step was an interrupted spawn, re-run it."""
+        if self.step_num < 1:
+            return
+        last_step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
+        meta = self._read_step_meta(last_step_dir)
+        if meta.get("status") != "interrupted":
+            return
+        # Check it was a spawn action
+        toml_file = last_step_dir / "planner.toml"
+        if not toml_file.exists():
+            return
+        plan = prompts.parse_saved_step_toml(toml_file.read_text())
+        if plan is None or plan.get("action") != "spawn":
+            return
+        # Read saved tasks
+        workers_dir = last_step_dir / "workers"
+        if not workers_dir.exists():
+            return
+        task_files = sorted(workers_dir.glob("task_*.md"))
+        if not task_files:
+            return
+        tasks = [{"description": f.read_text()} for f in task_files]
+        logger.info("Re-spawning %d interrupted worker(s) from step %d",
+                     len(tasks), self.step_num)
+        self.tui.log(
+            f"Re-spawning {len(tasks)} interrupted worker(s) from step {self.step_num}",
+            color="cyan",
+        )
+        # Back up step_num so the main loop replays this step number
+        self.step_num -= 1
+        # Store tasks for _do_step to pick up
+        self._respawn_plan = {"action": "spawn", "tasks": tasks}
+
     def _setup_logging(self):
         """Configure file logging to trace.log in the run directory."""
         root = logging.getLogger("openprover")
@@ -406,6 +442,21 @@ class Prover:
 
         # Clear previous step's worker tabs
         self.tui.clear_worker_tabs()
+
+        # If we have a pending respawn from an interrupted resume, skip planner
+        if self._respawn_plan is not None:
+            plan = self._respawn_plan
+            self._respawn_plan = None
+            step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            summary = f"Re-spawning {len(plan['tasks'])} interrupted worker(s)"
+            self._current_planner_result = "(respawn of interrupted workers)"
+            self._current_step_action = "spawn"
+            self._current_step_summary = summary
+            self._step_idx = self.tui.step_complete(
+                self.step_num, self.max_steps, "spawn", summary,
+            )
+            return self._handle_spawn(plan, step_dir)
 
         # Save step input
         step_dir = self.work_dir / "steps" / f"step_{self.step_num:03d}"
@@ -1142,6 +1193,9 @@ class Prover:
         if not use_vllm_tools:
             # Single-turn path: Claude CLI (with or without MCP) or non-vLLM
             # When MCP is configured, Claude CLI handles tool calling internally.
+            def _tool_start_cb(name, tool_input):
+                self.tui.start_worker_action(worker_id, name, tool_input)
+
             def _tool_cb(name, tool_input, result, status, duration_ms=0):
                 logger.info("[%s] %s: %s (%dms)", worker_id, name, status, duration_ms)
                 tool_calls_log.append({
@@ -1159,6 +1213,7 @@ class Prover:
                     stream_callback=self._stream_cb(worker_id),
                     archive_path=archive_path,
                     tool_callback=_tool_cb if use_mcp_tools else None,
+                    tool_start_callback=_tool_start_cb if use_mcp_tools else None,
                 )
                 self.tui.stream_end(tab=worker_id)
 
@@ -1250,6 +1305,7 @@ class Prover:
                         except json.JSONDecodeError:
                             tool_args = {"raw": tc["function"]["arguments"]}
 
+                        self.tui.start_worker_action(worker_id, tool_name, tool_args)
                         t0 = time.time()
                         tool_result, tool_status = execute_worker_tool(
                             tool_name, tool_args, worker_id,
@@ -1266,7 +1322,7 @@ class Prover:
                             "duration_ms": tool_dur_ms,
                         })
 
-                        # Add to TUI
+                        # Update TUI with completed action
                         self.tui.add_worker_action(
                             worker_id, tool_name, tool_args,
                             tool_result, tool_status, tool_dur_ms,

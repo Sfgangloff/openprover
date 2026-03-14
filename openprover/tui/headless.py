@@ -157,6 +157,9 @@ class HeadlessTUI:
     def worker_output(self, tab_id: str, text: str):
         pass
 
+    def start_worker_action(self, tab_id: str, tool: str, args: dict):
+        print(f"[action] {tool} \u2014 running\u2026", flush=True)
+
     def add_worker_action(self, tab_id: str, tool: str, args: dict,
                           result: str, status: str, duration_ms: int = 0):
         dur = f" ({duration_ms / 1000:.1f}s)" if duration_ms else ""

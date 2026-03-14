@@ -85,10 +85,83 @@ class TabsMixin:
         if tab is self._active_tab and self._main_visible:
             self._redraw()
 
+    def start_worker_action(self, tab_id: str, tool: str, args: dict):
+        """Show a tool call that is about to start executing, with a spinner."""
+        tab = self._find_tab(tab_id)
+        entry = {
+            "type": "action",
+            "tool": tool,
+            "args": args,
+            "result": "",
+            "status": "running",
+            "duration_ms": 0,
+        }
+        idx = len(tab.entries)
+        tab.entries.append(entry)
+        line = self._format_action_line(entry)
+        self._tab_log(tab, line, step_idx=idx)
+        tab.pending_action_log_idx = len(tab.log_lines) - 1
+        # Enable spinner for tool execution.
+        # If streaming is already active (MCP path), just update the label;
+        # otherwise (vLLM path), set up a fresh spinner.
+        tab.prev_spinner_label = tab.spinner_label
+        tab.spinner_label = f"{tool}\u2026"
+        tab.spinner_tick = 0
+        if not tab.streaming:
+            tab.spinner_start = time.monotonic()
+            tab.spinner_time = 0.0
+            tab.spinner_tokens = 0
+            tab.streaming = True
+            tab.is_waiting = False
+            tab.trace_buf = []
+            tab.output_buf = []
+            tab.output_non_toml_seen = False
+            tab.output_toml_seen = False
+        self._redraw_header()
+        if tab is self._active_tab and self._main_visible:
+            if self.view == "whiteboard_split":
+                self._redraw()
+            elif not self._has_visible_stream_content(tab):
+                ch = SPINNER[0]
+                with self._write_lock:
+                    self._write_raw(f'  {DIM}{ch} {tool}\u2026 {self._spinner_status(0, 0)}{RESET}')
+                    sys.stdout.flush()
+
     def add_worker_action(self, tab_id: str, tool: str, args: dict,
                           result: str, status: str, duration_ms: int = 0):
         """Record a completed tool call in a worker tab as a navigable entry."""
         tab = self._find_tab(tab_id)
+
+        # Complete a pending action: update the existing entry and log line
+        if tab.pending_action_log_idx >= 0:
+            log_idx = tab.pending_action_log_idx
+            tab.pending_action_log_idx = -1
+            if 0 <= log_idx < len(tab.log_lines):
+                entry_idx = tab.log_lines[log_idx].step_idx
+                if 0 <= entry_idx < len(tab.entries):
+                    entry = tab.entries[entry_idx]
+                    entry["result"] = result
+                    entry["status"] = status
+                    entry["duration_ms"] = duration_ms
+                    tab.log_lines[log_idx].text = self._format_action_line(entry)
+                    # Clear spinner
+                    tab.spinner_label = tab.prev_spinner_label
+                    tab.prev_spinner_label = ""
+                    if not tab.spinner_label:
+                        tab.streaming = False
+                    # Clear the spinner line and redraw
+                    if tab is self._active_tab and self._main_visible:
+                        if self.view == "whiteboard_split":
+                            self._redraw()
+                        else:
+                            with self._write_lock:
+                                self._write_raw('\r\033[2K')
+                                sys.stdout.flush()
+                            self._redraw()
+                    self._redraw_header()
+                    return
+
+        # Fallback: no pending action, append as new entry
         entry = {
             "type": "action",
             "tool": tool,
@@ -109,6 +182,8 @@ class TabsMixin:
         color = TOOL_STYLE.get(tool, WHITE)
         if status == "ok":
             icon = f"{GREEN}\u2713{RESET}"
+        elif status == "running":
+            icon = ""
         else:
             icon = f"{YELLOW}\u2717{RESET}"
         # Short summary from args
@@ -125,6 +200,8 @@ class TabsMixin:
             dur = f" {DIM}({duration_ms / 1000:.1f}s){RESET}"
         else:
             dur = ""
+        if status == "running":
+            return f'{color}\u25b8{RESET} {BOLD}{tool}{RESET} {DIM}\u2014{RESET} {summary}'
         return f'{color}\u25b8{RESET} {BOLD}{tool}{RESET} {icon}{dur} {DIM}\u2014{RESET} {summary}'
 
     def clear_worker_tabs(self):

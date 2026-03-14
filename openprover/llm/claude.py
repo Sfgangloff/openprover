@@ -65,6 +65,7 @@ class LLMClient:
         stream_callback=None,
         archive_path: Path | None = None,
         tool_callback=None,
+        tool_start_callback=None,
         max_tokens: int | None = None,  # ignored — CLI uses max_output_tokens from __init__
     ) -> dict:
         """Make an LLM call and archive it.
@@ -75,6 +76,8 @@ class LLMClient:
                 Signature: callback(text: str).
             tool_callback: If provided, called when MCP tool events are detected.
                 Signature: tool_callback(name: str, input: dict, result: str, status: str, duration_ms: int).
+            tool_start_callback: If provided, called when a tool use begins.
+                Signature: tool_start_callback(name: str, input: dict).
 
         Returns dict with keys: result (str), cost (float), duration_ms (int),
         raw (full JSON response).
@@ -123,6 +126,7 @@ class LLMClient:
                 cmd, prompt, system_prompt, json_schema,
                 call_num, label, start, stream_callback, archive_path,
                 tool_callback=tool_callback,
+                tool_start_callback=tool_start_callback,
             )
 
         proc = subprocess.Popen(
@@ -184,13 +188,15 @@ class LLMClient:
 
     def _call_streaming(self, cmd, prompt, system_prompt, json_schema,
                         call_num, label, start, callback, archive_path=None,
-                        tool_callback=None):
+                        tool_callback=None, tool_start_callback=None):
         """Stream text deltas to callback, return final result.
 
         Args:
             tool_callback: Optional callback for MCP tool events.
                 Signature: tool_callback(tool_name: str, tool_input: dict,
                                          result: str, status: str, duration_ms: int)
+            tool_start_callback: Optional callback when a tool use begins.
+                Signature: tool_start_callback(tool_name: str, tool_input: dict)
         """
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -274,6 +280,10 @@ class LLMClient:
                                 "input": tool_input,
                                 "start_time": time.time(),
                             }
+                            if tool_start_callback and _cur_tool_name.startswith("mcp__"):
+                                parts = _cur_tool_name.split("__", 2)
+                                tname = parts[-1] if len(parts) == 3 else _cur_tool_name
+                                tool_start_callback(tname, tool_input)
 
                 # Claude CLI emits tool results as {"type": "user"} messages
                 elif msg_type == "user" and tool_callback:
