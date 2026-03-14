@@ -87,7 +87,7 @@ def lean_verify(code: str) -> str:
 
 
 @mcp.tool()
-def lean_search(query: str) -> str:
+async def lean_search(query: str) -> str:
     """Search Mathlib and Lean 4 declarations by natural language query."""
     if not query.strip():
         return "Error: no query provided"
@@ -100,7 +100,7 @@ def lean_search(query: str) -> str:
 
     try:
         rerank = 25 if _gpu_available() else 0
-        response = asyncio.run(service.search(query, limit=10, rerank_top=rerank))
+        response = await service.search(query, limit=10, rerank_top=rerank)
         results = response.results
         if not results:
             return "No results found"
