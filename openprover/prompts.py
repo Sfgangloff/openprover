@@ -85,11 +85,12 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "Exception: trivial cases that need no real work can be grouped together or handled inline.\n"
         "- Workers may return partial results (e.g. useful lemmas but incomplete proof). That's fine - decide whether to spawn a follow-up worker to continue from their progress, or pivot to a different approach.\n"
         "- Don't get stuck. If the first proof avenue does not work, try others.\n"
-        "- Use write_whiteboard to keep track of the high-level state after learning something new. "
+        "- **Keep the whiteboard up-to-date.** After every action that yields new information, use write_whiteboard to reflect the current state. "
+        "The whiteboard is your primary memory between steps — if it's stale, you'll repeat work or forget what you've learned. "
         "Record: current plan, failed attempts (brief), alternative branches to explore if the current plan fails. "
         "Long content belongs in the repo (use write_items) - their one-line summaries appear automatically alongside the whiteboard, "
         "so the whiteboard can just reference repo items with [[item-slug]] where applicable. "
-        "Update the whiteboard at most once per planner loop, typically right after receiving new information from the previous action.\n"
+        "Update the whiteboard at most once per planner loop, but do not skip it when you have new information.\n"
     )
     if not isolation:
         principles += "- Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
