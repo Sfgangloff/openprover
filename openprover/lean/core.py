@@ -115,6 +115,12 @@ def run_lean_check(lean_file: Path, project_dir: Path,
         if stderr:
             parts.append(stderr)
         feedback = '\n'.join(parts)
+        # Strip the full file path prefix from each diagnostic line
+        file_prefix = str(lean_file.resolve()) + ":"
+        feedback = '\n'.join(
+            line[len(file_prefix):] if line.startswith(file_prefix) else line
+            for line in feedback.splitlines()
+        )
         logger.info("Lean check failed: %s", lean_file.name)
         return (False, feedback, cmd_info)
 
