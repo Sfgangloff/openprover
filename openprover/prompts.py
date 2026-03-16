@@ -90,6 +90,11 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "- **Keep worker tasks small.** Don't overload a single worker with too much work in one spawn. "
         "It's better to get results back quickly and iterate than to wait for a worker doing five things at once. "
         "Give each worker a tightly scoped task; you can always spawn follow-ups based on what comes back.\n"
+        "- **Don't stop at partial results.** If the problem has multiple levels of difficulty "
+        "(e.g. \"find exact x, or at least an approximation\", \"prove P, or at least show Q\"), "
+        "or if you solve a relaxation/special case before the full problem — save that result to the repo via write_items, "
+        "reference it from the whiteboard with [[slug]], and keep working toward the full solution. "
+        "A partial result is progress, not the finish line.\n"
         "- Don't get stuck. If the first proof avenue does not work, try others.\n"
         "- **Keep the whiteboard up-to-date.** Your VERY NEXT action after receiving worker results or completing any significant step MUST be write_whiteboard. "
         "Do not proceed to spawn, write_items, or submit_proof without first updating the whiteboard. "
@@ -613,7 +618,8 @@ def format_discussion_prompt(
     parts.append(f"\n\n{steps_taken} steps taken. Budget: {budget_summary}.")
     parts.append(
         "\n\nWrite a brief discussion: result, approaches tried, key insights, "
-        "open gaps, recommendations. Use $ and $$ for math."
+        "open gaps, recommendations. Use $ and $$ for math. "
+        "Reference repo items with [[slug]] links — the reader will have access to the full repo."
     )
     return "".join(parts)
 
