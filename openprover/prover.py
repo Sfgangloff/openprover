@@ -668,9 +668,9 @@ class Prover:
         if self.autonomous:
             return None
 
-        # Reading actions don't need approval
+        # Low-impact actions don't need approval
         action = plan.get("action", "")
-        if action in ("read_items", "read_theorem"):
+        if action in ("read_items", "read_theorem", "write_whiteboard"):
             return None
 
         self.tui.show_proposal(plan)

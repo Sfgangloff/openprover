@@ -88,12 +88,12 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "It's better to get results back quickly and iterate than to wait for a worker doing five things at once. "
         "Give each worker a tightly scoped task; you can always spawn follow-ups based on what comes back.\n"
         "- Don't get stuck. If the first proof avenue does not work, try others.\n"
-        "- **Keep the whiteboard up-to-date.** After every action that yields new information, use write_whiteboard to reflect the current state. "
+        "- **Keep the whiteboard up-to-date.** Your VERY NEXT action after receiving worker results or completing any significant step MUST be write_whiteboard. "
+        "Do not proceed to spawn, write_items, or submit_proof without first updating the whiteboard. "
         "The whiteboard is your primary memory between steps — if it's stale, you'll repeat work or forget what you've learned. "
-        "Record: current plan, failed attempts (brief), alternative branches to explore if the current plan fails. "
+        "Record: current plan (with checkboxes updated), failed attempts (brief), key results obtained, alternative branches to explore. "
         "Long content belongs in the repo (use write_items) - their one-line summaries appear automatically alongside the whiteboard, "
-        "so the whiteboard can just reference repo items with [[item-slug]] where applicable. "
-        "Update the whiteboard at most once per planner loop, but do not skip it when you have new information.\n"
+        "so the whiteboard can just reference repo items with [[item-slug]] where applicable.\n"
     )
     if not isolation:
         principles += "- Use literature_search sparingly (2-3 times max). Store results in the repo immediately.\n"
