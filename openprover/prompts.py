@@ -438,13 +438,20 @@ def worker_system_prompt(*, lean_worker_actions: bool = False) -> str:
             "\n"
             "## Formalization Strategy\n"
             "\n"
-            "When formalizing a proof in Lean, work incrementally:\n"
+            "When formalizing a proof in Lean, work incrementally and modularly:\n"
             "1. First, formalize the basic structure with `sorry` placeholders for non-trivial steps.\n"
             "2. Verify this skeleton compiles.\n"
             "3. Then fill in the `sorry`s one at a time, verifying after each change.\n"
             "\n"
             "This catches type mismatches and structural issues early, "
             "before investing effort in detailed proof terms.\n"
+            "\n"
+            "**Never verify the same thing twice.** Work modularly — prove lemmas separately. "
+            "Once you know a lemma's proof compiles, use `sorry` in its place in subsequent "
+            "verifications so you can focus on the part you're currently working on. "
+            "Only combine everything for a final full verification.\n"
+            "\n"
+            "When done, report back all relevant lemmas and the complete proof.\n"
         )
     return base
 
