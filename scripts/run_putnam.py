@@ -39,7 +39,7 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
 
     cmd = ["openprover", "--theorem", theorem_path,
            "--model", args.model,
-           "--max-steps", str(args.max_steps), "--headless",
+           "--max-time", args.max_time, "--headless",
            "-P", str(args.parallelism)]
 
     if args.planner_model:
@@ -61,6 +61,8 @@ def _run_problem(problem_name: str, statement: str, lean_dir: Path,
         cmd.append("--isolation")
     else:
         cmd.append("--no-isolation")
+    if args.give_up_after is not None:
+        cmd.extend(["--give-up-after", str(args.give_up_after)])
 
     start = time.monotonic()
     try:
@@ -152,7 +154,10 @@ def main():
                         help="Override model for worker (defaults to --model)")
     parser.add_argument("--provider-url", default="http://localhost:8000",
                         help="Server URL for local models (default: http://localhost:8000)")
-    parser.add_argument("--max-steps", type=int, default=50)
+    parser.add_argument("--max-time", default="4h", metavar="DURATION",
+                        help="Wall-clock time budget per problem, e.g. '30m', '2h' (default: 4h)")
+    parser.add_argument("--give-up-after", type=float, default=None, metavar="RATIO",
+                        help="Fraction of budget before give_up is allowed (default: 0.5)")
     parser.add_argument("--autonomous", action="store_true")
     parser.add_argument("--informal", action="store_true",
                         help="Skip Lean setup/verification; run openprover without formal checking")
@@ -213,7 +218,7 @@ def main():
 
         cmd = ["openprover", "--theorem", theorem_path,
                "--model", args.model,
-               "--max-steps", str(args.max_steps),
+               "--max-time", args.max_time,
                "-P", str(args.parallelism)]
 
         if args.planner_model:
@@ -240,6 +245,8 @@ def main():
             cmd.append("--isolation")
         else:
             cmd.append("--no-isolation")
+        if args.give_up_after is not None:
+            cmd.extend(["--give-up-after", str(args.give_up_after)])
         if args.verbose:
             cmd.append("--verbose")
 
