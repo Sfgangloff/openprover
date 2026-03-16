@@ -1067,7 +1067,7 @@ class Prover:
             wid = f"worker_{self.step_num}_{i}"
             desc = task.get("description", "")
             task_summary = task.get("summary", "").strip()
-            label = f"Worker {i}: {task_summary}" if task_summary else f"Worker {i}"
+            label = f"Worker {i}"
             self.tui.add_worker_tab(wid, label, task_description=desc)
             worker_ids.append(wid)
 
@@ -1146,8 +1146,10 @@ class Prover:
             for i, task, wresp in non_interrupted:
                 vid = f"verifier_{self.step_num}_{i}"
                 label = f"Verify {i}"
+                worker_out = wresp.get("result", "")
+                vdesc = f"Verifying Worker {i}\n\n--- Worker {i} Output ---\n{worker_out}"
                 self.tui.add_worker_tab(vid, label,
-                                        task_description=f"Verifying Worker {i}")
+                                        task_description=vdesc)
                 verifier_ids.append(vid)
 
             self.tui.snapshot_worker_tabs(self.step_num)
@@ -1862,9 +1864,10 @@ class Prover:
                 if v_result_file.exists():
                     v_result = v_result_file.read_text()
                     vid = f"verifier_{step_num}_{tidx}"
+                    vdesc = f"Verifying Worker {tidx}\n\n--- Worker {tidx} Output ---\n{result}"
                     self.tui.add_worker_tab(
                         vid, f"Verify {tidx}",
-                        task_description=f"Verifying Worker {tidx}",
+                        task_description=vdesc,
                     )
                     if v_result:
                         self.tui.worker_output(vid, v_result)

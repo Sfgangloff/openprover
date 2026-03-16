@@ -174,7 +174,7 @@ class RenderMixin:
                 sub_lines = entry.text.split('\n')
                 wrapped_lines: list[str] = []
                 for j, sub in enumerate(sub_lines):
-                    base = f' {sub}' if j == 0 else sub
+                    base = f' {sub}'
                     # Re-fit separator lines to current width
                     raw = sub.replace('\033[2m', '').replace('\033[0m', '').strip()
                     if raw and all(c == '─' for c in raw) and len(raw) > max_w - 2:
@@ -597,6 +597,16 @@ class RenderMixin:
                         self._write_raw(f'\033[{self.rows};1H\033[2K{indicator}')
                 elif self.view == "help":
                     self._write_raw(HELP_TEXT)
+                    budget = getattr(self, '_budget_ref', None)
+                    if budget:
+                        from ..budget import _fmt_tokens, _fmt_duration
+                        import time as _time
+                        elapsed = int(_time.monotonic() - budget.start_time)
+                        tok_str = _fmt_tokens(budget.total_output_tokens)
+                        self._write_raw(f'\n  {BOLD}Current usage{RESET}\n\n')
+                        self._write_raw(f'    {DIM}{"elapsed":<16}{RESET}{_fmt_duration(elapsed)}\n')
+                        self._write_raw(f'    {DIM}{"output tokens":<16}{RESET}{tok_str}\n')
+                        self._write_raw(f'    {DIM}{"budget":<16}{RESET}{budget.summary_str()}\n')
                     if self.run_params:
                         self._write_raw(f'\n  {BOLD}Parameters{RESET}\n\n')
                         for key, val in self.run_params.items():

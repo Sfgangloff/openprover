@@ -232,7 +232,7 @@ def _cmd_prove():
     parser.add_argument("--provider-url", default="http://localhost:8000", help="Server URL for local models (default: http://localhost:8000)")
     budget_group = parser.add_mutually_exclusive_group()
     budget_group.add_argument("--max-tokens", type=int, default=None, metavar="N", help="Output token budget (mutually exclusive with --max-time)")
-    budget_group.add_argument("--max-time", type=str, default=None, metavar="DURATION", help="Wall-clock time budget, e.g. '30m', '2h' (default: 1h)")
+    budget_group.add_argument("--max-time", type=str, default=None, metavar="DURATION", help="Wall-clock time budget, e.g. '30m', '2h' (default: 4h)")
     parser.add_argument("--conclude-after", type=float, default=0.99, metavar="RATIO", help="Fraction of budget that triggers conclusion (0.9-1.0, default: 0.99)")
     parser.add_argument("--autonomous", action="store_true", help="Start in autonomous mode (default: interactive)")
     parser.add_argument("--read-only", action="store_true", help="Inspect run without resuming")
@@ -397,7 +397,10 @@ def _cmd_prove():
     def make_worker_llm(archive_dir):
         return _make_client(worker_model, archive_dir)
 
-    model_label = planner_model if planner_model == worker_model else f"{planner_model}/{worker_model}"
+    MODEL_DISPLAY = {"sonnet": "sonnet 4.6", "opus": "opus 4.6"}
+    _p = MODEL_DISPLAY.get(planner_model, planner_model)
+    _w = MODEL_DISPLAY.get(worker_model, worker_model)
+    model_label = _p if planner_model == worker_model else f"{_p}/{_w}"
 
     # ── Resolve budget ──────────────────────────────────────────
     if not (0.9 <= args.conclude_after <= 1.0):
@@ -412,7 +415,7 @@ def _cmd_prove():
         budget_mode = args._saved_budget_mode
         budget_limit = args._saved_budget_limit
     else:
-        budget_mode, budget_limit = "time", parse_duration("1h")
+        budget_mode, budget_limit = "time", parse_duration("4h")
 
     budget = Budget(
         mode=budget_mode,
