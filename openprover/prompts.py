@@ -392,6 +392,51 @@ def worker_system_prompt(*, lean_worker_actions: bool = False) -> str:
     return base
 
 
+def verifier_system_prompt() -> str:
+    """Build system prompt for the independent verifier."""
+    return (
+        "You are an independent verifier reviewing a mathematician's work.\n"
+        "\n"
+        "You will receive the original task and the worker's output. "
+        "Your job is to independently verify the correctness of the worker's reasoning and conclusions.\n"
+        "\n"
+        "IMPORTANT: Do NOT verify formal Lean code statements — those are checked automatically by the system. "
+        "Focus on:\n"
+        "- Informal mathematical reasoning and proofs\n"
+        "- Logical gaps or unjustified steps\n"
+        "- Incorrect claims or conclusions\n"
+        "- Whether the task was actually completed as requested\n"
+        "\n"
+        "End your response with exactly one of:\n"
+        "VERDICT: CORRECT\n"
+        "VERDICT: CRITICALLY FLAWED — <brief reason>\n"
+        "VERDICT: NEEDS MINOR FIXES — <brief reason>\n"
+        "\n"
+        "Be concise. Use $inline$ and $$display$$ LaTeX.\n"
+    )
+
+
+def format_verifier_prompt(task_description: str, worker_output: str) -> str:
+    """Format the prompt for a verifier given the original task and worker output."""
+    return (
+        f"# Original Task\n\n{task_description}\n\n"
+        f"# Worker Output\n\n{worker_output}\n\n"
+        f"# Your Task\n\n"
+        f"Independently verify the worker's output above. "
+        f"Do not verify formal Lean code — focus on informal reasoning, "
+        f"logical correctness, and whether the task was completed as requested."
+    )
+
+
+def extract_verdict(verifier_output: str) -> str:
+    """Extract the VERDICT line from verifier output, or return empty string."""
+    for line in reversed(verifier_output.splitlines()):
+        line = line.strip()
+        if line.startswith("VERDICT:"):
+            return line
+    return ""
+
+
 SEARCH_SYSTEM_PROMPT = (
     "You are a mathematical research assistant. Search for relevant mathematical "
     "literature and results. Report findings concisely with precise mathematical content."

@@ -87,6 +87,26 @@ class StepsMixin:
         summary = entry.get("summary", "")
         color = ACTION_STYLE.get(action, "")
         line = f'{color}■{RESET} {BOLD}{action}{RESET} {DIM}—{RESET} {summary}'
+        # Show per-worker task summaries with verdicts for spawn actions
+        if action == "spawn":
+            worker_tabs = entry.get("worker_tabs") or []
+            verdicts = entry.get("verdicts") or {}
+            for j, tab in enumerate(worker_tabs):
+                label = getattr(tab, "label", "")
+                if not label.startswith("Worker"):
+                    continue  # skip verifier tabs
+                task_desc = getattr(tab, "task_description", "").strip()
+                first_line = (task_desc.split("\n")[0][:60]
+                              if task_desc else "(no description)")
+                line += f'\n  {DIM}[{j}]{RESET} {first_line}'
+                verdict = verdicts.get(j, "")
+                if verdict:
+                    if "CORRECT" in verdict and "FLAWED" not in verdict:
+                        line += f'\n      {GREEN}{verdict}{RESET}'
+                    elif "CRITICALLY FLAWED" in verdict:
+                        line += f'\n      {RED}{verdict}{RESET}'
+                    else:
+                        line += f'\n      {YELLOW}{verdict}{RESET}'
         labels: list[str] = []
         feedback = (entry.get("feedback") or "").strip()
         if entry.get("rejected"):

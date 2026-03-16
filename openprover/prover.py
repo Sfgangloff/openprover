@@ -1089,6 +1089,55 @@ class Prover:
                 self.tui.autonomous = False
                 self.tui.log("Interrupted — switching to manual mode", color="yellow")
 
+        # ── Verifier phase ──
+        non_interrupted = [
+            (i, t, w) for i, (t, w) in enumerate(zip(tasks, worker_resps))
+            if w and w.get("error") != "interrupted" and w.get("result")
+        ]
+        verifier_resps: dict[int, dict] = {}
+
+        if non_interrupted:
+            verifier_ids = []
+            for i, task, wresp in non_interrupted:
+                vid = f"verifier_{self.step_num}_{i}"
+                label = f"Verify {i}"
+                self.tui.add_worker_tab(vid, label,
+                                        task_description=f"Verifying Worker {i}")
+                verifier_ids.append(vid)
+
+            self.tui.snapshot_worker_tabs(self.step_num)
+            vn = len(non_interrupted)
+            self.tui.set_waiting_status(f"verifying {vn} worker(s)")
+
+            with ThreadPoolExecutor(max_workers=vn) as pool:
+                vfutures: dict = {}
+                for j, (i, task, wresp) in enumerate(non_interrupted):
+                    desc = task.get("description", "")
+                    archive = workers_dir / f"verifier_{i}_call.json"
+                    future = pool.submit(
+                        self._run_verifier, desc, wresp["result"],
+                        verifier_ids[j], archive,
+                    )
+                    vfutures[future] = (j, i)
+
+                v_pending = set(vfutures.keys())
+                while v_pending:
+                    done_set, v_pending = wait(
+                        v_pending, timeout=0.5, return_when=FIRST_COMPLETED,
+                    )
+                    for future in done_set:
+                        j, i = vfutures[future]
+                        try:
+                            verifier_resps[i] = future.result()
+                        except Exception as e:
+                            verifier_resps[i] = {
+                                "result": f"Verifier error: {e}", "cost": 0.0,
+                                "duration_ms": 0, "raw": {}, "error": str(e),
+                            }
+                        self.tui.mark_worker_done(verifier_ids[j])
+
+            self.tui.set_waiting_status("")
+
         # Save results and build prev_output
         parts = []
         for i, (task, wresp) in enumerate(zip(tasks, worker_resps)):
@@ -1097,6 +1146,11 @@ class Prover:
             result = wresp["result"] if wresp else ""
             parts.append(f"## Worker {i}: {first_line}\n\n{result}")
             (workers_dir / f"result_{i}.md").write_text(result or "")
+            # Append verifier result if available
+            if i in verifier_resps:
+                v_result = verifier_resps[i].get("result", "")
+                parts.append(f"## Verification of Worker {i}\n\n{v_result}")
+                (workers_dir / f"verifier_result_{i}.md").write_text(v_result or "")
             # Save tool calls log
             tc_log = wresp.get("tool_calls_log", []) if wresp else []
             if tc_log:
@@ -1106,10 +1160,21 @@ class Prover:
 
         self._push_output("\n\n".join(parts))
 
-        # Track worker output tokens in budget
+        # Track worker + verifier output tokens in budget
         for wresp in worker_resps:
             if wresp:
                 self._track_output_tokens(wresp)
+        for vresp in verifier_resps.values():
+            self._track_output_tokens(vresp)
+
+        # Extract and store verdicts for TUI display
+        verdicts = {}
+        for i, vresp in verifier_resps.items():
+            verdict = prompts.extract_verdict(vresp.get("result", ""))
+            if verdict:
+                verdicts[i] = verdict
+        self.tui.step_entries[self._step_idx]["verdicts"] = verdicts
+        self.tui._sync_step_log_line(self._step_idx)
 
         # Save step metadata with worker details
         status = "interrupted" if any_interrupted else "ok"
@@ -1427,6 +1492,34 @@ class Prover:
         result["tool_calls_log"] = tool_calls_log
         return result
 
+    def _run_verifier(self, task_desc: str, worker_output: str,
+                      verifier_id: str, archive_path: Path | None = None) -> dict:
+        """Run an independent verifier for a worker's output. Thread-safe."""
+        prompt = prompts.format_verifier_prompt(task_desc, worker_output)
+        system_prompt = prompts.verifier_system_prompt()
+
+        self.tui.stream_start("verifying...", tab=verifier_id)
+        try:
+            resp = self.worker_llm.call(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                label=verifier_id,
+                stream_callback=self._stream_cb(verifier_id),
+                archive_path=archive_path,
+            )
+            self.tui.stream_end(tab=verifier_id)
+            resp["error"] = ""
+        except Interrupted:
+            self.tui.stream_end(tab=verifier_id)
+            logger.info("[%s] interrupted", verifier_id)
+            resp = {"result": "(terminated by user)", "cost": 0.0,
+                    "duration_ms": 0, "raw": {}, "error": "interrupted"}
+        except RuntimeError as e:
+            self.tui.stream_end(tab=verifier_id)
+            resp = {"result": f"Verifier error: {e}", "cost": 0.0,
+                    "duration_ms": 0, "raw": {}, "error": str(e)}
+        return resp
+
 
     # ── Saving & discussion ──────────────────────────────────
 
@@ -1691,6 +1784,7 @@ class Prover:
                 continue
 
             task_files = sorted(workers_dir.glob("task_*.md"))
+            verdicts: dict[int, str] = {}
             for task_file in task_files:
                 tidx = task_file.stem.removeprefix("task_")
                 result_file = workers_dir / f"result_{tidx}.md"
@@ -1709,7 +1803,32 @@ class Prover:
                     self.tui.worker_output(tab_id, result)
                 self.tui.mark_worker_done(tab_id)
 
+                # Load verifier result if present
+                v_result_file = workers_dir / f"verifier_result_{tidx}.md"
+                if v_result_file.exists():
+                    v_result = v_result_file.read_text()
+                    vid = f"verifier_{step_num}_{tidx}"
+                    self.tui.add_worker_tab(
+                        vid, f"Verify {tidx}",
+                        task_description=f"Verifying Worker {tidx}",
+                    )
+                    if v_result:
+                        self.tui.worker_output(vid, v_result)
+                        verdict = prompts.extract_verdict(v_result)
+                        if verdict:
+                            try:
+                                verdicts[int(tidx)] = verdict
+                            except ValueError:
+                                pass
+                    self.tui.mark_worker_done(vid)
+
             self.tui.snapshot_worker_tabs(step_num)
+            # Store verdicts for TUI step line display
+            if verdicts:
+                for entry in self.tui.step_entries:
+                    if entry.get("step_num") == step_num:
+                        entry["verdicts"] = verdicts
+                        break
             if idx < len(step_dirs) - 1:
                 self.tui.clear_worker_tabs()
 
