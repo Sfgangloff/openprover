@@ -19,6 +19,31 @@ from .tui._colors import YELLOW, GREEN, RESET as _RESET
 logger = logging.getLogger("openprover")
 
 
+def _format_tool_calls_toml(tc_log: list[dict]) -> str:
+    """Format a tool calls log as TOML [[call]] entries."""
+    lines = []
+    for tc in tc_log:
+        lines.append("[[call]]")
+        lines.append(f'tool = "{tc.get("tool", "")}"')
+        lines.append(f'status = "{tc.get("status", "")}"')
+        lines.append(f'duration_ms = {tc.get("duration_ms", 0)}')
+        args = tc.get("args", {})
+        if isinstance(args, dict):
+            for k, v in args.items():
+                val = str(v)
+                if "\n" in val:
+                    lines.append(f'args_{k} = """\n{val}\n"""')
+                else:
+                    lines.append(f'args_{k} = "{val}"')
+        result = str(tc.get("result", ""))
+        if "\n" in result:
+            lines.append(f'result = """\n{result}\n"""')
+        else:
+            lines.append(f'result = "{result}"')
+        lines.append("")
+    return "\n".join(lines)
+
+
 def slugify(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -226,10 +251,9 @@ class Prover:
         if self.resumed:
             logger.info("Resuming from step %d (%s)", self.step_num, self.budget.status_str())
 
-        # LLM clients (archive_dir is fallback; per-call paths used for step calls)
-        archive_dir = self.work_dir / "archive"
-        self.planner_llm = self._make_llm(archive_dir)
-        self.worker_llm = self._make_worker_llm(archive_dir)
+        # LLM clients (archive_dir unused — all calls provide explicit archive_path)
+        self.planner_llm = self._make_llm(self.work_dir)
+        self.worker_llm = self._make_worker_llm(self.work_dir)
         # Unified view for cost/call tracking
         self.llm = self.planner_llm
 
@@ -367,23 +391,11 @@ class Prover:
         path.write_text(json.dumps(self.step_history))
 
     def _load_step_history(self):
-        """Restore step_history from disk (with backward compat for prev_outputs.json)."""
+        """Restore step_history from disk."""
         path = self.work_dir / "step_history.json"
         if path.exists():
             try:
                 self.step_history = json.loads(path.read_text())
-                return
-            except (json.JSONDecodeError, TypeError):
-                pass
-        # Backward compat: convert old prev_outputs.json (list of strings)
-        old_path = self.work_dir / "prev_outputs.json"
-        if old_path.exists():
-            try:
-                old = json.loads(old_path.read_text())
-                self.step_history = [
-                    {"step": 0, "planner": "", "action": "", "summary": "",
-                     "output": o} for o in old
-                ]
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -415,9 +427,9 @@ class Prover:
             return
 
         # Determine which workers were interrupted vs completed by parsing
-        # the [[workers]] entries in step_meta.toml
+        # the [[workers]] entries in meta.toml
         interrupted_indices = set()
-        meta_path = last_step_dir / "step_meta.toml"
+        meta_path = last_step_dir / "meta.toml"
         if meta_path.exists():
             meta_text = meta_path.read_text()
             # Parse [[workers]] blocks to find interrupted ones
@@ -597,7 +609,7 @@ class Prover:
                     system_prompt=system_prompt,
                     label=f"planner_step_{self.step_num}{retry_suffix}",
                     stream_callback=self._stream_cb("planner"),
-                    archive_path=step_dir / f"planner_call{retry_suffix}.json",
+                    archive_path=step_dir / f"planner_call{retry_suffix}.md",
                 )
             except Interrupted:
                 self.tui.stream_end(tab="planner")
@@ -646,7 +658,7 @@ class Prover:
                             system_prompt=system_prompt,
                             label=f"planner_step_{self.step_num}_phase2",
                             stream_callback=self._stream_cb("planner"),
-                            archive_path=step_dir / "planner_call_phase2.json",
+                            archive_path=step_dir / "planner_call_phase2.md",
                             **({"max_tokens": phase2_max} if hasattr(self.planner_llm, 'answer_reserve') else {}),
                         )
                     except Interrupted:
@@ -712,7 +724,7 @@ class Prover:
         self._current_step_action = primary_action
         self._current_step_summary = primary_summary
 
-        # Save planner output (save primary plan for backward compat)
+        # Save planner output
         self._save_step(step_dir, primary_plan)
 
         # Interactive confirmation for the whole batch
@@ -1171,7 +1183,7 @@ class Prover:
                     desc = task.get("description", "")
                     (workers_dir / f"task_{i}.md").write_text(desc)
 
-                    archive = workers_dir / f"worker_{i}_call.json"
+                    archive = workers_dir / f"worker_{i}_call.md"
                     future = pool.submit(self._run_worker, task, worker_ids[i], archive)
                     futures[future] = i
 
@@ -1276,9 +1288,8 @@ class Prover:
                             tc_log = (wresp.get("tool_calls_log", [])
                                       if wresp else [])
                             if tc_log:
-                                (workers_dir / f"tool_calls_{orig_idx}.json"
-                                 ).write_text(
-                                    json.dumps(tc_log, indent=2, default=str))
+                                (workers_dir / f"tool_calls_{orig_idx}.toml"
+                                 ).write_text(_format_tool_calls_toml(tc_log))
                             break
         else:
             # Normal path (no completed_workers to merge)
@@ -1298,8 +1309,8 @@ class Prover:
                 # Save tool calls log
                 tc_log = wresp.get("tool_calls_log", []) if wresp else []
                 if tc_log:
-                    (workers_dir / f"tool_calls_{i}.json").write_text(
-                        json.dumps(tc_log, indent=2, default=str)
+                    (workers_dir / f"tool_calls_{i}.toml").write_text(
+                        _format_tool_calls_toml(tc_log)
                     )
 
         self._push_output("\n\n".join(all_parts))
@@ -1374,7 +1385,7 @@ class Prover:
                 label=f"search_step_{self.step_num}",
                 web_search=True,
                 stream_callback=self._stream_cb(wid),
-                archive_path=workers_dir / "search_call.json",
+                archive_path=workers_dir / "search_call.md",
             )
             self.tui.stream_end(tab=wid)
             self._track_output_tokens(search_resp)
@@ -1493,7 +1504,7 @@ class Prover:
                     system_prompt=system_prompt,
                     label=f"{worker_id}_phase2",
                     stream_callback=self._stream_cb(worker_id),
-                    archive_path=archive_path.parent / f"{archive_path.stem}_phase2.json" if archive_path else None,
+                    archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
                     max_tokens=answer_reserve,
                 )
                 self.tui.stream_end(tab=worker_id)
@@ -1535,7 +1546,7 @@ class Prover:
             while True:
                 self.tui.stream_start("working..." if call_idx == 0 else "continuing...", tab=worker_id)
                 call_archive = (
-                    archive_path.parent / f"{archive_path.stem}_{call_idx}.json"
+                    archive_path.parent / f"{archive_path.stem}_{call_idx}.md"
                     if archive_path else None
                 )
                 resp = self.worker_llm.chat(
@@ -1687,7 +1698,7 @@ class Prover:
             vfutures: dict = {}
             for j, (i, task, wresp) in enumerate(non_interrupted):
                 desc = task.get("description", "")
-                archive = workers_dir / f"verifier_{i}_call.json"
+                archive = workers_dir / f"verifier_{i}_call.md"
                 future = pool.submit(
                     self._run_verifier, desc, wresp["result"],
                     verifier_ids[j], archive,
@@ -1801,14 +1812,14 @@ class Prover:
             self.tui.update_budget(self.budget.status_str())
 
     def _restore_budget_tokens(self):
-        """On resume, sum output tokens from existing step_meta.toml files."""
+        """On resume, sum output tokens from existing meta.toml files."""
         if self.budget.mode != "tokens":
             return
         steps_dir = self.work_dir / "steps"
         if not steps_dir.exists():
             return
         total = 0
-        for meta_path in sorted(steps_dir.glob("step_*/step_meta.toml")):
+        for meta_path in sorted(steps_dir.glob("step_*/meta.toml")):
             text = meta_path.read_text()
             for m in re.finditer(r'^output_tokens\s*=\s*(\d+)', text, re.MULTILINE):
                 total += int(m.group(1))
@@ -1823,7 +1834,7 @@ class Prover:
                         error: str = "",
                         feedback: str = "",
                         workers: list[dict] | None = None):
-        """Write step_meta.toml with structured metadata for the step."""
+        """Write meta.toml with structured metadata for the step."""
         lines = [
             f'timestamp = "{datetime.now(timezone.utc).isoformat()}"',
             f'step = {self.step_num}',
@@ -1867,7 +1878,7 @@ class Prover:
                 if w.get("error"):
                     lines.append(f'error = "{w["error"]}"')
 
-        (step_dir / "step_meta.toml").write_text("\n".join(lines) + "\n")
+        (step_dir / "meta.toml").write_text("\n".join(lines) + "\n")
 
     def _write_discussion(self):
         logger.info("Writing discussion")
@@ -1890,7 +1901,7 @@ class Prover:
                 ),
                 label="discussion",
                 stream_callback=self._stream_cb("planner"),
-                archive_path=self.work_dir / "discussion_call.json",
+                archive_path=self.work_dir / "discussion_call.md",
             )
             self.tui.stream_end(tab="planner")
             (self.work_dir / "DISCUSSION.md").write_text(resp["result"])
@@ -2065,7 +2076,7 @@ class Prover:
 
     @staticmethod
     def _read_step_meta(step_dir: Path) -> dict[str, str]:
-        meta_path = step_dir / "step_meta.toml"
+        meta_path = step_dir / "meta.toml"
         if not meta_path.exists():
             return {}
         text = meta_path.read_text()

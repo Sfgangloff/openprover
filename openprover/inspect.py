@@ -1,7 +1,7 @@
 """Browse LLM prompts and outputs from an OpenProver run directory."""
 
-import json
 import os
+import re
 import signal
 import shutil
 import sys
@@ -13,6 +13,9 @@ from pathlib import Path
 from .tui._colors import DIM, BOLD, RESET, RED, GREEN, YELLOW, BLUE, CYAN, GRAY
 
 HEADER_ROWS = 3
+
+# Section separator pattern used in archive .md files
+_SECTION_RE = re.compile(r'^======== (.+?) ========$', re.MULTILINE)
 
 
 def find_latest_run() -> Path:
@@ -28,20 +31,78 @@ def find_latest_run() -> Path:
     return max(dirs, key=lambda d: d.stat().st_mtime)
 
 
-def _load_json(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, FileNotFoundError, OSError):
+def _load_call(path: Path) -> dict | None:
+    """Load an LLM call archive file (.md with YAML frontmatter)."""
+    if not path.exists():
         return None
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+
+    # Parse markdown format: YAML frontmatter + sections
+    data: dict = {}
+
+    # Extract YAML frontmatter
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            fm_text = text[4:end]
+            body = text[end + 5:]
+            for line in fm_text.splitlines():
+                if ": " in line:
+                    key, val = line.split(": ", 1)
+                    key = key.strip()
+                    # Parse numeric values
+                    if key in ("call_num", "elapsed_ms", "input_tokens",
+                               "output_tokens", "cache_creation_tokens",
+                               "cache_read_tokens"):
+                        try:
+                            data[key] = int(val)
+                        except ValueError:
+                            data[key] = val
+                    elif key == "cost_usd":
+                        try:
+                            data[key] = float(val)
+                        except ValueError:
+                            data[key] = val
+                    else:
+                        data[key] = val
+        else:
+            body = text
+    else:
+        body = text
+
+    # Parse sections
+    sections: dict[str, str] = {}
+    matches = list(_SECTION_RE.finditer(body))
+    for i, m in enumerate(matches):
+        name = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        sections[name] = body[start:end].strip()
+
+    # Map sections back to the dict keys that _make_pages expects
+    data["system_prompt"] = sections.get("SYSTEM PROMPT", "")
+    data["prompt"] = sections.get("USER PROMPT", "")
+    data["thinking"] = sections.get("THINKING", "")
+    data["result_text"] = sections.get("RESPONSE", "")
+    if not data.get("error") and "ERROR" in sections:
+        data["error"] = sections["ERROR"]
+    # response=None signals "in progress" to _make_pages
+    if "RESPONSE" not in sections and "ERROR" not in sections and not data.get("error"):
+        data["response"] = None
+    else:
+        data["response"] = True  # non-None sentinel
+
+    return data
 
 
 def _format_tokens(data: dict) -> str:
-    resp = data.get("response") or {}
-    usage = resp.get("usage", {})
-    inp = usage.get("input_tokens", 0)
-    out = usage.get("output_tokens", 0)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
+    inp = data.get("input_tokens", 0)
+    out = data.get("output_tokens", 0)
+    cache_read = data.get("cache_read_tokens", 0)
+    cache_create = data.get("cache_creation_tokens", 0)
     parts = []
     if inp:
         parts.append(f"in:{inp}")
@@ -55,8 +116,7 @@ def _format_tokens(data: dict) -> str:
 
 
 def _format_cost(data: dict) -> str:
-    resp = data.get("response") or {}
-    cost = resp.get("total_cost_usd", 0.0)
+    cost = data.get("cost_usd", 0.0)
     if cost:
         return f"${cost:.4f}"
     return ""
@@ -70,7 +130,7 @@ def _format_duration(data: dict) -> str:
 
 
 def _make_pages(data: dict, step: int | str, role: str, label: str) -> list[dict]:
-    """Create prompt and output pages from an archive JSON dict."""
+    """Create prompt and output pages from an archive dict."""
     pages = []
     model = data.get("model", "")
     meta_parts = [p for p in [model, _format_duration(data), _format_tokens(data), _format_cost(data)] if p]
@@ -187,14 +247,13 @@ def load_pages(run_dir: Path) -> list[dict]:
     for step_dir in step_dirs:
         step_num = int(step_dir.name.removeprefix("step_"))
 
-        planner = _load_json(step_dir / "planner_call.json")
+        planner = _load_call(step_dir / "planner_call.md")
         if planner:
             pages.extend(_make_pages(planner, step_num, "planner", "Planner"))
 
         retry_idx = 1
         while True:
-            retry_path = step_dir / f"planner_call_retry_{retry_idx}.json"
-            retry_data = _load_json(retry_path)
+            retry_data = _load_call(step_dir / f"planner_call_retry_{retry_idx}.md")
             if not retry_data:
                 break
             pages.extend(_make_pages(retry_data, step_num, "retry", f"Retry {retry_idx}"))
@@ -204,20 +263,19 @@ def load_pages(run_dir: Path) -> list[dict]:
         if workers_dir.exists():
             worker_idx = 0
             while True:
-                worker_path = workers_dir / f"worker_{worker_idx}_call.json"
-                worker_data = _load_json(worker_path)
+                worker_data = _load_call(workers_dir / f"worker_{worker_idx}_call.md")
                 if not worker_data:
                     break
                 pages.extend(_make_pages(worker_data, step_num, "worker", f"Worker {worker_idx}"))
                 worker_idx += 1
 
-            search_data = _load_json(workers_dir / "search_call.json")
+            search_data = _load_call(workers_dir / "search_call.md")
             if search_data:
                 pages.extend(_make_pages(search_data, step_num, "search", "Search"))
 
         pages.extend(_load_lean_pages(step_dir, step_num))
 
-    discussion = _load_json(run_dir / "discussion_call.json")
+    discussion = _load_call(run_dir / "discussion_call.md")
     if discussion:
         pages.extend(_make_pages(discussion, "end", "discussion", "Discussion"))
 
