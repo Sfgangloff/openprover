@@ -194,6 +194,7 @@ class Prover:
         self.shutting_down = False
         self._workers_active = False
         self._interrupt_count = 0
+        self._last_interrupt_time = 0.0
         self.step_num = 0
         self._step_idx = 0
         self.step_history: list[dict] = []  # rolling window of last 3 steps
@@ -2100,7 +2101,16 @@ class Prover:
         return data
 
     def request_interrupt(self):
-        """Called by SIGINT handler. Tiered: soft → hard → exit."""
+        """Called by SIGINT handler. Tiered: soft → hard → exit.
+
+        In cbreak mode, Ctrl+C fires both the TUI key reader callback and
+        SIGINT, so this can be called twice for a single keypress. Debounce
+        by ignoring calls within 100ms of the previous one.
+        """
+        now = time.time()
+        if now - self._last_interrupt_time < 0.1:
+            return
+        self._last_interrupt_time = now
         self._interrupt_count += 1
 
         if self._workers_active and self._interrupt_count == 1:
