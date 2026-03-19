@@ -422,6 +422,9 @@ def worker_system_prompt(*, lean_worker_actions: bool = False) -> str:
         "VERDICT: INCORRECT\n"
         "\n"
         "Write in concise mathematical style. Use $inline$ and $$display$$ LaTeX.\n"
+        "\n"
+        "IMPORTANT: You are a single worker. Do NOT attempt to spawn subagents, delegate to other workers, "
+        "or \"launch agents in parallel\". You do all the work yourself, directly in your response.\n"
     )
     if lean_worker_actions:
         base += (
