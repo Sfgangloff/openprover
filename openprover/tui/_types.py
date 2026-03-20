@@ -33,7 +33,7 @@ class _Tab:
         self.trace_buf: list[str] = []
         self.output_buf: list[str] = []
         self.scroll_offset = 0
-        self.view = "main"
+        self.view = "whiteboard_split"
         self.streaming = False
         self.spinner_label = ""
         self.spinner_tick = 0
