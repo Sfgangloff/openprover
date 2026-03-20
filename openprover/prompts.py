@@ -105,7 +105,10 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "- **Keep the whiteboard up-to-date.** Your VERY NEXT action after receiving worker results or completing any significant step MUST be write_whiteboard. "
         "Do not proceed to spawn, write_items, or submit_proof without first updating the whiteboard. "
         "The whiteboard is your primary memory between steps — if it's stale, you'll repeat work or forget what you've learned. "
-        "Record: current plan (with checkboxes updated), failed attempts (brief), key results obtained, alternative branches to explore. "
+        "Record: current plan (with checkboxes updated), failed attempts (brief, but say *why* they failed), key results obtained, alternative branches to explore. "
+        "**Include substance, not just status.** Don't write 'Proof found' — write the 1-2 sentence proof idea. "
+        "Don't write 'Worker failed' — write what was tried and why it didn't work. "
+        "The whiteboard should let someone reconstruct your key insights and dead ends at a glance. "
         "Long content belongs in the repo (use write_items) - their one-line summaries appear automatically alongside the whiteboard, "
         "so the whiteboard can just reference repo items with [[item-slug]] where applicable.\n"
     )
@@ -357,6 +360,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "- Abbreviations and arrows freely\n"
         '"WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
         "- Keep it concise — long results belong in repo items, not on the whiteboard.\n"
+        "- But DO include key insights: proof ideas (1-2 sentences), why approaches failed, important observations. Status without substance is useless.\n"
         "\n"
         "---\n"
         "\n"
