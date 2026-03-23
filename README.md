@@ -2,7 +2,9 @@
 
 ![system_plot](assets/openprover_system.png)
 
-Theorem prover powered by language models. A **planner** coordinates proof search by maintaining a whiteboard and repository, delegating focused tasks to **parallel workers** via Claude CLI or local models (vLLM).
+Theorem prover powered by language models.
+
+A **planner** coordinates proof search by maintaining a whiteboard and repository, delegating focused tasks to parallel **workers** via Claude CLI or local models (vLLM).
 
 ## How it works
 
