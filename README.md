@@ -179,6 +179,10 @@ The `examples/` directory has theorem statements at various difficulty levels:
 | `erdos_838.md` | Hard (open) |
 | `collatz.md` | Harder (open) |
 
+# Ideas
+
+- Add modes where OpenProver also tries to 1) simplify a proof or make it nicer and 2) generalize a proof.
+- In the `lean_verify` action, provide proof states to the planner.
 
 # Cite
 
