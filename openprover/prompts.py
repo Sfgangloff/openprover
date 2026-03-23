@@ -105,7 +105,7 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "- **Keep the whiteboard up-to-date.** Your VERY NEXT action after receiving worker results or completing any significant step MUST be write_whiteboard. "
         "Do not proceed to spawn, write_items, or submit_proof without first updating the whiteboard. "
         "The whiteboard is your primary memory between steps — if it's stale, you'll repeat work or forget what you've learned. "
-        "Record: current plan (with checkboxes updated), failed attempts (brief, but say *why* they failed), key results obtained, alternative branches to explore. "
+        "Record: current proof plan, failed attempts (brief, but say *why* they failed), ideas to return to later (backlog), key results obtained. "
         "**Include substance, not just status.** Don't write 'Proof found' — write the 1-2 sentence proof idea. "
         "Don't write 'Worker failed' — write what was tried and why it didn't work. "
         "The whiteboard should let someone reconstruct your key insights and dead ends at a glance. "
@@ -366,7 +366,7 @@ def planner_system_prompt(*, isolation: bool = False, allow_give_up: bool = True
         "# Whiteboard Style\n"
         "\n"
         "Terse, dense, like shorthand on a real whiteboard:\n"
-        "- Sections: Goal, Plan, Status, Open Questions, Tried\n"
+        "- Sections: Goal, Plan (current proof strategy), Failed (past attempts — what & why), Backlog (ideas to revisit, with [[refs]] if applicable), Status, Open Questions\n"
         "- Use LaTeX (will be displayed via MathJax): $inline$ and $$display$$\n"
         "- Abbreviations and arrows freely\n"
         '"WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
