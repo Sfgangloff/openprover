@@ -29,6 +29,11 @@ Modes:
 ## Install
 
 ```bash
+pip install openprover
+```
+
+Or from source:
+```bash
 git clone https://github.com/open-prover/openprover.git
 cd openprover
 python -m venv .venv && source .venv/bin/activate
