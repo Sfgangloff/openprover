@@ -112,7 +112,9 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
         "Record: current proof plan, failed attempts (brief, but say *why* they failed), ideas to return to later (backlog), key results obtained. "
         "**Include substance, not just status.** Don't write 'Proof found' - write the 1-2 sentence proof idea. "
         "Don't write 'Worker failed' - write what was tried and why it didn't work. "
-        "The whiteboard should let someone reconstruct your key insights and dead ends at a glance. "
+        "**The whiteboard must make sense standalone.** Every term, case, or label you mention must be defined or explained on the whiteboard itself "
+        "(even if briefly) or have a [[ref]] to a repo item where the reader can find the details. "
+        "Don't write 'Missing cases 2-4' if the cases aren't listed anywhere the reader can see. "
         "Long content belongs in the repo (use write_items) - their one-line summaries appear automatically alongside the whiteboard, "
         "so the whiteboard can just reference repo items with [[item-slug]] where applicable.\n"
     )
