@@ -200,8 +200,6 @@ class StreamMixin:
         if is_active and self._main_visible:
             if self.view == "whiteboard_split" or target.scroll_offset > 0:
                 self._redraw()
-            elif had_visible:
-                self._write('\n')
             else:
                 self._write('\r\033[2K')
         self._redraw_header()
