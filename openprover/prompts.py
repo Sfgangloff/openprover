@@ -747,8 +747,9 @@ def format_discussion_prompt(
         parts.append(f"\n\n# Proof\n\n{proof}")
     parts.append(f"\n\n{steps_taken} steps taken. Budget: {budget_summary}.")
     parts.append(
-        "\n\nWrite a brief discussion: result, approaches tried, key insights, "
-        "open gaps, recommendations. Use $ and $$ for math. "
+        "\n\nWrite a brief discussion. Begin by stating exactly what theorem was being proved "
+        "(copy or paraphrase the statement precisely). Then cover: result, approaches tried, "
+        "key insights, open gaps, recommendations. Use $ and $$ for math. "
         "Reference repo items with [[slug]] links - the reader will have access to the full repo."
     )
     return "".join(parts)
