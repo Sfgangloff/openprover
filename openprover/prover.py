@@ -317,10 +317,6 @@ class Prover:
             return None
         def cb(t, k="text"):
             if output_only and k == "thinking":
-                # Count thinking tokens so spinner shows progress, but don't display.
-                target = self.tui._find_tab_or_none(tab)
-                if target and target.streaming:
-                    target.spinner_tokens += 1
                 return
             self.tui.stream_text(t, kind=k, tab=tab, show_toml=output_only)
         return cb
