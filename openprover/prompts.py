@@ -121,9 +121,9 @@ def _build_principles(*, lean_mode: str, has_lean: bool,
     if not isolation:
         principles += (
             "- Use literature_search sparingly (2-3 times max). After a literature search, the very next step must process the results: update the whiteboard with key findings and revised strategy, and write relevant results to the repo.\n"
-            "- **Never spawn workers for literature search or recall.** Workers have no web access and no knowledge of specific theorems or papers - "
-            "they will hallucinate citations. To find existing results, use the `literature_search` action (a planner-level action that spawns a web-enabled worker). "
-            "Only spawn regular workers for doing original mathematical reasoning.\n"
+            "- **Never spawn workers for literature search or recall.** Workers have NO web access, NO search capability, and NO knowledge of specific theorems or papers — "
+            "they WILL hallucinate citations if asked to search. To find existing results, use the `literature_search` action (a planner-level action, NOT a spawn task). "
+            "Only spawn regular workers for doing original mathematical reasoning, not for searching or recalling literature.\n"
         )
     if lean_items:
         principles += (
@@ -455,6 +455,10 @@ def worker_system_prompt(*, lean_worker_tools: bool = False) -> str:
         "\n"
         "IMPORTANT: You are a single worker. Do NOT attempt to spawn subagents, delegate to other workers, "
         "or \"launch agents in parallel\". You do all the work yourself, directly in your response.\n"
+        "\n"
+        "IMPORTANT: You have NO web access, NO search capability, and NO access to external databases or papers. "
+        "Do not attempt literature searches or cite specific papers — you will hallucinate references. "
+        "Work from first principles using your mathematical knowledge.\n"
         "\n"
         "IMPORTANT: All reasoning must happen in your thinking trace, not in your output. "
         "When writing your response, write the final answer directly — do not re-reason, backtrack, "
@@ -864,7 +868,17 @@ def parse_planner_toml(text: str) -> list[dict] | ParseError | None:
             spawn_count += 1
             if spawn_count > 1:
                 return ParseError(
-                    "At most one spawn block is allowed per step."
+                    "At most one spawn block is allowed per step. "
+                    "Put ALL tasks inside a SINGLE spawn block using multiple [[tasks]] entries:\n"
+                    "<OPENPROVER_ACTION>\n"
+                    'action = "spawn"\n\n'
+                    "[[tasks]]\n"
+                    'summary = "First task"\n'
+                    'description = """..."""\n\n'
+                    "[[tasks]]\n"
+                    'summary = "Second task"\n'
+                    'description = """..."""\n'
+                    "</OPENPROVER_ACTION>"
                 )
         plans.append(parsed)
 
