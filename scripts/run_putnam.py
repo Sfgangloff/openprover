@@ -143,7 +143,7 @@ def main():
                         help="Number of concurrent openprover instances (default: 1)")
     parser.add_argument("-P", "--parallelism", type=int, default=1,
                         help="Max parallel workers per spawn step inside openprover (default: 1)")
-    model_choices = ["sonnet", "opus", "minimax-m2.5"]
+    model_choices = ["sonnet", "opus", "minimax-m2.5", "leanstral"]
     parser.add_argument("--model", default="sonnet", choices=model_choices)
     parser.add_argument("--planner-model", choices=model_choices, default=None,
                         help="Override model for planner (defaults to --model)")
