@@ -24,6 +24,7 @@ Modes:
 
 - Python 3.10+
 - **Claude** (default): [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` command on PATH)
+- **Leanstral** (alternative): Mistral's Lean-specialized model; requires `MISTRAL_API_KEY` (get one at https://console.mistral.ai/)
 - **Local models** (alternative): any OpenAI-compatible server such as [vLLM](https://github.com/vllm-project/vllm); pass `--provider-url` to point at it
 
 ## Install
@@ -114,7 +115,7 @@ openprover --theorem examples/addition.md \
 | `--provider-url` | `http://localhost:8000` | Server URL for local models |
 | `--answer-reserve` | `4096` | Tokens reserved for answer after thinking (local models) |
 
-Available Claude models: `sonnet`, `opus`. For local models, pass any model name supported by your OpenAI-compatible server (e.g. `minimax-m2.5`) together with `--provider-url`.
+Available Claude models: `sonnet`, `opus`. Use `leanstral` for Mistral's Lean-specialized model (requires `MISTRAL_API_KEY`). For local models, pass any model name supported by your OpenAI-compatible server (e.g. `minimax-m2.5`) together with `--provider-url`.
 
 ### TUI controls
 
