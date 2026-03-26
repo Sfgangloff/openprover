@@ -85,7 +85,16 @@ def lean_verify(code: str) -> str:
     full_code = merge_lean_imports(_store, code) if _store else code
     path = work_dir.make_file("mcp_verify", full_code)
     success, feedback, _cmd_info = run_lean_check(path, project_dir)
-    result = "OK - no errors" if success else feedback
+    if success:
+        result = "OK - no errors"
+    else:
+        result = feedback
+        if not lean_has_errors(feedback) and "sorry" in feedback.lower():
+            result += (
+                "\n\nNote: code contains sorry — this means the proof has gaps. "
+                "lean_store will REJECT code with sorry. You must fill ALL sorry "
+                "holes with actual proof terms before storing."
+            )
     if _store:
         store_lines = len(_store.splitlines())
         result = f"({store_lines} lines from lean_store were automatically prepended)\n{result}"

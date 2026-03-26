@@ -1656,6 +1656,16 @@ class Prover:
         resp["tool_calls_log"] = tool_calls_log
         return resp
 
+    @staticmethod
+    def _estimate_messages_chars(messages: list[dict]) -> int:
+        """Estimate the total character count of a message list."""
+        total = 0
+        for msg in messages:
+            total += len(msg.get("content") or "")
+            for tc in msg.get("tool_calls") or []:
+                total += len(tc.get("function", {}).get("arguments", ""))
+        return total
+
     def _run_worker_multi_turn(self, prompt: str, system_prompt: str,
                                worker_id: str, archive_path: Path | None) -> dict:
         """Multi-turn tool-calling worker (vLLM/Mistral)."""
@@ -1669,8 +1679,52 @@ class Prover:
         call_idx = 0
         conversation_id = None  # Mistral stateful conversation
 
+        # Context limit: reserve space for the model's response.
+        # ~4 chars per token is a rough estimate.
+        ctx_length = getattr(self.worker_llm, 'context_length', 200_000)
+        answer_reserve = getattr(self.worker_llm, 'answer_reserve', 4096)
+        # Leave room for answer + thinking in the context window
+        max_input_chars = (ctx_length - answer_reserve) * 4
+
         try:
             while True:
+                # Check context length before calling the API
+                msg_chars = self._estimate_messages_chars(messages)
+                if msg_chars > max_input_chars:
+                    logger.warning(
+                        "[%s] context nearly full (%d chars > %d limit) — forcing output",
+                        worker_id, msg_chars, max_input_chars,
+                    )
+                    self.tui.tab_log(worker_id, "Context nearly full — wrapping up", color="yellow")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You are running out of context space. Write your final "
+                            "answer NOW based on what you have so far. Do not make "
+                            "any more tool calls."
+                        ),
+                    })
+                    self.tui.stream_start("forcing output (context limit)...", tab=worker_id)
+                    phase2_kwargs = {}
+                    if conversation_id:
+                        phase2_kwargs["conversation_id"] = conversation_id
+                    resp = self.worker_llm.chat(
+                        messages=messages,
+                        tools=None,
+                        max_tokens=answer_reserve,
+                        label=f"{worker_id}_context_limit",
+                        stream_callback=self._stream_cb(worker_id, output_only=True),
+                        archive_path=(
+                            archive_path.parent / f"{archive_path.stem}_context_limit.md"
+                            if archive_path else None
+                        ),
+                        **phase2_kwargs,
+                    )
+                    self.tui.stream_end(tab=worker_id)
+                    total_cost += resp["cost"]
+                    total_duration += resp["duration_ms"]
+                    break
+
                 self.tui.stream_start("working..." if call_idx == 0 else "continuing...", tab=worker_id)
                 call_archive = (
                     archive_path.parent / f"{archive_path.stem}_{call_idx}.md"

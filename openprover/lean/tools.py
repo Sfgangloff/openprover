@@ -115,6 +115,11 @@ def _tool_lean_verify(
             status = "error"
         elif "sorry" in feedback.lower():
             status = "partial"
+            feedback += (
+                "\n\nNote: code contains sorry — this means the proof has gaps. "
+                "lean_store will REJECT code with sorry. You must fill ALL sorry "
+                "holes with actual proof terms before storing."
+            )
         else:
             # Warnings only, no errors - treat as success
             status = "ok"
