@@ -377,6 +377,7 @@ def planner_system_prompt(*, isolation: bool = False,
         "- Sections: Goal, Plan (current proof strategy), Failed (past attempts - what & why), Backlog (ideas to revisit, with [[refs]] if applicable), Status, Open Questions\n"
         "- Use LaTeX (will be displayed via MathJax): $inline$ and $$display$$\n"
         "- Abbreviations and arrows freely\n"
+        "- Use checkboxes for plans and progress tracking: `- [ ]` todo, `- [x]` done\n"
         '"WLOG assume $p,q$ coprime" not "Without loss of generality..."\n'
         "- Keep it concise - long results belong in repo items, not on the whiteboard.\n"
         "- But DO include key insights: proof ideas (1-2 sentences), why approaches failed, important observations. Status without substance is useless.\n"

@@ -106,6 +106,7 @@ class MistralClient:
         self.archive_dir = archive_dir
         self.call_count = 0
         self.total_cost = 0.0
+        self.answer_reserve = answer_reserve
         self.max_output_tokens = answer_reserve
         self._api_key = os.environ.get("MISTRAL_API_KEY")
         if not self._api_key:
@@ -332,7 +333,16 @@ class MistralClient:
     def _build_payload(self, *, inputs, instructions="", tools=None,
                        max_tokens=None, stream=False, no_thinking=False,
                        continuation=False):
-        effective_max = max_tokens if max_tokens is not None else self.max_output_tokens
+        if max_tokens is not None:
+            effective_max = max_tokens
+        elif no_thinking:
+            # No thinking: max_tokens is purely for output text.
+            effective_max = self.max_output_tokens
+        else:
+            # Thinking enabled: thinking + output share the max_tokens budget.
+            # Use the full context length so thinking doesn't crowd out output.
+            # The API caps at (context_length - prompt_tokens) automatically.
+            effective_max = self.context_length
         if continuation:
             # Continuation of existing conversation: only inputs,
             # stream, and completion_args.  model/tools/instructions

@@ -192,13 +192,16 @@ class Prover:
                  make_worker_llm=None,
                  lean_items: bool = False,
                  lean_worker_tools: bool = False,
-                 history_budget: int = 0):
+                 history_budget: int = 0,
+                 exit_on_budget_out: bool = False):
         self.model = model_name
         self._make_llm = make_llm
         self._make_worker_llm = make_worker_llm or make_llm
         self.lean_items = lean_items
         self.lean_worker_tools = lean_worker_tools
         self._history_budget_override = history_budget
+        self.exit_on_budget_out = exit_on_budget_out
+        self._spending_limit_hit = False
         self.budget = budget
         self.autonomous = autonomous
         self.verbose = verbose
@@ -367,7 +370,7 @@ class Prover:
             )
             self._maybe_respawn_interrupted_workers()
 
-        while not self.budget.is_exhausted() and not self.shutting_down:
+        while not self.budget.is_exhausted() and not self.shutting_down and not self._spending_limit_hit:
             self.step_num += 1
             self._current_planner_result = ""
             self._current_action_outputs = []
@@ -632,7 +635,7 @@ class Prover:
                 logger.error("Planner error: %s", e)
                 self.tui.log(f"Error: {e}", color="red")
                 self._save_step_meta(step_dir, status="llm_error", error=str(e))
-                return "continue"
+                return self._check_spending_limit(e)
             self.tui.stream_end(tab="planner")
             resp = _use_thinking_as_result(resp)
             self._track_output_tokens(resp)
@@ -662,19 +665,41 @@ class Prover:
                 if finish in ("length", "max_tokens") and attempt == 0:
                     logger.info("Planner truncated (finish_reason=%s) - Phase 2", finish)
                     self.tui.log("Planner output truncated - forcing decision...", color="yellow")
-                    phase2_prompt = prompts.format_planner_truncated(prompt, resp["result"])
                     self.tui.stream_start("forcing decision", tab="planner")
                     try:
                         phase2_max = getattr(self.planner_llm, 'answer_reserve', None) or 16_000
-                        resp = self.planner_llm.call(
-                            prompt=phase2_prompt,
-                            system_prompt=system_prompt,
-                            label=f"planner_step_{self.step_num}_phase2",
-                            stream_callback=self._stream_cb("planner", output_only=True),
-                            archive_path=step_dir / "planner_call_phase2.md",
-                            max_tokens=phase2_max,
-                            no_thinking=True,
-                        )
+                        conv_id = resp.get("conversation_id")
+                        if conv_id and hasattr(self.planner_llm, 'chat'):
+                            messages = [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": prompt},
+                                {"role": "assistant", "content": resp["result"] or ""},
+                                {"role": "user", "content": (
+                                    "Your response was cut off. Write your final "
+                                    "decision now — output ONLY the "
+                                    "<OPENPROVER_ACTION>...</OPENPROVER_ACTION> block."
+                                )},
+                            ]
+                            resp = self.planner_llm.chat(
+                                messages=messages,
+                                tools=None,
+                                max_tokens=phase2_max,
+                                label=f"planner_step_{self.step_num}_phase2",
+                                stream_callback=self._stream_cb("planner", output_only=True),
+                                archive_path=step_dir / "planner_call_phase2.md",
+                                conversation_id=conv_id,
+                            )
+                        else:
+                            phase2_prompt = prompts.format_planner_truncated(prompt, resp["result"])
+                            resp = self.planner_llm.call(
+                                prompt=phase2_prompt,
+                                system_prompt=system_prompt,
+                                label=f"planner_step_{self.step_num}_phase2",
+                                stream_callback=self._stream_cb("planner", output_only=True),
+                                archive_path=step_dir / "planner_call_phase2.md",
+                                max_tokens=phase2_max,
+                                no_thinking=True,
+                            )
                     except Interrupted:
                         self.tui.stream_end(tab="planner")
                         return self._handle_interrupt(step_dir)
@@ -683,7 +708,7 @@ class Prover:
                         logger.error("Phase 2 error: %s", e)
                         self.tui.log(f"Error: {e}", color="red")
                         self._save_step_meta(step_dir, status="llm_error", error=str(e))
-                        return "continue"
+                        return self._check_spending_limit(e)
                     self.tui.stream_end(tab="planner")
                     resp = _use_thinking_as_result(resp)
                     self._track_output_tokens(resp)
@@ -1542,26 +1567,47 @@ class Prover:
                 label = "interrupted - forcing output..." if reason == "soft_interrupted" else "forcing output..."
                 self.tui.stream_start(label, tab=worker_id)
                 answer_reserve = getattr(self.worker_llm, 'answer_reserve', None)
-                # For Claude CLI, CLAUDE_CODE_MAX_OUTPUT_TOKENS is the total budget
-                # including thinking tokens. Use a larger Phase 2 budget so thinking
-                # doesn't crowd out the actual text output.
                 phase2_max = answer_reserve or 16_000
-                phase2_prompt = (
-                    f"{prompt}\n\n---\n\n"
-                    f"Your previous reasoning was cut off. Write your final answer now. "
-                    f"Output only the answer — no re-reasoning, no backtracking, no narration.\n\n"
-                    f"Previous output (last 2000 chars):\n"
-                    f"```\n{resp['result'][-2000:]}\n```"
-                )
-                resp2 = self.worker_llm.call(
-                    prompt=phase2_prompt,
-                    system_prompt=system_prompt,
-                    label=f"{worker_id}_phase2",
-                    stream_callback=self._stream_cb(worker_id, output_only=True),
-                    archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
-                    max_tokens=phase2_max,
-                    no_thinking=True,
-                )
+
+                conv_id = resp.get("conversation_id")
+                if conv_id and hasattr(self.worker_llm, 'chat'):
+                    # Mistral: continue the conversation to preserve thinking context
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": resp["result"] or ""},
+                        {"role": "user", "content": (
+                            "Your response was cut off. Write your final answer now. "
+                            "Output only the answer — no re-reasoning, no backtracking, no narration."
+                        )},
+                    ]
+                    resp2 = self.worker_llm.chat(
+                        messages=messages,
+                        tools=None,
+                        max_tokens=phase2_max,
+                        label=f"{worker_id}_phase2",
+                        stream_callback=self._stream_cb(worker_id, output_only=True),
+                        archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
+                        conversation_id=conv_id,
+                    )
+                else:
+                    # Claude CLI / others: fresh call with context snippet
+                    phase2_prompt = (
+                        f"{prompt}\n\n---\n\n"
+                        f"Your previous reasoning was cut off. Write your final answer now. "
+                        f"Output only the answer — no re-reasoning, no backtracking, no narration.\n\n"
+                        f"Previous output (last 2000 chars):\n"
+                        f"```\n{resp['result'][-2000:]}\n```"
+                    )
+                    resp2 = self.worker_llm.call(
+                        prompt=phase2_prompt,
+                        system_prompt=system_prompt,
+                        label=f"{worker_id}_phase2",
+                        stream_callback=self._stream_cb(worker_id, output_only=True),
+                        archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
+                        max_tokens=phase2_max,
+                        no_thinking=True,
+                    )
                 self.tui.stream_end(tab=worker_id)
                 resp = {
                     "result": resp2["result"],
@@ -1815,27 +1861,54 @@ class Prover:
             if resp.get("finish_reason") in ("length", "max_tokens"):
                 logger.info("[%s] truncated - Phase 2", verifier_id)
                 self.tui.stream_start("forcing verdict...", tab=verifier_id)
-                phase2_prompt = (
-                    f"{prompt}\n\n---\n\n"
-                    f"Your previous verification was cut off. Based on your analysis so far, "
-                    f"provide your final verdict now.\n\n"
-                    f"Previous output (last 2000 chars):\n"
-                    f"```\n{resp['result'][-2000:]}\n```\n\n"
-                    f"Respond with ONLY one of:\n"
-                    f"VERDICT: CORRECT\n"
-                    f"VERDICT: CRITICALLY FLAWED - <brief reason>\n"
-                    f"VERDICT: NEEDS MINOR FIXES - <brief reason>"
-                )
                 answer_reserve = getattr(self.worker_llm, 'answer_reserve', None)
-                resp2 = self.worker_llm.call(
-                    prompt=phase2_prompt,
-                    system_prompt=system_prompt,
-                    label=f"{verifier_id}_phase2",
-                    stream_callback=self._stream_cb(verifier_id, output_only=True),
-                    archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
-                    max_tokens=answer_reserve or 4_000,
-                    no_thinking=True,
-                )
+                phase2_max = answer_reserve or 4_000
+
+                conv_id = resp.get("conversation_id")
+                if conv_id and hasattr(self.worker_llm, 'chat'):
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": resp["result"] or ""},
+                        {"role": "user", "content": (
+                            "Your verification was cut off. Based on your analysis, "
+                            "provide your final verdict now.\n\n"
+                            "Respond with ONLY one of:\n"
+                            "VERDICT: CORRECT\n"
+                            "VERDICT: CRITICALLY FLAWED - <brief reason>\n"
+                            "VERDICT: NEEDS MINOR FIXES - <brief reason>"
+                        )},
+                    ]
+                    resp2 = self.worker_llm.chat(
+                        messages=messages,
+                        tools=None,
+                        max_tokens=phase2_max,
+                        label=f"{verifier_id}_phase2",
+                        stream_callback=self._stream_cb(verifier_id, output_only=True),
+                        archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
+                        conversation_id=conv_id,
+                    )
+                else:
+                    phase2_prompt = (
+                        f"{prompt}\n\n---\n\n"
+                        f"Your previous verification was cut off. Based on your analysis so far, "
+                        f"provide your final verdict now.\n\n"
+                        f"Previous output (last 2000 chars):\n"
+                        f"```\n{resp['result'][-2000:]}\n```\n\n"
+                        f"Respond with ONLY one of:\n"
+                        f"VERDICT: CORRECT\n"
+                        f"VERDICT: CRITICALLY FLAWED - <brief reason>\n"
+                        f"VERDICT: NEEDS MINOR FIXES - <brief reason>"
+                    )
+                    resp2 = self.worker_llm.call(
+                        prompt=phase2_prompt,
+                        system_prompt=system_prompt,
+                        label=f"{verifier_id}_phase2",
+                        stream_callback=self._stream_cb(verifier_id, output_only=True),
+                        archive_path=archive_path.parent / f"{archive_path.stem}_phase2.md" if archive_path else None,
+                        max_tokens=phase2_max,
+                        no_thinking=True,
+                    )
                 self.tui.stream_end(tab=verifier_id)
                 resp2 = _use_thinking_as_result(resp2)
                 resp = {
@@ -1909,6 +1982,23 @@ class Prover:
             "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
             "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
         }
+
+    @staticmethod
+    def _is_spending_limit_error(error: Exception) -> bool:
+        """Check if a RuntimeError indicates a Claude spending limit hit."""
+        msg = str(error).lower()
+        return ("spending" in msg or "spend limit" in msg
+                or "billing" in msg or "quota" in msg
+                or ("rate" in msg and "limit" in msg))
+
+    def _check_spending_limit(self, error: Exception) -> str:
+        """If --exit-on-budget-out and this is a spending limit error, return 'stop'.
+        Otherwise return 'continue'."""
+        if self.exit_on_budget_out and self._is_spending_limit_error(error):
+            self._spending_limit_hit = True
+            self.tui.log("Spending limit hit - exiting (--exit-on-budget-out).", color="yellow")
+            return "stop"
+        return "continue"
 
     def _track_output_tokens(self, resp: dict):
         """Add output tokens from an LLM response to the budget."""
