@@ -40,7 +40,7 @@ def main():
         models_data = json.loads(resp.read())
         available = [m["id"] for m in models_data.get("data", [])]
         # Build reverse alias map for display
-        ALIASES = {"lm-provers/QED-Nano": "qed-nano", "Qwen/Qwen3-4B-Thinking-2507": "qwen3-4b"}
+        ALIASES = {}
         for m in available:
             alias = ALIASES.get(m, "")
             print(f"  [{available.index(m)}] {m}" + (f"  (alias: {alias})" if alias else ""))
@@ -50,7 +50,7 @@ def main():
 
     if args.model is not None:
         # Accept index, alias, or full name
-        ALIAS_MAP = {"qed-nano": "lm-provers/QED-Nano", "qwen3-4b": "Qwen/Qwen3-4B-Thinking-2507"}
+        ALIAS_MAP = {}
         if args.model.isdigit() and int(args.model) < len(available):
             model = available[int(args.model)]
         else:

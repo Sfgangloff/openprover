@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run openprover on a ProofBench problem")
     parser.add_argument("problem", help="Problem ID (e.g. PB-Basic-001)")
     parser.add_argument("--list", action="store_true", help="List available problems and exit")
-    parser.add_argument("--model", default="qed-nano", choices=["sonnet", "opus", "qed-nano"])
+    parser.add_argument("--model", default="sonnet", choices=["sonnet", "opus", "minimax-m2.5"])
     parser.add_argument("--provider-url", default="http://localhost:8000",
                         help="Server URL for local models (default: http://localhost:8000)")
     parser.add_argument("--max-steps", type=int, default=50)
@@ -54,7 +54,7 @@ def main():
         theorem_path = f.name
 
     cmd = ["openprover", theorem_path, "--model", args.model, "--max-steps", str(args.max_steps)]
-    if args.model == "qed-nano":
+    if args.model == "minimax-m2.5":
         cmd.extend(["--provider-url", args.provider_url])
     if args.autonomous:
         cmd.append("--autonomous")
