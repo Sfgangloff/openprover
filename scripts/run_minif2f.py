@@ -216,6 +216,8 @@ def main():
                         help="Path to cloned MiniF2F repository (for Lean verification)")
     parser.add_argument("--problem", help="Specific theorem name to run (e.g., amc12a_2019_p21)")
     parser.add_argument("--limit", type=int, help="Limit number of problems to run")
+    parser.add_argument("--skip", type=int, default=0,
+                        help="Skip first N problems (for resuming interrupted runs)")
     parser.add_argument("--problem-parallelism", type=int, default=1,
                         help="Number of concurrent openprover instances (default: 1)")
     parser.add_argument("-P", "--parallelism", type=int, default=1,
@@ -280,6 +282,10 @@ def main():
                 print(f"  Did you mean: {', '.join(available[:5])}", file=sys.stderr)
             sys.exit(1)
         problems = {args.problem: problems[args.problem]}
+
+    if args.skip > 0:
+        problems = dict(list(problems.items())[args.skip:])
+        print(f"  Skipping first {args.skip} problems, {len(problems)} remaining")
 
     if args.limit is not None:
         problems = dict(list(problems.items())[:args.limit])
