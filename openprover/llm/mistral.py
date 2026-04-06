@@ -402,8 +402,30 @@ class MistralClient:
         for entry in raw.get("outputs", []):
             if entry.get("role") != "assistant":
                 continue
-            result_text = entry.get("content", "")
-            thinking_text = entry.get("reasoning", "")
+            content = entry.get("content", "")
+            if isinstance(content, str):
+                result_text = content
+            elif isinstance(content, list):
+                # Structured thinking format: list of dicts with type/thinking/content
+                thinking_parts: list[str] = []
+                output_parts: list[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "thinking":
+                        for tp in part.get("thinking", []):
+                            thinking_parts.append(tp.get("text", ""))
+                    else:
+                        for cp in part.get("content", []):
+                            output_parts.append(cp.get("text", ""))
+                        if not output_parts and part.get("text"):
+                            output_parts.append(part["text"])
+                result_text = "".join(output_parts)
+                thinking_text = "".join(thinking_parts)
+            reasoning = entry.get("reasoning", "")
+            if reasoning and not thinking_text:
+                thinking_text = reasoning
             tc = entry.get("tool_calls")
             if tc:
                 tool_calls = tc
