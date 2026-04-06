@@ -85,6 +85,9 @@ class HeadlessTUI:
         })
         return idx
 
+    def _sync_step_log_line(self, step_idx: int):
+        pass
+
     def update_step(self, step_num: int):
         pass
 
