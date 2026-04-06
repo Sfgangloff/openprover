@@ -141,6 +141,18 @@ def _tool_lean_store(
     if not lean_work_dir:
         return ("Lean project not configured", "error")
 
+    # Reject banned constructs before compiling
+    import re as _re
+    for pattern, label in [
+        (r'\bsorry\b', "sorry"),
+        (r'^\s*axiom\b', "axiom"),
+        (r'^\s*unsafe\b', "unsafe"),
+        (r'^\s*set_option\b', "set_option"),
+        (r'\bnative_decide\b', "native_decide"),
+    ]:
+        if _re.search(pattern, code, _re.MULTILINE):
+            return (f"Store rejected: code contains banned construct: {label}", "error")
+
     store = _worker_stores.get(worker_id, "")
     candidate = merge_lean_imports(store, code)
 
