@@ -115,10 +115,13 @@ def _run_openprover(
             "openprover",
             "--theorem", theorem_path,
             "--model", args.model,
-            "--max-time", args.max_time,
             "--headless",
             "-P", str(args.parallelism),
         ]
+        if args.max_tokens:
+            cmd.extend(["--max-tokens", str(args.max_tokens)])
+        else:
+            cmd.extend(["--max-time", args.max_time or "4h"])
         if args.planner_model:
             cmd.extend(["--planner-model", args.planner_model])
         if args.worker_model:
@@ -143,8 +146,11 @@ def _run_openprover(
         if used & CLAUDE_MODELS:
             cmd.extend(["--on-rate-limited", "exit"])
 
-        # Hard timeout: budget + 2 min grace for final LLM call / Lean check
-        hard_timeout = _parse_duration(args.max_time) + 120
+        # Hard timeout: time budget + 2 min grace, or 4h cap for token budgets
+        if args.max_tokens:
+            hard_timeout = 4 * 3600  # 4h wall-clock cap for token-based budgets
+        else:
+            hard_timeout = _parse_duration(args.max_time or "4h") + 120
 
         while True:
             try:
@@ -192,7 +198,7 @@ def _run_baseline(
     from baseline import run_baseline
 
     run_dir = bench_dir / "runs" / name
-    budget_secs = _parse_duration(args.max_time)
+    budget_secs = _parse_duration(args.max_time or "4h")
     result = run_baseline(
         name=name,
         theorem_lean=info["formal"],
@@ -314,8 +320,11 @@ def main():
     parser.add_argument("--planner-model", choices=model_choices, default=None)
     parser.add_argument("--worker-model", choices=model_choices, default=None)
     parser.add_argument("--provider-url", default="http://localhost:8000")
-    parser.add_argument("--max-time", default="4h", metavar="DURATION",
-                        help="Time budget per problem (default: 4h)")
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--max-time", default=None, metavar="DURATION",
+                        help="Time budget per problem (e.g. '10m', '2h')")
+    budget.add_argument("--max-tokens", type=int, default=None, metavar="N",
+                        help="Output token budget per problem")
     parser.add_argument("--informal", action="store_true",
                         help="Skip Lean verification (informal only)")
     parser.add_argument("--isolation",
@@ -400,6 +409,7 @@ def main():
         "planner_model": args.planner_model,
         "worker_model": args.worker_model,
         "max_time": args.max_time,
+        "max_tokens": args.max_tokens,
         "parallelism": args.parallelism,
         "problem_parallelism": args.problem_parallelism,
         "informal": args.informal,
