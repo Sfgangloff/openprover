@@ -132,6 +132,50 @@ Available Claude models: `sonnet`, `opus`. Use `leanstral` for Mistral's Lean-sp
 
 When confirming a step: Tab switches between accept/feedback, Enter confirms or opens detail view, Esc dismisses, `a` accepts and enters autonomous mode.
 
+## Lean setup (for formal verification)
+
+To use formal verification (`--lean-project`), you need [elan](https://github.com/leanprover/elan) (Lean version manager) installed. elan automatically fetches the right Lean toolchain.
+
+Benchmarks like MiniF2F and PutnamBench ship their own Lean projects with Mathlib dependencies. Build them once before running:
+
+```bash
+# MiniF2F
+git clone https://github.com/google-deepmind/miniF2F.git
+cd miniF2F
+lake exe cache get   # download precompiled Mathlib oleans
+lake build           # compile MiniF2F itself
+
+# PutnamBench
+git clone https://github.com/trishullab/PutnamBench.git
+cd PutnamBench/lean4
+lake exe cache get
+lake build
+```
+
+Then point OpenProver at the project:
+
+```bash
+openprover --theorem thm.md --lean-project ./miniF2F --lean-theorem thm.lean
+```
+
+## Benchmarks
+
+Scripts in `scripts/` run OpenProver against standard benchmarks:
+
+```bash
+# MiniF2F (fetches theorems from GitHub, uses local Lean project for verification)
+python scripts/run_minif2f.py valid --model leanstral --repo-path ./miniF2F --max-time 10m --problem-parallelism 10
+python scripts/run_minif2f.py test  --model leanstral --repo-path ./miniF2F --max-time 10m
+
+# PutnamBench
+python scripts/run_putnam.py --repo-path ./PutnamBench --model opus --max-time 2h --problem-parallelism 4
+
+# Run a single problem
+python scripts/run_minif2f.py valid --problem mathd_algebra_182 --model leanstral --repo-path ./miniF2F
+```
+
+Use `--informal` to skip Lean verification (faster but scores are not meaningful).
+
 ## Planner actions
 
 Each step, the planner chooses one action:
