@@ -17,6 +17,9 @@ from pathlib import Path
 VALID_URL = "https://raw.githubusercontent.com/google-deepmind/miniF2F/refs/heads/main/MiniF2F/Valid.lean"
 TEST_URL = "https://raw.githubusercontent.com/google-deepmind/miniF2F/refs/heads/main/MiniF2F/Test.lean"
 
+CLAUDE_MODELS = {"sonnet", "opus"}
+RATE_LIMIT_WAIT = 600  # seconds to wait before retrying after rate limit
+
 # Preamble that every extracted theorem file needs.
 LEAN_PREAMBLE = """\
 import MiniF2F.ProblemImports
@@ -136,14 +139,37 @@ def _run_openprover(
             cmd.extend(["--provider-url", args.provider_url])
         cmd.append("--isolation" if args.isolation else "--no-isolation")
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        elapsed = time.monotonic() - start
+        # For Claude models: exit on rate limit so the benchmark can retry
+        if used & CLAUDE_MODELS:
+            cmd.extend(["--on-rate-limited", "exit"])
 
-        if result.returncode != 0:
-            err = "\n".join((result.stderr or "unknown").strip().splitlines()[-3:])
-            return {"name": name, "status": "error", "elapsed": elapsed, "error": err}
-        status = "proved" if "[result] proved" in result.stdout else "not_proved"
-        return {"name": name, "status": status, "elapsed": elapsed, "error": ""}
+        # Hard timeout: budget + 2 min grace for final LLM call / Lean check
+        hard_timeout = _parse_duration(args.max_time) + 120
+
+        while True:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=hard_timeout)
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - start
+                return {"name": name, "status": "not_proved", "elapsed": elapsed,
+                        "error": f"hard timeout ({hard_timeout:.0f}s)"}
+
+            elapsed = time.monotonic() - start
+
+            if result.returncode != 0:
+                err = "\n".join((result.stderr or "unknown").strip().splitlines()[-3:])
+                return {"name": name, "status": "error", "elapsed": elapsed, "error": err}
+
+            if "[result] rate_limited" in result.stdout:
+                print(f"  ⏳ {name}: rate limited, waiting {RATE_LIMIT_WAIT // 60}m...",
+                      flush=True)
+                time.sleep(RATE_LIMIT_WAIT)
+                continue  # retry the same problem
+
+            status = "proved" if "[result] proved" in result.stdout else "not_proved"
+            return {"name": name, "status": status, "elapsed": elapsed, "error": ""}
+
     except Exception as e:
         return {"name": name, "status": "error", "elapsed": time.monotonic() - start,
                 "error": str(e)}

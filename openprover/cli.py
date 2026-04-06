@@ -575,4 +575,9 @@ def _cmd_prove():
             print(f"  PROOF.lean → {prover.work_dir / 'PROOF.lean'}")
         print(f"  {prover.work_dir}")
         if args.headless:
-            print(f"[result] {'proved' if has_proof else 'not_proved'}")
+            if has_proof:
+                print("[result] proved")
+            elif prover._spending_limit_hit:
+                print("[result] rate_limited")
+            else:
+                print("[result] not_proved")
