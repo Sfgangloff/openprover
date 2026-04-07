@@ -1,46 +1,36 @@
 #!/usr/bin/env python3
-"""Baseline prover: single conversation with lean_verify tool calling.
+"""Baseline prover: plain conversation, no tools.
 
-The model receives the theorem statement and can call lean_verify as many
-times as it wants within the time budget.  No planner/worker decomposition,
-no repository, no whiteboard — just raw model + verifier.
+The model is asked to write a Lean 4 proof inside <lean>...</lean> tags.
+Each turn we extract the block, run lean_verify, and append the result
+as a follow-up user message.  Loops until the proof verifies or the
+time budget runs out.
 """
 
+import argparse
 import json
 import logging
 import os
 import re
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
-from openprover.lean.core import LeanWorkDir, lean_has_errors, run_lean_check, strip_code_fences
+from openprover.lean.core import LeanWorkDir, lean_has_errors, run_lean_check
+from openprover.llm import MistralClient
 
 logger = logging.getLogger("baseline")
 
-MISTRAL_BASE_URL = "https://api.mistral.ai"
 MISTRAL_MODEL_MAP = {"leanstral": "labs-leanstral-2603"}
 
-LEAN_VERIFY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "lean_verify",
-        "description": "Verify Lean 4 code. Returns compiler output (errors/warnings or OK).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Complete Lean 4 source code to verify.",
-                },
-            },
-            "required": ["code"],
-        },
-    },
-}
+LEAN_TAG_RE = re.compile(r"<lean>\s*\n?(.*?)\n?\s*</lean>", re.DOTALL | re.IGNORECASE)
 
+
+# ── Helpers ──────────────────────────────────────────────────────────
 
 def _parse_duration(s: str) -> float:
-    """Parse a duration string like '10m', '2h', '1h30m' into seconds."""
+    """Parse '10m', '2h', '1h30m' into seconds."""
     total = 0.0
     for match in re.finditer(r"(\d+(?:\.\d+)?)\s*([hms])", s):
         val, unit = float(match.group(1)), match.group(2)
@@ -50,224 +40,54 @@ def _parse_duration(s: str) -> float:
     return total
 
 
-def _lean_verify(code: str, lean_work_dir: LeanWorkDir, lean_project_dir: Path) -> str:
-    """Run lean_verify and return the result string."""
-    code = strip_code_fences(code)
-    if not code:
-        return "Error: no code provided."
-    path = lean_work_dir.make_file("baseline_verify", code)
-    success, feedback, _ = run_lean_check(path, lean_project_dir)
+def _slugify(text: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+    return s[:40] or "theorem"
+
+
+def _extract_lean(text: str) -> str | None:
+    """Pull the contents of the last <lean>...</lean> block from text."""
+    matches = LEAN_TAG_RE.findall(text)
+    return matches[-1].strip() if matches else None
+
+
+def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, str]:
+    """Run lean_verify and return (success, feedback)."""
+    path = work_dir.make_file("baseline_verify", code)
+    success, feedback, _ = run_lean_check(path, project_dir)
     if success:
-        return "OK"
-    if lean_has_errors(feedback):
-        return feedback
-    if "sorry" in feedback.lower():
-        return feedback + "\n\nNote: code contains sorry — proof has gaps."
-    return feedback
+        return True, "OK"
+    if "sorry" in feedback.lower() and not lean_has_errors(feedback):
+        return False, feedback + "\n\nNote: code contains sorry — proof has gaps."
+    return False, feedback
 
 
-def _mistral_request(payload: dict, api_key: str,
-                     conversation_id: str | None = None,
-                     timeout: int = 600) -> dict:
-    """Make a non-streaming request to the Mistral Conversations API."""
-    import urllib.request
+# ── Core loop ────────────────────────────────────────────────────────
 
-    url = f"{MISTRAL_BASE_URL}/v1/conversations"
-    if conversation_id:
-        url = f"{url}/{conversation_id}"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+SYSTEM_PROMPT = """\
+You are a Lean 4 theorem prover. You will be given a theorem statement \
+ending in `sorry` and you must replace `sorry` with a complete proof.
 
+Each time you reply, output the FULL Lean 4 source (imports, opens, and \
+the theorem with your proof) inside a single <lean>...</lean> block. \
+After your reply, the user will run `lake env lean` on your code and \
+report the result. If verification fails, try a different approach.
 
-def _mistral_stream(payload: dict, api_key: str,
-                    conversation_id: str | None = None,
-                    timeout: int = 600,
-                    on_thinking=None, on_text=None) -> dict:
-    """Stream a Mistral Conversations API response via SSE.
+Output ONLY the <lean>...</lean> block (and any short reasoning before \
+it). Do not use markdown code fences inside the tag.\
+"""
 
-    Calls on_thinking(text) and on_text(text) for incremental tokens.
-    Returns a dict shaped like the non-streaming response so that
-    _parse_assistant_output can consume it.
-    """
-    import urllib.request
+INITIAL_USER_MSG = """\
+Prove this theorem. Output the full Lean source inside <lean>...</lean>.
 
-    url = f"{MISTRAL_BASE_URL}/v1/conversations"
-    if conversation_id:
-        url = f"{url}/{conversation_id}"
-    payload = {**payload, "stream": True}
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
+## Informal statement
+{informal}
 
-    thinking_parts: list[str] = []
-    output_parts: list[str] = []
-    tool_call_acc: dict[str, dict] = {}
-    conv_id: str | None = conversation_id
-
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for raw_line in resp:
-            line = raw_line.decode(errors="replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data_str = line[len("data:"):].lstrip()
-            if data_str == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            etype = chunk.get("type", "")
-            if etype == "conversation.response.started":
-                conv_id = chunk.get("conversation_id", conv_id)
-                continue
-            if etype == "function.call.delta":
-                fc_id = chunk.get("id", "")
-                acc = tool_call_acc.setdefault(fc_id, {
-                    "id": fc_id, "tool_call_id": "", "name": "", "arguments": "",
-                })
-                if chunk.get("tool_call_id"):
-                    acc["tool_call_id"] = chunk["tool_call_id"]
-                if chunk.get("name"):
-                    acc["name"] = chunk["name"]
-                acc["arguments"] += chunk.get("arguments", "")
-                continue
-            if etype != "message.output.delta":
-                continue
-
-            content = chunk.get("content", "")
-            if isinstance(content, str):
-                output_parts.append(content)
-                if on_text and content:
-                    on_text(content)
-            elif isinstance(content, dict):
-                ctype = content.get("type", "")
-                if ctype == "thinking":
-                    for part in content.get("thinking", []):
-                        text = part.get("text", "")
-                        if text:
-                            thinking_parts.append(text)
-                            if on_thinking:
-                                on_thinking(text)
-                else:
-                    text = ""
-                    for part in content.get("content", []):
-                        text += part.get("text", "")
-                    if not text:
-                        text = content.get("text", "")
-                    if text:
-                        output_parts.append(text)
-                        if on_text:
-                            on_text(text)
-
-    # Reconstruct a non-streaming-shaped response
-    outputs = []
-    assistant_content: list[dict] = []
-    if thinking_parts:
-        assistant_content.append({
-            "type": "thinking",
-            "thinking": [{"type": "text", "text": "".join(thinking_parts)}],
-        })
-    if output_parts:
-        assistant_content.append({
-            "type": "message.output",
-            "content": [{"type": "text", "text": "".join(output_parts)}],
-        })
-    outputs.append({
-        "role": "assistant",
-        "content": assistant_content if assistant_content else "",
-    })
-    for tc in tool_call_acc.values():
-        outputs.append({
-            "type": "function.call",
-            "id": tc["id"],
-            "tool_call_id": tc["tool_call_id"],
-            "name": tc["name"],
-            "arguments": tc["arguments"],
-        })
-    return {"outputs": outputs, "conversation_id": conv_id}
-
-
-def _parse_assistant_output(raw: dict) -> dict:
-    """Extract text, thinking, and tool_calls from Mistral response.
-
-    The Conversations API returns tool calls as separate output entries
-    with type="function.call", not inside the assistant message.
-    """
-    result_text = ""
-    thinking_text = ""
-    tool_calls = []
-
-    for entry in raw.get("outputs", []):
-        etype = entry.get("type", "")
-
-        # Tool calls are separate entries
-        if etype == "function.call":
-            tool_calls.append({
-                "id": entry.get("id", ""),
-                "tool_call_id": entry.get("tool_call_id", ""),
-                "name": entry.get("name", ""),
-                "arguments": entry.get("arguments", "{}"),
-            })
-            continue
-
-        if entry.get("role") != "assistant":
-            continue
-
-        content = entry.get("content", "")
-        if isinstance(content, str):
-            result_text = content
-        elif isinstance(content, list):
-            thinking_parts = []
-            output_parts = []
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                ptype = part.get("type", "")
-                if ptype == "thinking":
-                    for tp in part.get("thinking", []):
-                        thinking_parts.append(tp.get("text", ""))
-                else:
-                    for cp in part.get("content", []):
-                        output_parts.append(cp.get("text", ""))
-                    if not output_parts and part.get("text"):
-                        output_parts.append(part["text"])
-            result_text = "".join(output_parts)
-            thinking_text = "".join(thinking_parts)
-        reasoning = entry.get("reasoning", "")
-        if reasoning and not thinking_text:
-            thinking_text = reasoning
-
-        # Some responses have tool_calls on the assistant entry too
-        tc = entry.get("tool_calls")
-        if tc:
-            for t in tc:
-                tool_calls.append({
-                    "id": t.get("id", ""),
-                    "tool_call_id": t.get("tool_call_id", t.get("id", "")),
-                    "name": t.get("name", t.get("function", {}).get("name", "")),
-                    "arguments": t.get("arguments", t.get("function", {}).get("arguments", "{}")),
-                })
-
-    return {
-        "text": result_text,
-        "thinking": thinking_text,
-        "tool_calls": tool_calls or None,
-        "conversation_id": raw.get("conversation_id"),
-    }
+## Formal statement
+<lean>
+{formal}
+</lean>
+"""
 
 
 def run_baseline(
@@ -278,48 +98,36 @@ def run_baseline(
     model: str,
     max_time: float,
     run_dir: Path,
-    verbose: bool = False,
     stream: bool = False,
 ) -> dict:
-    """Run the baseline prover on a single problem.
+    """Run the baseline on a single theorem.
 
-    Returns {"status": "proved"|"not_proved"|"error", "elapsed": float,
-             "turns": int, "verifications": int, "error": str}.
+    Returns {"status": ..., "elapsed": ..., "turns": ..., "verifications": ...,
+             "error": ...}.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
-    api_key = os.environ.get("MISTRAL_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "elapsed": 0, "turns": 0,
-                "verifications": 0, "error": "MISTRAL_API_KEY not set"}
-
-    mistral_model = MISTRAL_MODEL_MAP.get(model, model)
-    lean_work_dir = LeanWorkDir(lean_project_dir)
-
-    system_prompt = (
-        "You are a Lean 4 theorem prover. Your goal is to prove the following theorem.\n\n"
-        f"## Informal statement\n{theorem_informal}\n\n"
-        f"## Formal statement (Lean 4)\n```lean\n{theorem_lean}\n```\n\n"
-        "The theorem file already has these imports:\n"
-        "```\nimport MiniF2F.ProblemImports\n"
-        "open scoped Real Nat Topology Polynomial\n```\n\n"
-        "Use the `lean_verify` tool to check your proof attempts. "
-        "Your code should include the full theorem statement with your proof replacing `sorry`. "
-        "Keep trying different approaches if verification fails. "
-        "When verification succeeds (returns OK), you're done."
-    )
-
-    # Save theorem
     (run_dir / "THEOREM.lean").write_text(theorem_lean + "\n")
     if theorem_informal:
         (run_dir / "THEOREM.md").write_text(theorem_informal + "\n")
 
-    # Conversation state
-    conversation_id = None
+    archive_dir = run_dir / "calls"
+    mistral_model = MISTRAL_MODEL_MAP.get(model, model)
+    client = MistralClient(model=mistral_model, archive_dir=archive_dir)
+    work_dir = LeanWorkDir(lean_project_dir)
+
+    initial_user = INITIAL_USER_MSG.format(
+        informal=theorem_informal or "(none provided)",
+        formal=theorem_lean,
+    )
+
+    # Conversation as a single accumulated user prompt (we restart the
+    # context each turn — no tool/function machinery, no API state).
+    transcript: list[str] = [initial_user]
+    log_lines: list[str] = []
     turns = 0
     verifications = 0
     proved = False
     start = time.monotonic()
-    log_lines: list[str] = []
 
     def log(msg: str):
         log_lines.append(msg)
@@ -327,147 +135,79 @@ def run_baseline(
 
     log(f"starting (model={model}, budget={max_time:.0f}s)")
 
+    # Streaming callback (used by MistralClient if stream=True)
+    dim = "\033[2m" if sys.stdout.isatty() else ""
+    reset = "\033[0m" if sys.stdout.isatty() else ""
+    state = {"in_thinking": False}
+
+    def stream_cb(text: str, kind: str):
+        if kind == "thinking":
+            if not state["in_thinking"]:
+                sys.stdout.write(dim)
+                state["in_thinking"] = True
+        else:
+            if state["in_thinking"]:
+                sys.stdout.write(reset)
+                state["in_thinking"] = False
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
     try:
         while True:
             elapsed = time.monotonic() - start
-            remaining = max_time - elapsed
-            if remaining <= 0:
-                log(f"time budget exhausted after {turns} turns, {verifications} verifications")
+            if elapsed >= max_time:
+                log(f"time budget exhausted after {turns} turns, "
+                    f"{verifications} verifications")
                 break
 
             turns += 1
+            prompt = "\n\n".join(transcript)
 
-            # Build request
-            if conversation_id is None:
-                # First turn
-                payload = {
-                    "model": mistral_model,
-                    "inputs": [{"role": "user", "content": "Prove the theorem. Use lean_verify to check your proof."}],
-                    "instructions": system_prompt,
-                    "tools": [LEAN_VERIFY_TOOL],
-                    "stream": False,
-                    "completion_args": {
-                        "temperature": 1.0,
-                        "max_tokens": 256_000,
-                        "top_p": 1,
-                        "reasoning_effort": "high",
-                    },
-                }
-            else:
-                # Continuation: send tool results
-                payload = {
-                    "inputs": pending_inputs,
-                    "stream": False,
-                    "completion_args": {
-                        "temperature": 1.0,
-                        "max_tokens": 256_000,
-                        "top_p": 1,
-                        "reasoning_effort": "high",
-                    },
-                }
-
-            # Call API
-            timeout = max(int(remaining) + 30, 60)
             if stream:
-                import sys
-                dim = "\033[2m" if sys.stdout.isatty() else ""
-                reset = "\033[0m" if sys.stdout.isatty() else ""
-                state = {"in_thinking": False, "started": False}
-
-                def _hdr():
-                    if not state["started"]:
-                        print(f"\n  ─── turn {turns} ───", flush=True)
-                        state["started"] = True
-
-                def on_thinking(text: str):
-                    _hdr()
-                    if not state["in_thinking"]:
-                        sys.stdout.write(dim)
-                        state["in_thinking"] = True
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-
-                def on_text(text: str):
-                    _hdr()
-                    if state["in_thinking"]:
-                        sys.stdout.write(reset)
-                        state["in_thinking"] = False
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-
-                raw = _mistral_stream(payload, api_key,
-                                      conversation_id=conversation_id,
-                                      timeout=timeout,
-                                      on_thinking=on_thinking, on_text=on_text)
+                print(f"\n  ─── turn {turns} ───", flush=True)
+                resp = client.call(prompt=prompt, system_prompt=SYSTEM_PROMPT,
+                                   stream_callback=stream_cb,
+                                   label=f"baseline-{name}-t{turns}")
                 if state["in_thinking"]:
                     sys.stdout.write(reset)
-                if state["started"]:
-                    print(flush=True)
+                    state["in_thinking"] = False
+                print(flush=True)
             else:
-                raw = _mistral_request(payload, api_key,
-                                       conversation_id=conversation_id,
-                                       timeout=timeout)
-            conversation_id = raw.get("conversation_id", conversation_id)
-            parsed = _parse_assistant_output(raw)
+                resp = client.call(prompt=prompt, system_prompt=SYSTEM_PROMPT,
+                                   label=f"baseline-{name}-t{turns}")
 
-            # Archive raw response
-            (run_dir / f"turn_{turns:03d}.json").write_text(
-                json.dumps(raw, indent=2, ensure_ascii=False))
+            assistant_text = resp.get("result", "") or ""
+            (run_dir / f"turn_{turns:03d}.txt").write_text(assistant_text + "\n")
 
-            if parsed["text"]:
-                log(f"turn {turns}: {parsed['text'][:120]}...")
-
-            if not parsed["tool_calls"]:
-                if proved:
-                    break
-                # Model didn't call a tool — restart conversation with
-                # stronger nudge (Conversations API doesn't allow user
-                # messages after thinking-only output).
-                log(f"turn {turns}: no tool call, restarting conversation")
-                conversation_id = None
+            code = _extract_lean(assistant_text)
+            if not code:
+                log(f"turn {turns}: no <lean> block found")
+                transcript.append(
+                    f"# Assistant turn {turns}\n{assistant_text}\n\n"
+                    "# User\nYour reply did not contain a <lean>...</lean> "
+                    "block. Please output the full Lean source inside "
+                    "<lean>...</lean>."
+                )
                 continue
 
-            # Process tool calls
-            pending_inputs = []
-            for tc in parsed["tool_calls"]:
-                tc_id = tc.get("tool_call_id") or tc.get("id", "")
-                fn_name = tc.get("name", "")
-                fn_args_raw = tc.get("arguments", "{}")
-                if isinstance(fn_args_raw, str):
-                    try:
-                        fn_args = json.loads(fn_args_raw)
-                    except json.JSONDecodeError:
-                        fn_args = {"code": fn_args_raw}
-                else:
-                    fn_args = fn_args_raw
+            verifications += 1
+            success, feedback = _verify(code, work_dir, lean_project_dir)
+            status_short = "OK" if success else "error"
+            log(f"turn {turns}: lean_verify #{verifications} -> {status_short}")
 
-                if fn_name == "lean_verify":
-                    verifications += 1
-                    code = fn_args.get("code", "")
-                    result = _lean_verify(code, lean_work_dir, lean_project_dir)
-                    status_short = "OK" if result == "OK" else "error"
-                    log(f"turn {turns}: lean_verify #{verifications} -> {status_short}")
-
-                    if result == "OK":
-                        proved = True
-                        (run_dir / "PROOF.lean").write_text(code + "\n")
-
-                    pending_inputs.append({
-                        "tool_call_id": tc_id,
-                        "result": result,
-                        "type": "function.result",
-                    })
-                else:
-                    pending_inputs.append({
-                        "tool_call_id": tc_id,
-                        "result": f"Unknown tool: {fn_name}",
-                        "type": "function.result",
-                    })
-
-            if proved:
+            if success:
+                proved = True
+                (run_dir / "PROOF.lean").write_text(code + "\n")
                 log(f"PROVED in {turns} turns, {verifications} verifications, "
                     f"{time.monotonic() - start:.0f}s")
                 break
+
+            transcript.append(
+                f"# Assistant turn {turns}\n{assistant_text}\n\n"
+                f"# User\nlean_verify failed:\n```\n{feedback}\n```\n"
+                "Try again. Output the full Lean source inside "
+                "<lean>...</lean>."
+            )
 
     except Exception as e:
         elapsed = time.monotonic() - start
@@ -490,21 +230,13 @@ def run_baseline(
 
 # ── CLI ──────────────────────────────────────────────────────────────
 
-def _slugify(text: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
-    return s[:40] or "theorem"
-
-
 def _main():
-    import argparse
-    from datetime import datetime
-
     parser = argparse.ArgumentParser(
         prog="baseline",
-        description="Baseline prover: single conversation with lean_verify",
+        description="Baseline Lean prover: single conversation, no tools",
     )
     parser.add_argument("run_dir", nargs="?",
-                        help="Working directory (auto-created if omitted)")
+                        help="Working directory (auto-created under runs/ if omitted)")
     parser.add_argument("--theorem", type=Path, metavar="FILE",
                         help="Path to informal theorem statement (.md)")
     parser.add_argument("--lean-theorem", type=Path, metavar="FILE", required=True,
@@ -513,9 +245,7 @@ def _main():
                         help="Path to Lean project with built .lake (lake build first)")
     parser.add_argument("--model", default="leanstral",
                         help="Model name (default: leanstral)")
-
-    budget = parser.add_mutually_exclusive_group()
-    budget.add_argument("--max-time", default="10m", metavar="DURATION",
+    parser.add_argument("--max-time", default="10m", metavar="DURATION",
                         help="Wall-clock budget per problem (default: 10m)")
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                         default=False,
@@ -523,7 +253,6 @@ def _main():
                              "(thinking shown dimmed)")
     args = parser.parse_args()
 
-    # Validate inputs
     if not args.lean_theorem.is_file():
         parser.error(f"--lean-theorem not found: {args.lean_theorem}")
     if not args.lean_project.is_dir():
@@ -536,11 +265,9 @@ def _main():
     theorem_lean = args.lean_theorem.read_text()
     theorem_informal = args.theorem.read_text() if args.theorem else ""
 
-    # Theorem name: extract from `theorem NAME ...` in the lean file
     name_match = re.search(r"^theorem\s+(\S+)", theorem_lean, re.MULTILINE)
     name = name_match.group(1) if name_match else args.lean_theorem.stem
 
-    # Resolve run_dir (auto-create if not provided)
     if args.run_dir:
         run_dir = Path(args.run_dir)
     else:
