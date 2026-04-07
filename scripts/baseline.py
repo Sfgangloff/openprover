@@ -56,6 +56,29 @@ def _extract_lean_blocks(text: str) -> list[str]:
     return [m.strip() for m in LEAN_FENCE_RE.findall(text)]
 
 
+def _sorry_column(raw_text: str, sorry_start: int) -> int:
+    """Return the column (number of chars between start of line and `sorry`)."""
+    line_start = raw_text.rfind("\n", 0, sorry_start) + 1
+    return sorry_start - line_start
+
+
+def _reindent(replacement: str, column: int) -> str:
+    """Re-indent a multi-line proof body so subsequent lines match `column`.
+
+    The first line replaces `sorry` directly and inherits whatever indent
+    was already on that line, so we leave it alone. Every following line
+    gets `column` spaces prepended (blank lines are left empty).
+    """
+    lines = replacement.splitlines()
+    if len(lines) <= 1:
+        return replacement
+    pad = " " * column
+    out = [lines[0]]
+    for line in lines[1:]:
+        out.append(pad + line if line.strip() else line)
+    return "\n".join(out)
+
+
 def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, str]:
     """Run lean_verify and return (success, feedback)."""
     path = work_dir.make_file("baseline_verify", code)
@@ -363,10 +386,19 @@ def run_baseline(
                 )
                 continue
 
+            # Re-indent each replacement so multi-line proof bodies sit
+            # under the column where `sorry` appeared. Without this, only
+            # the first line inherits the existing indent and Lean closes
+            # the `by` block at the next line that starts at column 0.
+            indented_replacements = [
+                _reindent(rep, _sorry_column(parsed.raw_text, start))
+                for rep, (start, _) in zip(replacements, parsed.sorry_positions)
+            ]
+
             # Splice into the original theorem. assemble_proof rejects
             # banned constructs (sorry, axiom, import, ...).
             try:
-                full_code = parsed.assemble_proof(replacements)
+                full_code = parsed.assemble_proof(indented_replacements)
             except ValueError as e:
                 log(f"turn {turns}: assembly rejected: {e}")
                 turn_outcome["outcome"] = "rejected"
