@@ -209,7 +209,9 @@ def run_baseline(
 
             code = _extract_lean(assistant_text)
             if not code:
-                log(f"turn {turns}: no ```lean block found")
+                log(f"turn {turns}: no ```lean block found "
+                    f"(reply: {len(assistant_text)} chars, "
+                    f"{turn_tokens} tokens)")
                 transcript.append(
                     f"# Assistant turn {turns}\n{assistant_text}\n\n"
                     "# User\nYour reply did not contain a ```lean ... ``` "
@@ -219,16 +221,31 @@ def run_baseline(
                 continue
 
             verifications += 1
+            log(f"turn {turns}: verifying ({len(code)} chars, "
+                f"{turn_tokens} tokens this turn, {tokens} total)")
+            verify_start = time.monotonic()
             success, feedback = _verify(code, work_dir, lean_project_dir)
-            status_short = "OK" if success else "error"
-            log(f"turn {turns}: lean_verify #{verifications} -> {status_short}")
+            verify_secs = time.monotonic() - verify_start
 
             if success:
                 proved = True
                 (run_dir / "PROOF.lean").write_text(code + "\n")
+                log(f"turn {turns}: lean_verify #{verifications} -> OK "
+                    f"({verify_secs:.1f}s)")
                 log(f"PROVED in {turns} turns, {verifications} verifications, "
                     f"{tokens} tokens, {time.monotonic() - start:.0f}s")
                 break
+
+            log(f"turn {turns}: lean_verify #{verifications} -> failed "
+                f"({verify_secs:.1f}s)")
+            if stream:
+                # Show the compiler feedback in interactive mode so the user
+                # can follow along.
+                preview = feedback.strip()
+                if len(preview) > 1500:
+                    preview = preview[:1500] + "\n  ... (truncated)"
+                for line in preview.splitlines():
+                    print(f"  │ {line}", flush=True)
 
             transcript.append(
                 f"# Assistant turn {turns}\n{assistant_text}\n\n"
