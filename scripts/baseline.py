@@ -209,12 +209,15 @@ def run_baseline(
     max_time: float | None = None,
     max_tokens: int | None = None,
     stream: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Run the baseline on a single theorem.
 
     Exactly one of max_time (seconds) or max_tokens (completion tokens)
-    must be set. Returns {"status", "elapsed", "turns", "verifications",
-    "tokens", "error"}.
+    must be set. When quiet=True, per-turn progress is only written to
+    log.txt (not stdout) — used by the benchmark harness which prints
+    its own one-line-per-problem summary. Returns
+    {"status", "elapsed", "turns", "verifications", "tokens", "error"}.
     """
     if (max_time is None) == (max_tokens is None):
         raise ValueError("specify exactly one of max_time or max_tokens")
@@ -270,7 +273,8 @@ def run_baseline(
 
     def log(msg: str):
         log_lines.append(msg)
-        print(f"  [{name}] {msg}", flush=True)
+        if not quiet:
+            print(f"  [{name}] {msg}", flush=True)
 
     budget_str = (f"{max_time:.0f}s" if max_time is not None
                   else f"{max_tokens} tokens")

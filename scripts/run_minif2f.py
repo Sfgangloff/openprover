@@ -215,6 +215,7 @@ def _run_baseline(
         max_time=max_time,
         max_tokens=max_tokens,
         run_dir=run_dir,
+        quiet=True,
     )
     return {
         "name": name,
