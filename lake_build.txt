@@ -1,1 +1,0 @@
-LEAN_ARGS="--threads=1" taskset -c 0-3 lake build
