@@ -1,0 +1,276 @@
+- ResearchStep dataset
+- maybe we can try using QED-Nano? If this worked, that would be very cool.
+- integration with tools like blueprint or Corca
+- use the Reasoning Cache (RT) idea (https://arxiv.org/abs/2602.03773) - similarly to QED-Nano
+- add a mode where OpenProver also tries to 1) simplify the final proof or make it nicer and 2) generalize the proof
+
+- use LeanExplore (https://github.com/justincasher/lean-explore) during autoformalization.
+  Instruct the agent to search at most once for each thing (we don't want to get stuck on the searching).
+
+
+ideas:
+- single compact whiteboard state (isn't it like recursive LLMs?)
+  - contains e.g. the current plan
+- repository of subresults, notes, results, observations, etc.
+  - each is a single file
+  - also brief, but containing everything that could be useful/interesting
+  - each has a single-sentence summary (given to agent input)
+- decomposition into just two levels (a la Kimi K2.5 or Cursor's web browser development): planner and worker
+  - other structure is emergent
+- workflow:
+  - planner thinks about the problem, creates tasks
+    - possible tasks: attempt proof of theorem (given a specific direction),
+    attempt proof of a variation of theorem, repair proof (given proof and
+    feedback), verify proof (give feedback; errors can be of two types: either
+    recoverable or fatal), literature search
+    - tasks are sorted
+    - usually, you first want to do literature search
+  - tasks are taken in batches of P (for now, we use no parallelization, ie P=1)
+  - worker reports back a report of progress
+    - can contain a proof, an observation, description of what failed, useful
+    identified or even proven lemma, literature review, etc. (whatever is
+    relevant as the worker's output - leaves space for automatic prompt optimization)
+- every proof (including proof of lemmas) is independently verified
+- we want to use formal verification (Lean) - but not for proof search
+  -> synthesis of formal methods (AlphaProof) and informal methods (Aletheia)
+
+----------
+
+We now need to integrate Lean verification into the process. We need to add
+support for the case where the theorem to be proven is formalized in Lean, and thus the proof can be verified automatically.
+Also, let's add a mode where the goal is only to formalize a proof from natural language to Lean.
+The goal is to provide tighter feedback signal for both the agent and us - Lean gives us the ability to automatically determine whether the proof is correct.
+
+Please inspect the current code base and help me think about this feature.
+
+Lean statement file can look something like this:
+
+(THEOREM.lean)
+```
+import Mathlib
+
+open MeasureTheory Set
+
+abbrev putnam_1962_a2_solution : Set (ℝ → ℝ) := sorry
+-- {f | (∃ a c : ℝ, 0 ≤ a ∧ f = (fun x : ℝ ↦ a / (1 - c * x) ^ 2)) ∨ (∃ a c : ℝ, 0 ≤ a ∧ 0 < c ∧ f = (fun x : ℝ ↦ if x < 1 / c then a / (1 - c * x) ^ 2 else 0)) ∨ (0 ≤ f ∧ ∀ x : ℝ, 0 < x → f x = 0) ∨ (∃ e : ℝ, 0 < e ∧ f 0 = 0 ∧ 0 ≤ f ∧ ∀ x ∈ Ioo (0 : ℝ) e, (⨍ t in Ico (0 : ℝ) x, f t) = 0)}
+/--
+Find every real-valued function $f$ whose domain is an interval $I$ (finite or infinite) having 0 as a left-hand endpoint, such that for every positive member $x$ of $I$ the average of $f$ over the closed interval $[0, x]$ is equal to the geometric mean of the numbers $f(0)$ and $f(x)$.
+-/
+theorem putnam_1962_a2
+    (P : Set ℝ → (ℝ → ℝ) → Prop)
+    (P_def : ∀ s f, P s f ↔ 0 ≤ f ∧ ∀ x ∈ s, ⨍ t in Ico 0 x, f t = √(f 0 * f x)) :
+    (∀ f,
+      (P (Ioi 0) f → ∃ g ∈ putnam_1962_a2_solution, EqOn f g (Ici 0)) ∧
+      (∀ e > 0, P (Ioo 0 e) f → ∃ g ∈ putnam_1962_a2_solution, EqOn f g (Ico 0 e))) ∧
+    ∀ f ∈ putnam_1962_a2_solution, P (Ioi 0) f ∨ (∃ e > 0, P (Ioo 0 e) f) :=
+  sorry
+```
+
+In order to prove this theorem, all `sorry` keywords have to be replaced with Lean code (and the rest of the file mustn't change), and Lean verification must succeeed on it.
+To get Lean verification, simply go to Lean project dir and run `lake env lean <file>.lean`. Let's have argparse arguments --lean-project-dir and --repl-dir
+Place all the generated files in a subdir "OpenProver-{random_id_length_8}
+Name the files somehow nicely, but also with a random suffix (the base should correspond to the item slug or "proof" for the final proof).
+When the lean command doesn't output anything, the proof is valid. Otherwise, its not (look at stdout for feedback)
+
+When writing items (write_items action), the planner can specify whether the output is markdown or lean.
+When it's lean, the Lean verification will automatically run on it. The output of the write_items (that what is provided as output to the planner) will then include the feedback from Lean (for each formal item written).
+
+Add action submit_lean_proof. When executing it, the planner has to specify n Lean blocks corresponding to the n `sorry` keywords in the formal theorem.
+Actually, it can also provide a context block which will be placed right below the import/open commands specified in the original file. Enforce that no `import` commands are performed by the new injected code (that would be cheating).
+The completed file (with sorries replaced) will then be automatically verified in Lean.
+If the verification is successful, PROOF.lean will be written and the search is done.
+If unsuccessful, the Lean feedback will be provided back to the planner.
+
+I think we should also add read_theorem action, which will provide both the natural language THEOREM.md content and the THEOREM.lean content (if it exists) to the planner.
+
+THEOREM.md must be specified. If THEOREM.lean is specified, we want to output formal proof (and also informal proof).
+When PROOF.md is also specified, we only want to formalize it (ie produce PROOF.lean)
+Note that PROOF.lean contains the same stuff as THEOREM.lean, but with all the sorry keywords replaced.
+
+Also, make it so that the planner sees the last 3 outputs instead of just the last one.
+
+
+
+----------
+
+We now need to integrate Lean verification into the process. We need to add
+support for the case where the theorem to be proven is formalized in Lean.
+Also, let's add a mode where the goal is only to formalize a theorem, not to prove it.
+
+First let's describe the autoformalization mode. The user will run something
+like `openprover formalize theorem.md`.  You can also say `prove` instead of
+`formalize`, but `prove` is implicit if no action is given.  I think the only
+change in formalize mode from proof mode is a bit different prompt for the
+planner (saying that the goal is to formalize, not to prove).  Also, in the
+formalize mode, the planner will be hardcoded to, as the first action, spawn one
+worker whose task is simply "Formalize this and that in Lean, output only the
+Lean code."
+
+
+Enforce that the input file is either .md or .lean. When .lean, our goal will be
+to generate both PROOF.lean and PROOF.md. The resulting lean file (if produced)
+must be a valid Lean file with all `sorry` keywords replaced (and nothing else
+changed - think of a way to check that).  Let's use
+https://github.com/oOo0oOo/lean-lsp-mcp - research how it works. We'll only use
+the lean_diagnostic_messages (Lean file execution + feedback) and lean_verify (check theorem soundness) actions.  Proof search
+should be done purely in natural language, as it is now. Lean should only be
+used for autoformalization to verify the final proof. To autoformalize something
+should be another type of thing that the planner can task a worker to do. Also,
+make it so that if the run dir already contains PROOF.md, and it also contains
+THEOREM.lean (THEOREM.md is mandatory), the planner will just ask a worker to
+formalize the proof.
+
+To enable a worker to formalize a proof (which might require multiple steps), we
+need to allow workers to do more than one steps. Right now, worker simply does
+reasoning+output and finishes (directly submits the output to planner). Instead,
+the `formalize` action should have a budget of 
+
+----------
+
+Let's completely rethink the high-level approach of OpenProver.
+
+There should be two logical components: planner (single) and worker (possibly
+multiple - spawned by the planner for a specific task, alive only for that
+specific task). All other structure will be emergent.
+On the global, planner level, there is:
+- whiteboard - a compact state containing everything necessary, summarized briefly; current version written in WHITEBOARD.md
+- repository of other things that are useful and should not be written directly on the whiteboard
+  - each thing is e.g. lemma, observation, failed proof attempt description, compilation of literature on some topic, etc.
+  - each thing is a single .md file in the repo/ subfolder
+  - each thing should only contain the relevant / interesting text
+  - only relevant / interesting items should be stored! We have limited space.
+  - each thing also has a one-sentence summary at the top (just "Summary: ...\n\n")
+- Planner proceeds in steps
+  - step input: whiteboard + list of summaries of all things (with names) + (if not
+  at first step) output of the previous step + level of parallelism P (for now,
+  let's use P=1 in argparse)
+  - types of steps: proof_found, give_up, read_items, write_item, spawn
+  - proof_found and give_up are clear
+  - read_items retrieves a list of repository items (ie their contents) based on their names
+  - write_item writes (or updates) a repository item given name and content; if the content is equal to "null", the item will be deleted
+  - spawn says what tasks to run (ie delegate to spawned workers) (only the first P tasks will be executed,
+  other will be discarded -> the planner should output at most P tasks)
+    - it's OK to run only one parallel task, but you can also have more
+    - example of tasks:
+      - run literature search
+      - planner has identified 3 possible paths toward proof -> run them in
+      parallel (or if they don't fit into P, run only some of them and write
+      others on the whiteboard)
+      - there is a proof -> verify it (each proof, even that of lemmas, should be independently verified at least once)
+        - on error, the verification should either output what is wrong, or say that it's wrong beyond repair
+      - there is a proof and feedback from verifier which says that there are some things that could be corrected -> refine it
+        - after repairing, the proof should be verified again
+      - etc.
+    - task assignment format: whatever - just the task description, with everything the worker needs to know
+      - the worker will only see the description + repository items that are referenced from the description
+      - repository items can be referenced simply by their name (which is the
+      part before the .md in the filename) anytime in the text using
+      wikilink-style links, ie "[[item-slug]]"
+    - output of that step is the concatenation of outputs of all workers run in the step
+- Worker:
+  - input: task (assigned by the planner)
+  - output: whatever is the relevant result
+    - can also include other relevant / interesting observations, notes, lemmas (potentially with
+    proofs), etc. - it's solely the decision of the planner whether it will choose to write
+    them to the repository (only write truly relevant / useful / interesting stuff)
+  - worker does not decompose into more "steps" - it's only one step (reasoning + output)
+- use useful stuff that is already in the current codebase
+  - e.g. instruct the planner that when stuck, it's useful to prove a variation / simplification of the theorem
+
+The basic UI shape is nice, we can build on top of it. However, we need a way to
+switch between the different workers. Create a system of tabs - one for
+coordinator, others for workers. Allow simple switching between them. When going
+back in history in the coordinator tab, the worker tabs should show the workers
+that were employed in that step (even though now they are finished - that should
+be indicated). This allows inspection of the whole history.
+
+Feel free to push back in any way. We need to keep it simple.
+
+
+
+---------
+
+- don't use JSON - use e.g. TOML (simpler format)
+- planner schema:
+  - aren't the thinking and summary outputs redundant?
+  - the web_search field is weird. Instead, in offline/isolation mode, we simply ban the literature search action. No other action then literature search is allowed to use web search
+- to be clear, proof_found should only be called when the planner is sure that the final proof is correct; and this action terminates openprover
+
+
+
+------
+
+To get Lean verification, use lean-repl. Let's have argparse arguments --project-dir and --repl-dir
+In work dir=project-dir, run `lake env <repl-dir/.lake/build/bin/repl>`
+The REPL accepts commands, use "\n\n" after each command. When first starting the REPL (only when in formal mode), look at the import commands in THEOREM.lean and execute them as the first REPL command:
+
+{"cmd" : "import X\nimportY\nimport Z"}
+
+Output of the REPL will be:
+
+{"env": 0}
+
+After that, run each snippet as:
+
+{"cmd": "lean code", "env": 0}
+
+Example output:
+
+```
+{"sorries":
+ [{"pos": {"line": 1, "column": 18},
+   "endPos": {"line": 1, "column": 23},
+   "goal": "⊢ Nat",
+   "proofState": 0}],
+ "messages":
+ [{"severity": "error",
+   "pos": {"line": 1, "column": 23},
+   "endPos": {"line": 1, "column": 26},
+   "data":
+   "type mismatch\n  rfl\nhas type\n  f = f : Prop\nbut is expected to have type\n  f = 2 : Prop"}],
+ "env": 6}
+```
+
+Look at the sorries and messages.
+
+When the REPL terminates, print a warning and restart it (for up to 3 times - then terminate the proof search).
+
+------
+
+
+In openarxiv/, implement a script for obtaining open research theorems from
+combinatorics from ArXiv.
+
+- download papers from combinatorics section, starting from the newest
+
+- when downloading a paper, create a subdir for it, and to it: the source code
+(from https://arxiv.org/e-print/<arxiv_id>, then extracted with the original
+archive removed), metadata (a TOML file)
+
+- create an LLM prompt by concatenating all the files, also specifying the paths
+(take inspiration from https://pypi.org/project/repo-to-prompt/, but do it
+yourself - it's easy). And ask the LLM to parse out and output all open problems
+introduced (and not solved) in the paper.
+
+- for each open problem, we need: name, id (generated automatically as a slug of
+the name), summary (short TLDR - max 1-2 sentences, very compact brief
+language), statement (full LaTex statement from the paper), context (all
+relevant context from the paper needed to understand the statement - only from
+the paper, not from other papers), references (list of references, each one has
+a tag and the string), images (just list of names).  Both the statement and the
+context can contain the references and images (with \cite(p|t) or
+\includegraphics) (but only include truly relevant references and images). Each
+reference/image mentioned in the context or statement has to be included in the
+list. Clean up all latex code to be standalone. It's OK for a paper to not
+contain any open problem, or to contain more than one.
+
+- if possible, use some simple format like TOML on the LLM output
+
+- store the prompt in the paper directory so that I can inspect it
+
+- use openrouter to call the LLM to extract the open problems
+
+- store the open problems in the paper subdir, in problems/ subdir, one per file
+
+- it should be a single script using argparse. It should have actions for
+starting papers download, for extracting problems from a single paper, and for running the extraction for all downloaded papers

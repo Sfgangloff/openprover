@@ -1,0 +1,170 @@
+.paper-detail-empty {
+  color: var(--color-text-muted);
+  text-align: center;
+  padding: var(--space-xl) 0;
+}
+
+.paper-detail-title {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: var(--space-md);
+  line-height: 1.35;
+}
+
+.paper-detail-meta {
+  margin-bottom: var(--space-lg);
+}
+
+.paper-detail-authors {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-xs);
+}
+
+.paper-detail-info {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.paper-detail-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  background: var(--color-tag-bg);
+  color: var(--color-tag);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.paper-detail-pdf {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.paper-detail-arxiv {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Abstract */
+
+.paper-detail-abstract {
+  margin-bottom: var(--space-lg);
+}
+
+.paper-detail-abstract h2 {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-sm);
+}
+
+.paper-detail-abstract p {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-md) var(--space-lg);
+  line-height: 1.7;
+  margin: 0;
+}
+
+/* Extraction info */
+
+.paper-detail-extraction {
+  margin-bottom: var(--space-lg);
+}
+
+.extraction-info {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.extraction-model {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--color-accent-light);
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+
+/* Problems */
+
+.paper-detail-problems h2 {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.paper-detail-problem-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  background: var(--color-accent);
+  color: white;
+  border-radius: 11px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 6px;
+}
+
+.paper-detail-problem-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.paper-detail-problem-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-md) var(--space-lg);
+}
+
+.paper-detail-problem-card h3 {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: var(--space-xs);
+}
+
+.paper-detail-problem-card h3 a {
+  color: var(--color-text);
+}
+.paper-detail-problem-card h3 a:hover {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.paper-detail-problem-loc {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-xs);
+}
+
+.paper-detail-problem-summary {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+
+.paper-detail-no-problems {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
