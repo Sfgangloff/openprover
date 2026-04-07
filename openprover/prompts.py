@@ -912,6 +912,16 @@ def parse_planner_toml(text: str) -> list[dict] | ParseError | None:
                 f"Valid actions: {', '.join(ACTIONS)}."
             )
         if action == "spawn":
+            # Normalize tasks to a list of dicts. The model can write
+            # `tasks = ["foo", "bar"]` (parsed as a list of strings) or
+            # `[[tasks]] description = "..."` (parsed as a list of dicts);
+            # downstream code assumes dicts.
+            raw_tasks = parsed.get("tasks", [])
+            if isinstance(raw_tasks, list):
+                parsed["tasks"] = [
+                    t if isinstance(t, dict) else {"description": str(t)}
+                    for t in raw_tasks
+                ]
             spawn_count += 1
             if spawn_count > 1:
                 return ParseError(
