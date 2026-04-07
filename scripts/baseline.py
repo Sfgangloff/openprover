@@ -96,15 +96,20 @@ def run_baseline(
     theorem_informal: str,
     lean_project_dir: Path,
     model: str,
-    max_time: float,
     run_dir: Path,
+    max_time: float | None = None,
+    max_tokens: int | None = None,
     stream: bool = False,
 ) -> dict:
     """Run the baseline on a single theorem.
 
-    Returns {"status": ..., "elapsed": ..., "turns": ..., "verifications": ...,
-             "error": ...}.
+    Exactly one of max_time (seconds) or max_tokens (completion tokens)
+    must be set. Returns {"status", "elapsed", "turns", "verifications",
+    "tokens", "error"}.
     """
+    if (max_time is None) == (max_tokens is None):
+        raise ValueError("specify exactly one of max_time or max_tokens")
+
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "THEOREM.lean").write_text(theorem_lean + "\n")
     if theorem_informal:
@@ -126,6 +131,7 @@ def run_baseline(
     log_lines: list[str] = []
     turns = 0
     verifications = 0
+    tokens = 0
     proved = False
     start = time.monotonic()
 
@@ -133,7 +139,9 @@ def run_baseline(
         log_lines.append(msg)
         print(f"  [{name}] {msg}", flush=True)
 
-    log(f"starting (model={model}, budget={max_time:.0f}s)")
+    budget_str = (f"{max_time:.0f}s" if max_time is not None
+                  else f"{max_tokens} tokens")
+    log(f"starting (model={model}, budget={budget_str})")
 
     # Streaming callback (used by MistralClient if stream=True)
     dim = "\033[2m" if sys.stdout.isatty() else ""
@@ -155,9 +163,13 @@ def run_baseline(
     try:
         while True:
             elapsed = time.monotonic() - start
-            if elapsed >= max_time:
+            if max_time is not None and elapsed >= max_time:
                 log(f"time budget exhausted after {turns} turns, "
-                    f"{verifications} verifications")
+                    f"{verifications} verifications, {tokens} tokens")
+                break
+            if max_tokens is not None and tokens >= max_tokens:
+                log(f"token budget exhausted after {turns} turns, "
+                    f"{verifications} verifications, {tokens} tokens")
                 break
 
             turns += 1
@@ -177,7 +189,17 @@ def run_baseline(
                                    label=f"baseline-{name}-t{turns}")
 
             assistant_text = resp.get("result", "") or ""
+            thinking_text = resp.get("thinking", "") or ""
             (run_dir / f"turn_{turns:03d}.txt").write_text(assistant_text + "\n")
+
+            # Track completion tokens (use API usage if available, else
+            # approximate via char count / 4 — works for streaming path
+            # which doesn't expose usage).
+            usage = (resp.get("raw") or {}).get("usage") or {}
+            turn_tokens = usage.get("completion_tokens")
+            if turn_tokens is None:
+                turn_tokens = (len(assistant_text) + len(thinking_text)) // 4
+            tokens += turn_tokens
 
             code = _extract_lean(assistant_text)
             if not code:
@@ -199,7 +221,7 @@ def run_baseline(
                 proved = True
                 (run_dir / "PROOF.lean").write_text(code + "\n")
                 log(f"PROVED in {turns} turns, {verifications} verifications, "
-                    f"{time.monotonic() - start:.0f}s")
+                    f"{tokens} tokens, {time.monotonic() - start:.0f}s")
                 break
 
             transcript.append(
@@ -214,18 +236,18 @@ def run_baseline(
         log(f"error: {e}")
         (run_dir / "log.txt").write_text("\n".join(log_lines) + "\n")
         return {"status": "error", "elapsed": elapsed, "turns": turns,
-                "verifications": verifications, "error": str(e)}
+                "verifications": verifications, "tokens": tokens, "error": str(e)}
 
     elapsed = time.monotonic() - start
     status = "proved" if proved else "not_proved"
     (run_dir / "log.txt").write_text("\n".join(log_lines) + "\n")
     (run_dir / "result.json").write_text(json.dumps({
         "name": name, "status": status, "elapsed": elapsed,
-        "turns": turns, "verifications": verifications,
+        "turns": turns, "verifications": verifications, "tokens": tokens,
     }, indent=2) + "\n")
 
     return {"status": status, "elapsed": elapsed, "turns": turns,
-            "verifications": verifications, "error": ""}
+            "verifications": verifications, "tokens": tokens, "error": ""}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
@@ -245,13 +267,19 @@ def _main():
                         help="Path to Lean project with built .lake (lake build first)")
     parser.add_argument("--model", default="leanstral",
                         help="Model name (default: leanstral)")
-    parser.add_argument("--max-time", default="10m", metavar="DURATION",
-                        help="Wall-clock budget per problem (default: 10m)")
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--max-time", default=None, metavar="DURATION",
+                        help="Wall-clock budget per problem (e.g. '10m', '2h')")
+    budget.add_argument("--max-tokens", type=int, default=None, metavar="N",
+                        help="Output token budget per problem")
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Stream model output to console "
                              "(thinking shown dimmed)")
     args = parser.parse_args()
+
+    if args.max_time is None and args.max_tokens is None:
+        args.max_time = "10m"  # default
 
     if not args.lean_theorem.is_file():
         parser.error(f"--lean-theorem not found: {args.lean_theorem}")
@@ -278,11 +306,14 @@ def _main():
             counter += 1
             run_dir = Path("runs") / f"baseline-{_slugify(name)}-{ts}-{counter}"
 
-    budget_secs = _parse_duration(args.max_time)
+    budget_secs = _parse_duration(args.max_time) if args.max_time else None
 
     print(f"Theorem:  {name}")
     print(f"Model:    {args.model}")
-    print(f"Budget:   {args.max_time} ({budget_secs:.0f}s)")
+    if budget_secs is not None:
+        print(f"Budget:   {args.max_time} ({budget_secs:.0f}s)")
+    else:
+        print(f"Budget:   {args.max_tokens} tokens")
     print(f"Run dir:  {run_dir}")
     print("─" * 60)
 
@@ -293,6 +324,7 @@ def _main():
         lean_project_dir=args.lean_project.resolve(),
         model=args.model,
         max_time=budget_secs,
+        max_tokens=args.max_tokens,
         run_dir=run_dir,
         stream=args.stream,
     )
@@ -302,6 +334,7 @@ def _main():
     print(f"Elapsed:       {result['elapsed']:.0f}s")
     print(f"Turns:         {result['turns']}")
     print(f"Verifications: {result['verifications']}")
+    print(f"Tokens:        {result['tokens']}")
     if result.get("error"):
         print(f"Error:         {result['error']}")
     raise SystemExit(0 if result["status"] == "proved" else 1)

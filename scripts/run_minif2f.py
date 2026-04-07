@@ -200,14 +200,20 @@ def _run_baseline(
     from baseline import run_baseline
 
     run_dir = bench_dir / "runs" / name
-    budget_secs = _parse_duration(args.max_time or "4h")
+    if args.max_tokens:
+        max_time = None
+        max_tokens = args.max_tokens
+    else:
+        max_time = _parse_duration(args.max_time or "4h")
+        max_tokens = None
     result = run_baseline(
         name=name,
         theorem_lean=info["formal"],
         theorem_informal=info["informal"],
         lean_project_dir=lean_project,
         model=args.model,
-        max_time=budget_secs,
+        max_time=max_time,
+        max_tokens=max_tokens,
         run_dir=run_dir,
     )
     return {
@@ -216,6 +222,7 @@ def _run_baseline(
         "elapsed": result["elapsed"],
         "turns": result.get("turns", 0),
         "verifications": result.get("verifications", 0),
+        "tokens": result.get("tokens", 0),
         "error": result.get("error", ""),
     }
 
@@ -277,6 +284,8 @@ def _run_all(
             extra = ""
             if "verifications" in entry and entry["verifications"]:
                 extra = f"  v={entry['verifications']}"
+            if entry.get("tokens"):
+                extra += f"  t={entry['tokens']}"
 
             print(f"  [{completed:>{pad}}/{total}]"
                   f"  {entry['name']:<{name_width}}"
