@@ -24,7 +24,11 @@ logger = logging.getLogger("baseline")
 
 MISTRAL_MODEL_MAP = {"leanstral": "labs-leanstral-2603"}
 
-LEAN_TAG_RE = re.compile(r"<lean>\s*\n?(.*?)\n?\s*</lean>", re.DOTALL | re.IGNORECASE)
+# Match ```lean ... ``` (or ```lean4 ... ```) markdown code fences.
+LEAN_FENCE_RE = re.compile(
+    r"```lean[0-9]*\s*\n(.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -46,8 +50,8 @@ def _slugify(text: str) -> str:
 
 
 def _extract_lean(text: str) -> str | None:
-    """Pull the contents of the last <lean>...</lean> block from text."""
-    matches = LEAN_TAG_RE.findall(text)
+    """Pull the contents of the last ```lean ... ``` block from text."""
+    matches = LEAN_FENCE_RE.findall(text)
     return matches[-1].strip() if matches else None
 
 
@@ -69,24 +73,26 @@ You are a Lean 4 theorem prover. You will be given a theorem statement \
 ending in `sorry` and you must replace `sorry` with a complete proof.
 
 Each time you reply, output the FULL Lean 4 source (imports, opens, and \
-the theorem with your proof) inside a single <lean>...</lean> block. \
-After your reply, the user will run `lake env lean` on your code and \
-report the result. If verification fails, try a different approach.
+the theorem with your proof) inside a single ```lean ... ``` markdown \
+code fence. After your reply, the user will run `lake env lean` on your \
+code and report the result. If verification fails, try a different \
+approach.
 
-Output ONLY the <lean>...</lean> block (and any short reasoning before \
-it). Do not use markdown code fences inside the tag.\
+Only the LAST ```lean ... ``` block in your reply is verified, so put \
+your final attempt at the end.\
 """
 
 INITIAL_USER_MSG = """\
-Prove this theorem. Output the full Lean source inside <lean>...</lean>.
+Prove this theorem. Output the full Lean source inside a ```lean ... ``` \
+code fence.
 
 ## Informal statement
 {informal}
 
 ## Formal statement
-<lean>
+```lean
 {formal}
-</lean>
+```
 """
 
 
@@ -203,12 +209,12 @@ def run_baseline(
 
             code = _extract_lean(assistant_text)
             if not code:
-                log(f"turn {turns}: no <lean> block found")
+                log(f"turn {turns}: no ```lean block found")
                 transcript.append(
                     f"# Assistant turn {turns}\n{assistant_text}\n\n"
-                    "# User\nYour reply did not contain a <lean>...</lean> "
-                    "block. Please output the full Lean source inside "
-                    "<lean>...</lean>."
+                    "# User\nYour reply did not contain a ```lean ... ``` "
+                    "code fence. Please output the full Lean source inside "
+                    "a ```lean ... ``` block."
                 )
                 continue
 
@@ -227,8 +233,8 @@ def run_baseline(
             transcript.append(
                 f"# Assistant turn {turns}\n{assistant_text}\n\n"
                 f"# User\nlean_verify failed:\n```\n{feedback}\n```\n"
-                "Try again. Output the full Lean source inside "
-                "<lean>...</lean>."
+                "Try again. Output the full Lean source inside a "
+                "```lean ... ``` code fence."
             )
 
     except Exception as e:
