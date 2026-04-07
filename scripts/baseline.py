@@ -67,6 +67,45 @@ def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, 
     return False, feedback
 
 
+def _write_turn_log(path: Path, *, turn: int, prompt: str, thinking: str,
+                    reply: str, turn_tokens: int, outcome: str,
+                    feedback: str, spliced: str) -> None:
+    """Write a single turn's full record (prompt, thinking, reply, result)."""
+    parts = [
+        f"# Turn {turn}\n",
+        f"- outcome: **{outcome or 'unknown'}**",
+        f"- tokens: {turn_tokens}\n",
+        "## User prompt\n",
+        f"````\n{prompt}\n````\n",
+    ]
+    if thinking:
+        parts.append("## Thinking\n")
+        parts.append(f"````\n{thinking}\n````\n")
+    parts.append("## Reply\n")
+    parts.append(f"````\n{reply}\n````\n")
+    if spliced:
+        parts.append("## Spliced Lean source\n")
+        parts.append(f"```lean\n{spliced}\n```\n")
+    if feedback:
+        parts.append("## Verifier feedback\n")
+        parts.append(f"````\n{feedback}\n````\n")
+    path.write_text("\n".join(parts))
+
+
+def _format_turn_for_transcript(*, turn: int, prompt: str, thinking: str,
+                                reply: str, turn_tokens: int, outcome: str,
+                                feedback: str, spliced: str) -> str:
+    """Return the markdown chunk appended to transcript.md after each turn."""
+    out = [f"\n## Turn {turn} — {outcome or 'unknown'} ({turn_tokens} tokens)\n"]
+    out.append("\n### User prompt\n\n````\n" + prompt + "\n````\n")
+    if thinking:
+        out.append("\n### Thinking\n\n````\n" + thinking + "\n````\n")
+    out.append("\n### Reply\n\n````\n" + reply + "\n````\n")
+    if feedback and outcome != "ok":
+        out.append("\n### Verifier feedback\n\n````\n" + feedback + "\n````\n")
+    return "".join(out)
+
+
 # ── Core loop ────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = '''\
@@ -162,7 +201,22 @@ def run_baseline(
     if theorem_informal:
         (run_dir / "THEOREM.md").write_text(theorem_informal + "\n")
 
+    # Per-turn detailed logs go under turns/, raw API archives under calls/.
+    turns_dir = run_dir / "turns"
+    turns_dir.mkdir(exist_ok=True)
     archive_dir = run_dir / "calls"
+    transcript_path = run_dir / "transcript.md"
+    transcript_path.write_text(
+        f"# Baseline transcript: {name}\n\n"
+        f"- model: `{model}`\n"
+        f"- run dir: `{run_dir}`\n\n"
+        f"## System prompt\n\n````\n{SYSTEM_PROMPT}\n````\n"
+    )
+
+    def _append_transcript(text: str) -> None:
+        with transcript_path.open("a") as f:
+            f.write(text)
+
     mistral_model = MISTRAL_MODEL_MAP.get(model, model)
     client = MistralClient(model=mistral_model, archive_dir=archive_dir)
     work_dir = LeanWorkDir(lean_project_dir)
@@ -246,7 +300,6 @@ def run_baseline(
 
             assistant_text = resp.get("result", "") or ""
             thinking_text = resp.get("thinking", "") or ""
-            (run_dir / f"turn_{turns:03d}.txt").write_text(assistant_text + "\n")
 
             # Track completion tokens (use API usage if available, else
             # approximate via char count / 4 — works for streaming path
@@ -256,6 +309,33 @@ def run_baseline(
             if turn_tokens is None:
                 turn_tokens = (len(assistant_text) + len(thinking_text)) // 4
             tokens += turn_tokens
+
+            # Outcome of this turn is filled in below; we write the turn
+            # log + transcript chunk once we know it.
+            turn_outcome: dict = {
+                "prompt": prompt,
+                "thinking": thinking_text,
+                "reply": assistant_text,
+                "turn_tokens": turn_tokens,
+                "outcome": "",        # "ok" / "verify_failed" / "no_block" / "rejected"
+                "feedback": "",
+                "spliced": "",
+            }
+
+            def _flush_turn():
+                _write_turn_log(turns_dir / f"turn_{turns:03d}.md",
+                                turn=turns, **turn_outcome)
+                _append_transcript(_format_turn_for_transcript(
+                    turn=turns, **turn_outcome))
+                # Also drop bare .lean / .err files alongside the .md so
+                # the spliced source and compiler output are easy to find
+                # with `ls`/`grep`, mirroring openprover's lean/ layout.
+                if turn_outcome["spliced"]:
+                    (turns_dir / f"turn_{turns:03d}.lean").write_text(
+                        turn_outcome["spliced"] + "\n")
+                if turn_outcome["feedback"] and turn_outcome["outcome"] != "ok":
+                    (turns_dir / f"turn_{turns:03d}.err").write_text(
+                        turn_outcome["feedback"] + "\n")
 
             blocks = _extract_lean_blocks(assistant_text)
             # Take the LAST `num_sorries` blocks (matches the system prompt:
@@ -267,6 +347,12 @@ def run_baseline(
                     f"block(s), got {len(blocks)} "
                     f"(reply: {len(assistant_text)} chars, "
                     f"{turn_tokens} tokens)")
+                turn_outcome["outcome"] = "no_block"
+                turn_outcome["feedback"] = (
+                    f"Expected {parsed.num_sorries} ```lean ... ``` block(s), "
+                    f"got {len(blocks)}."
+                )
+                _flush_turn()
                 transcript.append(
                     f"# Assistant turn {turns}\n{assistant_text}\n\n"
                     f"# User\nExpected {parsed.num_sorries} ```lean ... ``` "
@@ -283,6 +369,9 @@ def run_baseline(
                 full_code = parsed.assemble_proof(replacements)
             except ValueError as e:
                 log(f"turn {turns}: assembly rejected: {e}")
+                turn_outcome["outcome"] = "rejected"
+                turn_outcome["feedback"] = str(e)
+                _flush_turn()
                 transcript.append(
                     f"# Assistant turn {turns}\n{assistant_text}\n\n"
                     f"# User\nYour proof block was rejected: {e}. "
@@ -298,6 +387,9 @@ def run_baseline(
             success, feedback = _verify(full_code, work_dir, lean_project_dir)
             verify_secs = time.monotonic() - verify_start
 
+            turn_outcome["spliced"] = full_code
+            turn_outcome["feedback"] = feedback
+
             if success:
                 proved = True
                 (run_dir / "PROOF.lean").write_text(full_code + "\n")
@@ -305,10 +397,15 @@ def run_baseline(
                     f"({verify_secs:.1f}s)")
                 log(f"PROVED in {turns} turns, {verifications} verifications, "
                     f"{tokens} tokens, {time.monotonic() - start:.0f}s")
+                turn_outcome["outcome"] = "ok"
+                _flush_turn()
                 break
 
             log(f"turn {turns}: lean_verify #{verifications} -> failed "
                 f"({verify_secs:.1f}s)")
+            turn_outcome["outcome"] = "verify_failed"
+            _flush_turn()
+
             if stream:
                 # Show the compiler feedback in interactive mode so the user
                 # can follow along.
@@ -339,6 +436,14 @@ def run_baseline(
         "name": name, "status": status, "elapsed": elapsed,
         "turns": turns, "verifications": verifications, "tokens": tokens,
     }, indent=2) + "\n")
+    _append_transcript(
+        f"\n## Result\n\n"
+        f"- status: **{status}**\n"
+        f"- elapsed: {elapsed:.0f}s\n"
+        f"- turns: {turns}\n"
+        f"- verifications: {verifications}\n"
+        f"- tokens: {tokens}\n"
+    )
 
     return {"status": status, "elapsed": elapsed, "turns": turns,
             "verifications": verifications, "tokens": tokens, "error": ""}
