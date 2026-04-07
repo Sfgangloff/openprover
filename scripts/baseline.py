@@ -17,7 +17,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from openprover.lean.core import LeanWorkDir, lean_has_errors, run_lean_check
+from openprover.lean.core import (
+    LeanTheorem, LeanWorkDir, lean_has_errors, run_lean_check,
+)
 from openprover.llm import MistralClient
 
 logger = logging.getLogger("baseline")
@@ -49,10 +51,9 @@ def _slugify(text: str) -> str:
     return s[:40] or "theorem"
 
 
-def _extract_lean(text: str) -> str | None:
-    """Pull the contents of the last ```lean ... ``` block from text."""
-    matches = LEAN_FENCE_RE.findall(text)
-    return matches[-1].strip() if matches else None
+def _extract_lean_blocks(text: str) -> list[str]:
+    """Return the contents of every ```lean ... ``` block in text, in order."""
+    return [m.strip() for m in LEAN_FENCE_RE.findall(text)]
 
 
 def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, str]:
@@ -70,29 +71,37 @@ def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, 
 
 SYSTEM_PROMPT = """\
 You are a Lean 4 theorem prover. You will be given a theorem statement \
-ending in `sorry` and you must replace `sorry` with a complete proof.
+whose proof is `sorry`. You must produce a Lean 4 proof term/tactic \
+block that replaces `sorry` so the theorem compiles.
 
-Each time you reply, output the FULL Lean 4 source (imports, opens, and \
-the theorem with your proof) inside a single ```lean ... ``` markdown \
-code fence. After your reply, the user will run `lake env lean` on your \
-code and report the result. If verification fails, try a different \
-approach.
+Each time you reply, output ONE ```lean ... ``` markdown code fence \
+containing JUST the replacement for `sorry` — no `theorem` line, no \
+imports, no opens. The framework splices your block into the original \
+theorem and runs `lake env lean` on it. If verification fails, the \
+compiler errors are reported back; try a different approach.
 
-Only the LAST ```lean ... ``` block in your reply is verified, so put \
-your final attempt at the end.\
+If the theorem has multiple `sorry`s, output one ```lean ... ``` fence \
+per `sorry`, in order. Only the LAST set of fences in your reply is \
+used, so put your final attempt at the end.
+
+You may NOT use: `sorry`, `axiom`, `unsafe`, `set_option`, \
+`native_decide`, or `import` inside your replacement.\
 """
 
 INITIAL_USER_MSG = """\
-Prove this theorem. Output the full Lean source inside a ```lean ... ``` \
-code fence.
+Prove this theorem. Output a single ```lean ... ``` block containing \
+the proof body that replaces `sorry`.
 
 ## Informal statement
 {informal}
 
-## Formal statement
+## Theorem (you must replace `sorry` with your proof)
 ```lean
 {formal}
 ```
+
+The theorem above has {num_sorries} `sorry` placeholder(s). Output \
+{num_sorries} ```lean ... ``` block(s), one per placeholder, in order.
 """
 
 
@@ -126,9 +135,18 @@ def run_baseline(
     client = MistralClient(model=mistral_model, archive_dir=archive_dir)
     work_dir = LeanWorkDir(lean_project_dir)
 
+    # Parse the input theorem so we can splice proof bodies into its
+    # original sorries — the model can never edit the statement.
+    parsed = LeanTheorem(theorem_lean)
+    if parsed.num_sorries == 0:
+        return {"status": "error", "elapsed": 0, "turns": 0,
+                "verifications": 0, "tokens": 0,
+                "error": "input theorem contains no `sorry` placeholder"}
+
     initial_user = INITIAL_USER_MSG.format(
         informal=theorem_informal or "(none provided)",
         formal=theorem_lean,
+        num_sorries=parsed.num_sorries,
     )
 
     # Conversation as a single accumulated user prompt (we restart the
@@ -207,29 +225,50 @@ def run_baseline(
                 turn_tokens = (len(assistant_text) + len(thinking_text)) // 4
             tokens += turn_tokens
 
-            code = _extract_lean(assistant_text)
-            if not code:
-                log(f"turn {turns}: no ```lean block found "
+            blocks = _extract_lean_blocks(assistant_text)
+            # Take the LAST `num_sorries` blocks (matches the system prompt:
+            # the model puts its final attempt at the end).
+            replacements = blocks[-parsed.num_sorries:] if blocks else []
+
+            if len(replacements) != parsed.num_sorries:
+                log(f"turn {turns}: expected {parsed.num_sorries} ```lean "
+                    f"block(s), got {len(blocks)} "
                     f"(reply: {len(assistant_text)} chars, "
                     f"{turn_tokens} tokens)")
                 transcript.append(
                     f"# Assistant turn {turns}\n{assistant_text}\n\n"
-                    "# User\nYour reply did not contain a ```lean ... ``` "
-                    "code fence. Please output the full Lean source inside "
-                    "a ```lean ... ``` block."
+                    f"# User\nExpected {parsed.num_sorries} ```lean ... ``` "
+                    f"code fence(s) (one per `sorry`), got {len(blocks)}. "
+                    "Output exactly the right number of fenced blocks, in "
+                    "order, each containing only the proof body that "
+                    "replaces the corresponding `sorry`."
+                )
+                continue
+
+            # Splice into the original theorem. assemble_proof rejects
+            # banned constructs (sorry, axiom, import, ...).
+            try:
+                full_code = parsed.assemble_proof(replacements)
+            except ValueError as e:
+                log(f"turn {turns}: assembly rejected: {e}")
+                transcript.append(
+                    f"# Assistant turn {turns}\n{assistant_text}\n\n"
+                    f"# User\nYour proof block was rejected: {e}. "
+                    "Output a fresh ```lean ... ``` block containing only "
+                    "the proof body."
                 )
                 continue
 
             verifications += 1
-            log(f"turn {turns}: verifying ({len(code)} chars, "
-                f"{turn_tokens} tokens this turn, {tokens} total)")
+            log(f"turn {turns}: verifying ({sum(len(r) for r in replacements)}"
+                f" chars of proof, {turn_tokens} tokens this turn, {tokens} total)")
             verify_start = time.monotonic()
-            success, feedback = _verify(code, work_dir, lean_project_dir)
+            success, feedback = _verify(full_code, work_dir, lean_project_dir)
             verify_secs = time.monotonic() - verify_start
 
             if success:
                 proved = True
-                (run_dir / "PROOF.lean").write_text(code + "\n")
+                (run_dir / "PROOF.lean").write_text(full_code + "\n")
                 log(f"turn {turns}: lean_verify #{verifications} -> OK "
                     f"({verify_secs:.1f}s)")
                 log(f"PROVED in {turns} turns, {verifications} verifications, "
