@@ -168,8 +168,10 @@ def _run_openprover(
                 return {"name": name, "status": "error", "elapsed": elapsed, "error": err}
 
             if "[result] rate_limited" in result.stdout:
-                print(f"  ⏳ {name}: rate limited, waiting {RATE_LIMIT_WAIT // 60}m...",
-                      flush=True)
+                msg = (f"⚠️  WARNING: {name}: rate limited / spending limit hit, "
+                       f"waiting {RATE_LIMIT_WAIT // 60}m before retry")
+                print(msg, flush=True)
+                print(msg, file=sys.stderr, flush=True)
                 time.sleep(RATE_LIMIT_WAIT)
                 continue  # retry the same problem
 
