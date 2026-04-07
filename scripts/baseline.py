@@ -69,39 +69,71 @@ def _verify(code: str, work_dir: LeanWorkDir, project_dir: Path) -> tuple[bool, 
 
 # ── Core loop ────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """\
-You are a Lean 4 theorem prover. You will be given a theorem statement \
-whose proof is `sorry`. You must produce a Lean 4 proof term/tactic \
-block that replaces `sorry` so the theorem compiles.
+SYSTEM_PROMPT = '''\
+You are a Lean 4 theorem prover. You will be given a theorem whose \
+proof is `sorry`. You must produce ONLY the tactic/term block that \
+replaces `sorry` — NOT the whole theorem.
 
-Each time you reply, output ONE ```lean ... ``` markdown code fence \
-containing JUST the replacement for `sorry` — no `theorem` line, no \
-imports, no opens. The framework splices your block into the original \
-theorem and runs `lake env lean` on it. If verification fails, the \
-compiler errors are reported back; try a different approach.
+The framework parses the original theorem, splices your block in place \
+of `sorry`, and runs `lake env lean`. If verification fails, the \
+compiler errors are reported back and you try again.
+
+Output format: a single ```lean ... ``` markdown fence containing JUST \
+the replacement code. Do NOT repeat the `theorem` line, the binders, \
+the type, the `:= by`, the imports, or the opens.
+
+### Worked example
+
+Given this input theorem:
+
+```lean
+theorem add_zero_eq (n : ℕ) : n + 0 = n := by
+  sorry
+```
+
+A correct reply is:
+
+```lean
+simp
+```
+
+That's it — just the proof body. After splicing, the framework runs:
+
+```lean
+theorem add_zero_eq (n : ℕ) : n + 0 = n := by
+  simp
+```
+
+Multi-line tactic blocks are fine — just keep them as the proof body:
+
+```lean
+intro h
+rw [h]
+ring
+```
 
 If the theorem has multiple `sorry`s, output one ```lean ... ``` fence \
-per `sorry`, in order. Only the LAST set of fences in your reply is \
-used, so put your final attempt at the end.
+per `sorry`, in order. Only the LAST N fences in your reply are used \
+(where N is the number of sorries), so you can iterate inside one reply \
+and put your final attempt at the end.
 
-You may NOT use: `sorry`, `axiom`, `unsafe`, `set_option`, \
+You may NOT use any of: `sorry`, `axiom`, `unsafe`, `set_option`, \
 `native_decide`, or `import` inside your replacement.\
-"""
+'''
 
 INITIAL_USER_MSG = """\
-Prove this theorem. Output a single ```lean ... ``` block containing \
-the proof body that replaces `sorry`.
+Prove this theorem.
 
 ## Informal statement
 {informal}
 
-## Theorem (you must replace `sorry` with your proof)
+## Theorem (your proof will replace the `sorry`)
 ```lean
 {formal}
 ```
 
-The theorem above has {num_sorries} `sorry` placeholder(s). Output \
-{num_sorries} ```lean ... ``` block(s), one per placeholder, in order.
+Output {num_sorries} ```lean ... ``` block(s), one per `sorry`, each \
+containing ONLY the proof body (no `theorem` line, no imports).
 """
 
 
