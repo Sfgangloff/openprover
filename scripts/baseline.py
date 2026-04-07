@@ -335,3 +335,94 @@ def run_baseline(
 
     return {"status": status, "elapsed": elapsed, "turns": turns,
             "verifications": verifications, "error": ""}
+
+
+# ── CLI ──────────────────────────────────────────────────────────────
+
+def _slugify(text: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+    return s[:40] or "theorem"
+
+
+def _main():
+    import argparse
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(
+        prog="baseline",
+        description="Baseline prover: single conversation with lean_verify",
+    )
+    parser.add_argument("run_dir", nargs="?",
+                        help="Working directory (auto-created if omitted)")
+    parser.add_argument("--theorem", type=Path, metavar="FILE",
+                        help="Path to informal theorem statement (.md)")
+    parser.add_argument("--lean-theorem", type=Path, metavar="FILE", required=True,
+                        help="Path to formal theorem stub (.lean)")
+    parser.add_argument("--lean-project", type=Path, metavar="DIR", required=True,
+                        help="Path to Lean project with built .lake (lake build first)")
+    parser.add_argument("--model", default="leanstral",
+                        help="Model name (default: leanstral)")
+
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--max-time", default="10m", metavar="DURATION",
+                        help="Wall-clock budget per problem (default: 10m)")
+    args = parser.parse_args()
+
+    # Validate inputs
+    if not args.lean_theorem.is_file():
+        parser.error(f"--lean-theorem not found: {args.lean_theorem}")
+    if not args.lean_project.is_dir():
+        parser.error(f"--lean-project not found: {args.lean_project}")
+    if not (args.lean_project / ".lake").is_dir():
+        parser.error(f"{args.lean_project / '.lake'} not found — run `lake build` first")
+    if args.theorem and not args.theorem.is_file():
+        parser.error(f"--theorem not found: {args.theorem}")
+
+    theorem_lean = args.lean_theorem.read_text()
+    theorem_informal = args.theorem.read_text() if args.theorem else ""
+
+    # Theorem name: extract from `theorem NAME ...` in the lean file
+    name_match = re.search(r"^theorem\s+(\S+)", theorem_lean, re.MULTILINE)
+    name = name_match.group(1) if name_match else args.lean_theorem.stem
+
+    # Resolve run_dir (auto-create if not provided)
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = Path("runs") / f"baseline-{_slugify(name)}-{ts}"
+        counter = 1
+        while run_dir.exists():
+            counter += 1
+            run_dir = Path("runs") / f"baseline-{_slugify(name)}-{ts}-{counter}"
+
+    budget_secs = _parse_duration(args.max_time)
+
+    print(f"Theorem:  {name}")
+    print(f"Model:    {args.model}")
+    print(f"Budget:   {args.max_time} ({budget_secs:.0f}s)")
+    print(f"Run dir:  {run_dir}")
+    print("─" * 60)
+
+    result = run_baseline(
+        name=name,
+        theorem_lean=theorem_lean,
+        theorem_informal=theorem_informal,
+        lean_project_dir=args.lean_project.resolve(),
+        model=args.model,
+        max_time=budget_secs,
+        run_dir=run_dir,
+    )
+
+    print("─" * 60)
+    print(f"Result:        {result['status']}")
+    print(f"Elapsed:       {result['elapsed']:.0f}s")
+    print(f"Turns:         {result['turns']}")
+    print(f"Verifications: {result['verifications']}")
+    if result.get("error"):
+        print(f"Error:         {result['error']}")
+    raise SystemExit(0 if result["status"] == "proved" else 1)
+
+
+if __name__ == "__main__":
+    _main()
