@@ -69,9 +69,8 @@ def _lean_verify(code: str, lean_work_dir: LeanWorkDir, lean_project_dir: Path) 
 def _mistral_request(payload: dict, api_key: str,
                      conversation_id: str | None = None,
                      timeout: int = 600) -> dict:
-    """Make a request to the Mistral Conversations API."""
+    """Make a non-streaming request to the Mistral Conversations API."""
     import urllib.request
-    import urllib.error
 
     url = f"{MISTRAL_BASE_URL}/v1/conversations"
     if conversation_id:
@@ -86,6 +85,120 @@ def _mistral_request(payload: dict, api_key: str,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
+
+def _mistral_stream(payload: dict, api_key: str,
+                    conversation_id: str | None = None,
+                    timeout: int = 600,
+                    on_thinking=None, on_text=None) -> dict:
+    """Stream a Mistral Conversations API response via SSE.
+
+    Calls on_thinking(text) and on_text(text) for incremental tokens.
+    Returns a dict shaped like the non-streaming response so that
+    _parse_assistant_output can consume it.
+    """
+    import urllib.request
+
+    url = f"{MISTRAL_BASE_URL}/v1/conversations"
+    if conversation_id:
+        url = f"{url}/{conversation_id}"
+    payload = {**payload, "stream": True}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+    thinking_parts: list[str] = []
+    output_parts: list[str] = []
+    tool_call_acc: dict[str, dict] = {}
+    conv_id: str | None = conversation_id
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].lstrip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = chunk.get("type", "")
+            if etype == "conversation.response.started":
+                conv_id = chunk.get("conversation_id", conv_id)
+                continue
+            if etype == "function.call.delta":
+                fc_id = chunk.get("id", "")
+                acc = tool_call_acc.setdefault(fc_id, {
+                    "id": fc_id, "tool_call_id": "", "name": "", "arguments": "",
+                })
+                if chunk.get("tool_call_id"):
+                    acc["tool_call_id"] = chunk["tool_call_id"]
+                if chunk.get("name"):
+                    acc["name"] = chunk["name"]
+                acc["arguments"] += chunk.get("arguments", "")
+                continue
+            if etype != "message.output.delta":
+                continue
+
+            content = chunk.get("content", "")
+            if isinstance(content, str):
+                output_parts.append(content)
+                if on_text and content:
+                    on_text(content)
+            elif isinstance(content, dict):
+                ctype = content.get("type", "")
+                if ctype == "thinking":
+                    for part in content.get("thinking", []):
+                        text = part.get("text", "")
+                        if text:
+                            thinking_parts.append(text)
+                            if on_thinking:
+                                on_thinking(text)
+                else:
+                    text = ""
+                    for part in content.get("content", []):
+                        text += part.get("text", "")
+                    if not text:
+                        text = content.get("text", "")
+                    if text:
+                        output_parts.append(text)
+                        if on_text:
+                            on_text(text)
+
+    # Reconstruct a non-streaming-shaped response
+    outputs = []
+    assistant_content: list[dict] = []
+    if thinking_parts:
+        assistant_content.append({
+            "type": "thinking",
+            "thinking": [{"type": "text", "text": "".join(thinking_parts)}],
+        })
+    if output_parts:
+        assistant_content.append({
+            "type": "message.output",
+            "content": [{"type": "text", "text": "".join(output_parts)}],
+        })
+    outputs.append({
+        "role": "assistant",
+        "content": assistant_content if assistant_content else "",
+    })
+    for tc in tool_call_acc.values():
+        outputs.append({
+            "type": "function.call",
+            "id": tc["id"],
+            "tool_call_id": tc["tool_call_id"],
+            "name": tc["name"],
+            "arguments": tc["arguments"],
+        })
+    return {"outputs": outputs, "conversation_id": conv_id}
 
 
 def _parse_assistant_output(raw: dict) -> dict:
@@ -166,6 +279,7 @@ def run_baseline(
     max_time: float,
     run_dir: Path,
     verbose: bool = False,
+    stream: bool = False,
 ) -> dict:
     """Run the baseline prover on a single problem.
 
@@ -253,9 +367,46 @@ def run_baseline(
                 }
 
             # Call API
-            raw = _mistral_request(payload, api_key,
-                                   conversation_id=conversation_id,
-                                   timeout=max(int(remaining) + 30, 60))
+            timeout = max(int(remaining) + 30, 60)
+            if stream:
+                import sys
+                dim = "\033[2m" if sys.stdout.isatty() else ""
+                reset = "\033[0m" if sys.stdout.isatty() else ""
+                state = {"in_thinking": False, "started": False}
+
+                def _hdr():
+                    if not state["started"]:
+                        print(f"\n  ─── turn {turns} ───", flush=True)
+                        state["started"] = True
+
+                def on_thinking(text: str):
+                    _hdr()
+                    if not state["in_thinking"]:
+                        sys.stdout.write(dim)
+                        state["in_thinking"] = True
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+
+                def on_text(text: str):
+                    _hdr()
+                    if state["in_thinking"]:
+                        sys.stdout.write(reset)
+                        state["in_thinking"] = False
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+
+                raw = _mistral_stream(payload, api_key,
+                                      conversation_id=conversation_id,
+                                      timeout=timeout,
+                                      on_thinking=on_thinking, on_text=on_text)
+                if state["in_thinking"]:
+                    sys.stdout.write(reset)
+                if state["started"]:
+                    print(flush=True)
+            else:
+                raw = _mistral_request(payload, api_key,
+                                       conversation_id=conversation_id,
+                                       timeout=timeout)
             conversation_id = raw.get("conversation_id", conversation_id)
             parsed = _parse_assistant_output(raw)
 
@@ -366,6 +517,10 @@ def _main():
     budget = parser.add_mutually_exclusive_group()
     budget.add_argument("--max-time", default="10m", metavar="DURATION",
                         help="Wall-clock budget per problem (default: 10m)")
+    parser.add_argument("--stream", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Stream model output to console "
+                             "(thinking shown dimmed)")
     args = parser.parse_args()
 
     # Validate inputs
@@ -412,6 +567,7 @@ def _main():
         model=args.model,
         max_time=budget_secs,
         run_dir=run_dir,
+        stream=args.stream,
     )
 
     print("─" * 60)
