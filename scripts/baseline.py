@@ -419,6 +419,11 @@ def run_baseline(
             verifications += 1
             log(f"turn {turns}: verifying ({sum(len(r) for r in replacements)}"
                 f" chars of proof, {turn_tokens} tokens this turn, {tokens} total)")
+            if not quiet:
+                # Show the spliced source verbatim so the user can see
+                # exactly what the verifier is checking.
+                for line in full_code.splitlines():
+                    print(f"  │ {line}", flush=True)
             verify_start = time.monotonic()
             success, feedback = _verify(full_code, work_dir, lean_project_dir)
             verify_secs = time.monotonic() - verify_start
