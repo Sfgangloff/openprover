@@ -235,14 +235,24 @@ def _run_all(
     lean_project: Path | None,
     bench_dir: Path,
     args: argparse.Namespace,
+    carried: list[dict] | None = None,
 ) -> None:
-    total = len(problems)
-    proved = 0
-    not_proved = 0
-    errors = 0
-    completed = 0
+    """Run problems and record results.
+
+    `carried` is the list of result entries inherited from a resumed run;
+    they're written into the new bench dir's results.json up front and
+    counted toward the totals, so the harness output looks identical to
+    a non-interrupted run.
+    """
+    carried = carried or []
+    total = len(carried) + len(problems)
+    proved = sum(1 for r in carried if r["status"] == "proved")
+    not_proved = sum(1 for r in carried if r["status"] == "not_proved")
+    errors = sum(1 for r in carried if r["status"] not in ("proved", "not_proved"))
+    completed = len(carried)
     pad = len(str(total))
-    name_width = max(len(n) for n in problems) if problems else 20
+    name_width = max((len(n) for n in problems), default=20)
+    name_width = max(name_width, max((len(r["name"]) for r in carried), default=0))
 
     planner = args.planner_model or args.model
     worker = args.worker_model or args.model
@@ -251,10 +261,20 @@ def _run_all(
     print(f"  MiniF2F {args.split}: {total} problems, method={args.method},"
           f" parallelism={args.problem_parallelism},"
           f" model={model_label}, mode={mode}")
+    if carried:
+        print(f"  Resumed: {len(carried)} carried over, {len(problems)} to run")
     print(f"  Output: {bench_dir}\n")
 
     runner = _run_openprover if args.method == "openprover" else _run_baseline
-    results: list[dict] = []
+    results: list[dict] = list(carried)
+    _save_results(bench_dir, results)
+
+    if not problems:
+        # Nothing left to do (resumed run was already complete).
+        print(f"\n  Results: {proved} proved, {not_proved} not proved,"
+              f" {errors} errors (of {total})")
+        print(f"  Saved to {bench_dir / 'results.json'}")
+        return
 
     with ThreadPoolExecutor(max_workers=args.problem_parallelism) as pool:
         futures = {
@@ -303,6 +323,52 @@ def _run_all(
     print(f"  Saved to {bench_dir / 'results.json'}")
 
 
+# ── Resume helpers ───────────────────────────────────────────────────
+
+# Config keys carried forward when resuming a previous benchmark.
+_RESUME_CARRY_KEYS = (
+    "method", "split", "model", "planner_model", "worker_model",
+    "max_time", "max_tokens", "parallelism", "informal", "skip", "limit",
+)
+
+
+def _load_resume(parser, resume_dir: Path) -> tuple[dict, list[dict]]:
+    """Load config + results from a previous benchmark directory."""
+    if not resume_dir.is_dir():
+        parser.error(f"--resume: {resume_dir} is not a directory")
+    config_path = resume_dir / "config.json"
+    if not config_path.is_file():
+        parser.error(f"--resume: {config_path} not found")
+    old_config = json.loads(config_path.read_text())
+    results_path = resume_dir / "results.json"
+    old_results: list[dict] = []
+    if results_path.is_file():
+        old_results = json.loads(results_path.read_text())
+    return old_config, old_results
+
+
+def _import_completed_runs(old_dir: Path, new_dir: Path,
+                           completed_names: set[str]) -> None:
+    """Symlink per-problem run directories from old benchmark into new one.
+
+    The old runs are read-only — we just need them visible from the new
+    bench dir so the resumed benchmark looks self-contained.
+    """
+    src_runs = old_dir / "runs"
+    if not src_runs.is_dir():
+        return
+    dst_runs = new_dir / "runs"
+    dst_runs.mkdir(exist_ok=True)
+    for name in completed_names:
+        src = (src_runs / name).resolve()
+        if not src.exists():
+            continue
+        dst = dst_runs / name
+        if dst.exists() or dst.is_symlink():
+            continue
+        dst.symlink_to(src)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def main():
@@ -343,7 +409,35 @@ def main():
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--name",
                         help="Custom benchmark name (default: auto-generated)")
+    parser.add_argument("--resume", type=Path, metavar="DIR", default=None,
+                        help="Resume from a previous benchmark directory: "
+                             "inherits its config, skips problems already "
+                             "proved/not_proved, retries errored problems, "
+                             "and writes a fresh benchmark dir that links "
+                             "back to the original.")
     args = parser.parse_args()
+
+    # ── Resume: inherit config from a previous benchmark ──
+    resume_dir: Path | None = None
+    old_results: list[dict] = []
+    if args.resume:
+        resume_dir = args.resume.resolve()
+        old_config, old_results = _load_resume(parser, resume_dir)
+        # Carry forward run-shaping options from the old config; reject
+        # any conflicting overrides on the CLI.
+        for key in _RESUME_CARRY_KEYS:
+            if key not in old_config:
+                continue
+            cli_val = getattr(args, key, None)
+            old_val = old_config[key]
+            cli_default = parser.get_default(key)
+            if cli_val != cli_default and cli_val != old_val:
+                parser.error(
+                    f"--resume: cannot override --{key.replace('_', '-')} "
+                    f"({cli_val!r}) — original run used {old_val!r}"
+                )
+            setattr(args, key, old_val)
+        print(f"  Resuming from {resume_dir}")
 
     # ── Resolve Lean project ──
     lean_project: Path | None = None
@@ -396,6 +490,19 @@ def main():
     if args.limit is not None:
         problems = dict(list(problems.items())[:args.limit])
 
+    # ── Resume: filter out already-finished problems and carry results ──
+    carried: list[dict] = []
+    if resume_dir is not None:
+        # `proved` and `not_proved` are final; `error` is retried since
+        # the original benchmark may have crashed mid-attempt.
+        final = {r["name"] for r in old_results
+                 if r["status"] in ("proved", "not_proved")}
+        carried = [r for r in old_results if r["name"] in final]
+        before = len(problems)
+        problems = {n: info for n, info in problems.items() if n not in final}
+        print(f"  Carried over: {len(carried)} finished, "
+              f"{before - len(problems)} skipped, {len(problems)} to run")
+
     # ── Create benchmark dir ──
     benchmarks_root = Path("benchmarks")
     benchmarks_root.mkdir(exist_ok=True)
@@ -404,7 +511,8 @@ def main():
     else:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         model_tag = args.model
-        bench_name = f"{args.method}-{args.split}-{model_tag}-{ts}"
+        suffix = "-resumed" if resume_dir is not None else ""
+        bench_name = f"{args.method}-{args.split}-{model_tag}{suffix}-{ts}"
     bench_dir = benchmarks_root / bench_name
     if bench_dir.exists():
         print(f"Error: {bench_dir} already exists. Use --name to pick a"
@@ -425,14 +533,22 @@ def main():
         "parallelism": args.parallelism,
         "problem_parallelism": args.problem_parallelism,
         "informal": args.informal,
-        "total_problems": len(problems),
+        "total_problems": len(carried) + len(problems),
         "skip": args.skip,
         "limit": args.limit,
     }
+    if resume_dir is not None:
+        config["resumed_from"] = str(resume_dir)
     (bench_dir / "config.json").write_text(
         json.dumps(config, indent=2) + "\n")
 
-    _run_all(problems, lean_project, bench_dir, args)
+    # Symlink completed run dirs from the old benchmark so the new
+    # bench dir is self-contained.
+    if resume_dir is not None and carried:
+        _import_completed_runs(resume_dir, bench_dir,
+                               {r["name"] for r in carried})
+
+    _run_all(problems, lean_project, bench_dir, args, carried=carried)
 
 
 if __name__ == "__main__":
