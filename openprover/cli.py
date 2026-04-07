@@ -201,6 +201,11 @@ def _resolve_inputs(parser, args):
         slug = slugify(first_line) or "theorem"
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         work_dir = Path("runs") / f"{slug}-{timestamp}"
+        # Avoid collisions when multiple runs start in the same second
+        counter = 1
+        while work_dir.exists():
+            counter += 1
+            work_dir = Path("runs") / f"{slug}-{timestamp}-{counter}"
 
     return work_dir, theorem_text, lean_theorem_text, proof_md_text, mode, resuming, read_only
 
@@ -553,15 +558,26 @@ def _cmd_prove():
         cost = prover.planner_llm.total_cost + prover.worker_llm.total_cost
         calls = prover.planner_llm.call_count + prover.worker_llm.call_count
         tui.cleanup()
-        has_proof = ((prover.work_dir / "PROOF.md").exists()
-                     or (prover.work_dir / "PROOF.lean").exists())
+        has_md = (prover.work_dir / "PROOF.md").exists()
+        has_lean = (prover.work_dir / "PROOF.lean").exists()
+        if prover.mode == "prove":
+            has_proof = has_md
+        elif prover.mode == "formalize_only":
+            has_proof = has_lean
+        else:  # prove_and_formalize
+            has_proof = has_md and has_lean
         from .budget import _fmt_tokens
         tok_str = _fmt_tokens(prover.budget.total_output_tokens)
         print(f"  {calls} calls · ${cost:.4f} · {tok_str} output tokens")
-        if (prover.work_dir / "PROOF.md").exists():
+        if has_md:
             print(f"  PROOF.md  → {prover.work_dir / 'PROOF.md'}")
-        if (prover.work_dir / "PROOF.lean").exists():
+        if has_lean:
             print(f"  PROOF.lean → {prover.work_dir / 'PROOF.lean'}")
         print(f"  {prover.work_dir}")
         if args.headless:
-            print(f"[result] {'proved' if has_proof else 'not_proved'}")
+            if has_proof:
+                print("[result] proved")
+            elif prover._spending_limit_hit:
+                print("[result] rate_limited")
+            else:
+                print("[result] not_proved")

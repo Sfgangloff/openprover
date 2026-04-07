@@ -2051,6 +2051,9 @@ class Prover:
                     lines.append(f'content = """\n{content}\n"""')
         if "tasks" in plan:
             for task in plan["tasks"]:
+                # Tasks may be dicts or bare strings (inline array form).
+                if isinstance(task, str):
+                    task = {"description": task}
                 lines.append("\n[[tasks]]")
                 task_summary = task.get("summary", "")
                 if task_summary:

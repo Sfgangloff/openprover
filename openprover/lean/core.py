@@ -94,14 +94,27 @@ class LeanTheorem:
                 f"Expected {self.num_sorries} replacement(s), got {len(replacements)}"
             )
 
-        # Validate no imports in injected code
+        # Validate injected code for banned constructs
+        _BANNED = [
+            (r'^\s*import\b', "import statement"),
+            (r'\bsorry\b', "sorry"),
+            (r'^\s*axiom\b', "axiom declaration"),
+            (r'^\s*unsafe\b', "unsafe declaration"),
+            (r'^\s*set_option\b', "set_option"),
+            (r'\bnative_decide\b', "native_decide"),
+        ]
         for i, block in enumerate(replacements):
-            if re.search(r'^\s*import\b', block, re.MULTILINE):
-                raise ValueError(
-                    f"Replacement block {i} contains an import statement"
-                )
-        if context and re.search(r'^\s*import\b', context, re.MULTILINE):
-            raise ValueError("Context block contains an import statement")
+            for pattern, label in _BANNED:
+                if re.search(pattern, block, re.MULTILINE):
+                    raise ValueError(
+                        f"Replacement block {i} contains banned construct: {label}"
+                    )
+        if context:
+            for pattern, label in _BANNED:
+                if re.search(pattern, context, re.MULTILINE):
+                    raise ValueError(
+                        f"Context block contains banned construct: {label}"
+                    )
 
         # Replace sorries in reverse order (preserves earlier offsets)
         result = self.raw_text

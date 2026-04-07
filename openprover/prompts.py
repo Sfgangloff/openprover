@@ -531,6 +531,11 @@ def worker_system_prompt(*, lean_worker_tools: bool = False) -> str:
             "abstract types, avoid unnecessary typeclasses, start with the simplest possible statement "
             "that captures the mathematical content.\n"
             "\n"
+            "**Banned tactics:** Do NOT use `native_decide`, `decide` (on non-trivial goals), "
+            "or `Decidable.decide` in proofs. These bypass the proof kernel and can time out "
+            "or produce non-portable proofs. Use `norm_num`, `omega`, `simp`, or explicit "
+            "proof terms instead.\n"
+            "\n"
             "**Stopping rule:** If you hit the same error 3+ times, STOP. Report: "
             "(1) what compiles so far (lean_store it), (2) the exact Lean error, "
             "(3) what Mathlib lemma or tactic you need but couldn't find.\n"
@@ -907,6 +912,16 @@ def parse_planner_toml(text: str) -> list[dict] | ParseError | None:
                 f"Valid actions: {', '.join(ACTIONS)}."
             )
         if action == "spawn":
+            # Normalize tasks to a list of dicts. The model can write
+            # `tasks = ["foo", "bar"]` (parsed as a list of strings) or
+            # `[[tasks]] description = "..."` (parsed as a list of dicts);
+            # downstream code assumes dicts.
+            raw_tasks = parsed.get("tasks", [])
+            if isinstance(raw_tasks, list):
+                parsed["tasks"] = [
+                    t if isinstance(t, dict) else {"description": str(t)}
+                    for t in raw_tasks
+                ]
             spawn_count += 1
             if spawn_count > 1:
                 return ParseError(
